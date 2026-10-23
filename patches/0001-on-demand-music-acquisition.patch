@@ -1,0 +1,2706 @@
+From 8060d31536abf59c3fd925e45639cd58ddb057ba Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 15:49:41 +0000
+Subject: [PATCH 01/10] Add Guitarr: on-demand music acquisition
+
+Search MusicBrainz from Navidrome, request missing tracks/albums and fetch
+them with YouTube (yt-dlp), Soulseek (slskd) or Lidarr. Exposed under
+/api/seer behind Seer.Enabled. See SEER.md.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ SEER.md                                       |  76 ++++
+ cmd/root.go                                   |  16 +
+ cmd/wire_gen.go                               |  29 +-
+ cmd/wire_injectors.go                         |  16 +
+ conf/configuration.go                         |  62 ++++
+ core/acquire/catalog_musicbrainz.go           | 148 ++++++++
+ core/acquire/model.go                         |  67 ++++
+ core/acquire/service.go                       | 351 ++++++++++++++++++
+ core/acquire/service_test.go                  | 245 ++++++++++++
+ core/acquire/source_lidarr.go                 | 110 ++++++
+ core/acquire/source_soulseek.go               | 327 ++++++++++++++++
+ core/acquire/source_soulseek_test.go          | 100 +++++
+ core/acquire/source_youtube.go                | 135 +++++++
+ core/acquire/store_memory.go                  |  81 ++++
+ core/acquire/store_sql.go                     | 108 ++++++
+ core/acquire/store_sql_test.go                |  84 +++++
+ core/seer/library.go                          |  83 +++++
+ core/seer/seer.go                             |  98 +++++
+ .../20261010000000_create_acquire_request.sql |  20 +
+ server/nativeapi/config.go                    |   2 +
+ server/seerapi/seerapi.go                     | 158 ++++++++
+ server/seerapi/seerapi_test.go                | 100 +++++
+ 22 files changed, 2415 insertions(+), 1 deletion(-)
+ create mode 100644 SEER.md
+ create mode 100644 core/acquire/catalog_musicbrainz.go
+ create mode 100644 core/acquire/model.go
+ create mode 100644 core/acquire/service.go
+ create mode 100644 core/acquire/service_test.go
+ create mode 100644 core/acquire/source_lidarr.go
+ create mode 100644 core/acquire/source_soulseek.go
+ create mode 100644 core/acquire/source_soulseek_test.go
+ create mode 100644 core/acquire/source_youtube.go
+ create mode 100644 core/acquire/store_memory.go
+ create mode 100644 core/acquire/store_sql.go
+ create mode 100644 core/acquire/store_sql_test.go
+ create mode 100644 core/seer/library.go
+ create mode 100644 core/seer/seer.go
+ create mode 100644 db/migrations/20261010000000_create_acquire_request.sql
+ create mode 100644 server/seerapi/seerapi.go
+ create mode 100644 server/seerapi/seerapi_test.go
+
+diff --git a/SEER.md b/SEER.md
+new file mode 100644
+index 0000000..e9779e0
+--- /dev/null
++++ b/SEER.md
+@@ -0,0 +1,76 @@
++# Navidrome Seer (on-demand acquisition)
++
++Search the whole MusicBrainz catalog from Navidrome. Items you own are flagged
++`inLibrary`; anything else can be requested and is fetched by YouTube (yt-dlp),
++Soulseek (slskd) or Lidarr, then scanned into the library.
++
++Code: `core/acquire` (engine, no Navidrome imports), `core/seer` (config,
++library matching, scanner), `server/seerapi` (HTTP), migration
++`db/migrations/20261010000000_create_acquire_request.sql`.
++
++## Configuration
++
++```toml
++[Seer]
++Enabled = true
++AutoApprove = false              # false: an admin must approve each request
++Sources = "lidarr,soulseek,youtube"  # priority order; first one that succeeds wins
++DestFolder = ""                  # default: <first library>/Seer. Must be inside a library
++Workers = 2
++ImportTimeout = "30m"            # how long to wait for the scan to find a download
++UserAgent = ""                   # sent to MusicBrainz; please set one with your contact
++MusicBrainzURL = "https://musicbrainz.org/ws/2"
++
++[Seer.YouTube]                   # tracks only; lossy audio
++Enabled = true
++Path = "yt-dlp"
++Format = "opus"
++
++[Seer.Soulseek]                  # tracks and albums
++Enabled = false
++URL = "http://slskd:5030"
++ApiKey = ""
++DownloadFolder = "/slskd/downloads"  # slskd's downloads folder, as Navidrome sees it
++PreferFLAC = true
++
++[Seer.Lidarr]                    # albums only; Lidarr must import into a Navidrome library
++Enabled = false
++URL = "http://lidarr:8686"
++ApiKey = ""
++RootFolder = "/music"
++QualityProfileID = 1
++MetadataProfileID = 1
++```
++
++Environment variables work as usual, e.g. `ND_SEER_ENABLED=true`,
++`ND_SEER_SOULSEEK_APIKEY=...`.
++
++## API (authenticated, under `/api/seer`)
++
++| Method | Path | Who | What |
++|---|---|---|---|
++| GET | `/catalog?q=&limit=` | any user | catalog search, each item flagged `inLibrary` |
++| GET | `/requests` | any user | own requests; admins get all (`?mine=true` for own) |
++| POST | `/requests` | any user | body: a catalog item. 409 if already in the library; returns the existing request if someone already asked for it |
++| GET | `/requests/{id}` | owner or admin | one request |
++| POST | `/requests/{id}/approve` | admin | queue a pending request, or retry a failed one |
++
++Statuses: `pending` → `queued` → `searching` → `downloading` → `importing` →
++`available`, or `failed` with `error`.
++
++## How a request flows
++
++1. Approved requests are queued; queued and in-progress requests survive restarts.
++2. Sources are tried in order. YouTube files are named and tagged from
++   MusicBrainz (title, artist, album, recording MBID) with ffmpeg, so the scan
++   matches them by MBID. Soulseek downloads are polled until complete and moved
++   to `DestFolder/Artist/Album/`. Lidarr is asked to search and imports on its own.
++3. A watcher (not the workers) waits for the library scan to find the item,
++   rescanning every 2 minutes, and fails the request after `ImportTimeout`.
++
++## Not done yet
++
++- Web UI (plan phase 2): search page with "Request" button, requests page, SSE updates.
++- Lidarr and slskd API shapes are untested against live instances.
++- Soulseek files keep the peer's tags (no MusicBrainz retagging yet).
++- Per-user quotas, rate limits, reject/cancel requests.
+diff --git a/cmd/root.go b/cmd/root.go
+index e39c553..1a01f6d 100644
+--- a/cmd/root.go
++++ b/cmd/root.go
+@@ -13,6 +13,7 @@ import (
+ 	"github.com/navidrome/navidrome/conf"
+ 	"github.com/navidrome/navidrome/consts"
+ 	"github.com/navidrome/navidrome/core/artwork"
++	"github.com/navidrome/navidrome/core/seer"
+ 	"github.com/navidrome/navidrome/db"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
+@@ -97,6 +98,7 @@ func runNavidrome(parentCtx context.Context) error {
+ 	g.Go(startArtworkWorker(ctx, artworkWorker))
+ 	g.Go(scheduleArtworkHousekeeping(ctx, artworkWorker))
+ 	g.Go(runInitialScan(ctx))
++	g.Go(startSeer(ctx))
+ 	if conf.Server.Scanner.Enabled {
+ 		g.Go(startScanWatcher(ctx))
+ 		g.Go(schedulePeriodicScan(ctx))
+@@ -134,6 +136,9 @@ func startServer(ctx context.Context) func() error {
+ 		if conf.Server.ListenBrainz.Enabled {
+ 			a.MountRouter("ListenBrainz Auth", consts.URLPathNativeAPI+"/listenbrainz", CreateListenBrainzRouter())
+ 		}
++		if seer.Enabled() {
++			a.MountRouter("Seer API", consts.URLPathNativeAPI+"/seer", CreateSeerRouter(ctx))
++		}
+ 		if conf.Server.Jellyfin.Enabled {
+ 			a.MountRouter("Jellyfin API", consts.URLPathJellyfinAPI, CreateJellyfinAPIRouter(ctx))
+ 		}
+@@ -367,6 +372,17 @@ func startJellyfinDiscovery(ctx context.Context) func() error {
+ 	}
+ }
+ 
++// startSeer starts the on-demand acquisition workers, if enabled.
++func startSeer(ctx context.Context) func() error {
++	return func() error {
++		if !seer.Enabled() {
++			return nil
++		}
++		CreateSeer(ctx).Start(ctx)
++		return nil
++	}
++}
++
+ // startPlaybackServer starts the Navidrome playback server, if configured.
+ // It is responsible for the Jukebox functionality
+ func startPlaybackServer(ctx context.Context) func() error {
+diff --git a/cmd/wire_gen.go b/cmd/wire_gen.go
+index 2a39668..62c52b7 100644
+--- a/cmd/wire_gen.go
++++ b/cmd/wire_gen.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/navidrome/navidrome/core/playlists"
+ 	"github.com/navidrome/navidrome/core/quickconnect"
+ 	"github.com/navidrome/navidrome/core/scrobbler"
++	"github.com/navidrome/navidrome/core/seer"
+ 	"github.com/navidrome/navidrome/core/sonic"
+ 	"github.com/navidrome/navidrome/core/stream"
+ 	"github.com/navidrome/navidrome/db"
+@@ -36,6 +37,7 @@ import (
+ 	"github.com/navidrome/navidrome/server/jellyfin"
+ 	"github.com/navidrome/navidrome/server/nativeapi"
+ 	"github.com/navidrome/navidrome/server/public"
++	"github.com/navidrome/navidrome/server/seerapi"
+ 	"github.com/navidrome/navidrome/server/subsonic"
+ )
+ 
+@@ -150,6 +152,31 @@ func CreateAPIv1Router(ctx context.Context) *apiv1.Router {
+ 	return router
+ }
+ 
++func CreateSeerRouter(ctx context.Context) *seerapi.Router {
++	sqlDB := db.Db()
++	dataStore := persistence.New(sqlDB)
++	broker := events.GetBroker()
++	uploader := artwork.NewUploader(dataStore)
++	playlistsPlaylists := playlists.NewPlaylists(dataStore, uploader)
++	metricsMetrics := metrics.GetPrometheusInstance(dataStore)
++	modelScanner := scanner.GetInstance(ctx, dataStore, broker, playlistsPlaylists, metricsMetrics)
++	seerSeer := seer.GetInstance(dataStore, modelScanner, sqlDB)
++	router := seerapi.New(dataStore, seerSeer)
++	return router
++}
++
++func CreateSeer(ctx context.Context) *seer.Seer {
++	sqlDB := db.Db()
++	dataStore := persistence.New(sqlDB)
++	broker := events.GetBroker()
++	uploader := artwork.NewUploader(dataStore)
++	playlistsPlaylists := playlists.NewPlaylists(dataStore, uploader)
++	metricsMetrics := metrics.GetPrometheusInstance(dataStore)
++	modelScanner := scanner.GetInstance(ctx, dataStore, broker, playlistsPlaylists, metricsMetrics)
++	seerSeer := seer.GetInstance(dataStore, modelScanner, sqlDB)
++	return seerSeer
++}
++
+ func CreatePublicRouter() *public.Router {
+ 	sqlDB := db.Db()
+ 	dataStore := persistence.New(sqlDB)
+@@ -268,7 +295,7 @@ func getPluginManager() *plugins.Manager {
+ 
+ // wire_injectors.go:
+ 
+-var allProviders = wire.NewSet(core.Set, artwork.Set, server.New, subsonic.New, jellyfin.New, jellyfin.NewDiscovery, apiv1.New, nativeapi.New, public.New, persistence.New, lastfm.NewRouter, listenbrainz.NewRouter, events.GetBroker, scanner.GetInstance, scanner.GetWatcher, metrics.GetPrometheusInstance, db.Db, plugins.GetManager, sonic.New, wire.Bind(new(agents.PluginLoader), new(*plugins.Manager)), wire.Bind(new(scrobbler.PluginLoader), new(*plugins.Manager)), wire.Bind(new(lyrics.PluginLoader), new(*plugins.Manager)), wire.Bind(new(sonic.PluginLoader), new(*plugins.Manager)), wire.Bind(new(sonic.Engine), new(*sonic.Sonic)), wire.Bind(new(nativeapi.PluginManager), new(*plugins.Manager)), wire.Bind(new(core.PluginUnloader), new(*plugins.Manager)), wire.Bind(new(plugins.PluginMetricsRecorder), new(metrics.Metrics)), wire.Bind(new(core.Watcher), new(scanner.Watcher)), wire.Bind(new(playlists.ImageUploadService), new(artwork.Uploader)))
++var allProviders = wire.NewSet(core.Set, artwork.Set, server.New, subsonic.New, jellyfin.New, jellyfin.NewDiscovery, apiv1.New, nativeapi.New, public.New, seerapi.New, seer.GetInstance, persistence.New, lastfm.NewRouter, listenbrainz.NewRouter, events.GetBroker, scanner.GetInstance, scanner.GetWatcher, metrics.GetPrometheusInstance, db.Db, plugins.GetManager, sonic.New, wire.Bind(new(agents.PluginLoader), new(*plugins.Manager)), wire.Bind(new(scrobbler.PluginLoader), new(*plugins.Manager)), wire.Bind(new(lyrics.PluginLoader), new(*plugins.Manager)), wire.Bind(new(sonic.PluginLoader), new(*plugins.Manager)), wire.Bind(new(sonic.Engine), new(*sonic.Sonic)), wire.Bind(new(nativeapi.PluginManager), new(*plugins.Manager)), wire.Bind(new(core.PluginUnloader), new(*plugins.Manager)), wire.Bind(new(plugins.PluginMetricsRecorder), new(metrics.Metrics)), wire.Bind(new(core.Watcher), new(scanner.Watcher)), wire.Bind(new(playlists.ImageUploadService), new(artwork.Uploader)))
+ 
+ func GetPluginManager(ctx context.Context) *plugins.Manager {
+ 	manager := getPluginManager()
+diff --git a/cmd/wire_injectors.go b/cmd/wire_injectors.go
+index c5006e0..64233ae 100644
+--- a/cmd/wire_injectors.go
++++ b/cmd/wire_injectors.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/navidrome/navidrome/core/playback"
+ 	"github.com/navidrome/navidrome/core/playlists"
+ 	"github.com/navidrome/navidrome/core/scrobbler"
++	"github.com/navidrome/navidrome/core/seer"
+ 	"github.com/navidrome/navidrome/core/sonic"
+ 	"github.com/navidrome/navidrome/db"
+ 	"github.com/navidrome/navidrome/model"
+@@ -28,6 +29,7 @@ import (
+ 	"github.com/navidrome/navidrome/server/jellyfin"
+ 	"github.com/navidrome/navidrome/server/nativeapi"
+ 	"github.com/navidrome/navidrome/server/public"
++	"github.com/navidrome/navidrome/server/seerapi"
+ 	"github.com/navidrome/navidrome/server/subsonic"
+ )
+ 
+@@ -41,6 +43,8 @@ var allProviders = wire.NewSet(
+ 	apiv1.New,
+ 	nativeapi.New,
+ 	public.New,
++	seerapi.New,
++	seer.GetInstance,
+ 	persistence.New,
+ 	lastfm.NewRouter,
+ 	listenbrainz.NewRouter,
+@@ -99,6 +103,18 @@ func CreateAPIv1Router(ctx context.Context) *apiv1.Router {
+ 	))
+ }
+ 
++func CreateSeerRouter(ctx context.Context) *seerapi.Router {
++	panic(wire.Build(
++		allProviders,
++	))
++}
++
++func CreateSeer(ctx context.Context) *seer.Seer {
++	panic(wire.Build(
++		allProviders,
++	))
++}
++
+ func CreatePublicRouter() *public.Router {
+ 	panic(wire.Build(
+ 		allProviders,
+diff --git a/conf/configuration.go b/conf/configuration.go
+index efa9cbf..ea59974 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -126,6 +126,7 @@ type configOptions struct {
+ 	Deezer                          deezerOptions       `json:",omitzero"`
+ 	ListenBrainz                    listenBrainzOptions `json:",omitzero"`
+ 	Jellyfin                        jellyfinOptions     `json:",omitzero"`
++	Seer                            seerOptions         `json:",omitzero"`
+ 	EnableScrobbleHistory           bool
+ 	Tags                            map[string]TagConf `json:",omitempty"`
+ 	Agents                          string
+@@ -230,6 +231,44 @@ type listenBrainzOptions struct {
+ 	TrackAlgorithm  string
+ }
+ 
++// seerOptions configures on-demand acquisition (core/seer).
++type seerOptions struct {
++	Enabled        bool
++	AutoApprove    bool
++	Workers        int
++	DestFolder     string // where new files go; must be inside a library. Default: <first library>/Seer
++	Sources        string // comma-separated priority order of sources
++	UserAgent      string // sent to MusicBrainz
++	MusicBrainzURL string // MusicBrainz web service base URL (for mirrors)
++	ImportTimeout  time.Duration
++	YouTube        seerYouTubeOptions  `json:",omitzero"`
++	Soulseek       seerSoulseekOptions `json:",omitzero"`
++	Lidarr         seerLidarrOptions   `json:",omitzero"`
++}
++
++type seerYouTubeOptions struct {
++	Enabled bool
++	Path    string // yt-dlp binary
++	Format  string
++}
++
++type seerSoulseekOptions struct {
++	Enabled        bool
++	URL            string
++	ApiKey         string //nolint:gosec
++	DownloadFolder string // slskd's downloads folder, as seen by Navidrome
++	PreferFLAC     bool
++}
++
++type seerLidarrOptions struct {
++	Enabled           bool
++	URL               string
++	ApiKey            string //nolint:gosec
++	RootFolder        string
++	QualityProfileID  int
++	MetadataProfileID int
++}
++
+ type jellyfinOptions struct {
+ 	Enabled    bool
+ 	ServerName string
+@@ -1093,6 +1132,29 @@ func setViperDefaults() {
+ 	viper.SetDefault("listenbrainz.baseurl", consts.DefaultListenBrainzBaseURL)
+ 	viper.SetDefault("listenbrainz.artistalgorithm", consts.DefaultListenBrainzArtistAlgorithm)
+ 	viper.SetDefault("listenbrainz.trackalgorithm", consts.DefaultListenBrainzTrackAlgorithm)
++	viper.SetDefault("seer.enabled", false)
++	viper.SetDefault("seer.autoapprove", false)
++	viper.SetDefault("seer.workers", 2)
++	viper.SetDefault("seer.destfolder", "")
++	viper.SetDefault("seer.sources", "lidarr,soulseek,youtube")
++	viper.SetDefault("seer.useragent", "")
++	viper.SetDefault("seer.musicbrainzurl", "https://musicbrainz.org/ws/2")
++	viper.SetDefault("seer.importtimeout", 30*time.Minute)
++	viper.SetDefault("seer.youtube.enabled", false)
++	viper.SetDefault("seer.youtube.path", "yt-dlp")
++	viper.SetDefault("seer.youtube.format", "opus")
++	viper.SetDefault("seer.soulseek.enabled", false)
++	viper.SetDefault("seer.soulseek.url", "")
++	viper.SetDefault("seer.soulseek.apikey", "")
++	viper.SetDefault("seer.soulseek.downloadfolder", "")
++	viper.SetDefault("seer.soulseek.preferflac", true)
++	viper.SetDefault("seer.lidarr.enabled", false)
++	viper.SetDefault("seer.lidarr.url", "")
++	viper.SetDefault("seer.lidarr.apikey", "")
++	viper.SetDefault("seer.lidarr.rootfolder", "")
++	viper.SetDefault("seer.lidarr.qualityprofileid", 1)
++	viper.SetDefault("seer.lidarr.metadataprofileid", 1)
++
+ 	viper.SetDefault("jellyfin.enabled", false)
+ 	viper.SetDefault("jellyfin.servername", "")
+ 	viper.SetDefault("jellyfin.autodiscovery", false)
+diff --git a/core/acquire/catalog_musicbrainz.go b/core/acquire/catalog_musicbrainz.go
+new file mode 100644
+index 0000000..f39936f
+--- /dev/null
++++ b/core/acquire/catalog_musicbrainz.go
+@@ -0,0 +1,148 @@
++package acquire
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++// DefaultUserAgent is sent when none is configured; MusicBrainz blocks empty ones.
++const DefaultUserAgent = "NavidromeSeer/0.1 ( https://github.com/navidrome/navidrome )"
++
++// luceneEscaper escapes the characters that have a meaning in MusicBrainz's
++// Lucene query syntax, so free text from the user is searched literally.
++var luceneEscaper = strings.NewReplacer(
++	`\`, `\\`, `+`, `\+`, `-`, `\-`, `!`, `\!`, `(`, `\(`, `)`, `\)`, `{`, `\{`, `}`, `\}`,
++	`[`, `\[`, `]`, `\]`, `^`, `\^`, `"`, `\"`, `~`, `\~`, `*`, `\*`, `?`, `\?`, `:`, `\:`,
++	`/`, `\/`, `&&`, `\&&`, `||`, `\||`,
++)
++
++// MusicBrainz implements Catalog using the MusicBrainz web service.
++// MusicBrainz asks for a meaningful User-Agent and at most 1 request/second.
++type MusicBrainz struct {
++	UserAgent string // e.g. "navidrome-acquire/0.1 (you@example.com)"
++	Client    *http.Client
++	BaseURL   string // default https://musicbrainz.org/ws/2
++
++	mu   sync.Mutex
++	last time.Time
++}
++
++func (m *MusicBrainz) throttle() {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if wait := time.Second - time.Since(m.last); wait > 0 {
++		time.Sleep(wait)
++	}
++	m.last = time.Now()
++}
++
++func (m *MusicBrainz) get(ctx context.Context, path string, q url.Values, out any) error {
++	base := m.BaseURL
++	if base == "" {
++		base = "https://musicbrainz.org/ws/2"
++	}
++	cl := m.Client
++	if cl == nil {
++		cl = &http.Client{Timeout: 15 * time.Second}
++	}
++	q.Set("fmt", "json")
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path+"?"+q.Encode(), nil)
++	if err != nil {
++		return err
++	}
++	ua := m.UserAgent
++	if ua == "" {
++		ua = DefaultUserAgent
++	}
++	req.Header.Set("User-Agent", ua)
++	m.throttle()
++	resp, err := cl.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return fmt.Errorf("musicbrainz: HTTP %d", resp.StatusCode)
++	}
++	return json.NewDecoder(resp.Body).Decode(out)
++}
++
++type mbArtistCredit []struct {
++	Name string `json:"name"`
++}
++
++func (a mbArtistCredit) String() string {
++	names := make([]string, 0, len(a))
++	for _, c := range a {
++		names = append(names, c.Name)
++	}
++	return strings.Join(names, ", ")
++}
++
++func yearOf(date string) int {
++	if len(date) >= 4 {
++		if y, err := strconv.Atoi(date[:4]); err == nil {
++			return y
++		}
++	}
++	return 0
++}
++
++// Search returns a mix of albums (release groups) and tracks (recordings).
++func (m *MusicBrainz) Search(ctx context.Context, query string, limit int) ([]CatalogItem, error) {
++	if limit <= 0 {
++		limit = 10
++	}
++	var out []CatalogItem
++	query = luceneEscaper.Replace(query)
++
++	var rgs struct {
++		ReleaseGroups []struct {
++			ID           string         `json:"id"`
++			Title        string         `json:"title"`
++			PrimaryType  string         `json:"primary-type"`
++			FirstRelease string         `json:"first-release-date"`
++			ArtistCredit mbArtistCredit `json:"artist-credit"`
++		} `json:"release-groups"`
++	}
++	if err := m.get(ctx, "/release-group", url.Values{"query": {query}, "limit": {strconv.Itoa(limit)}}, &rgs); err != nil {
++		return nil, err
++	}
++	for _, rg := range rgs.ReleaseGroups {
++		if rg.PrimaryType != "" && rg.PrimaryType != "Album" && rg.PrimaryType != "EP" {
++			continue
++		}
++		out = append(out, CatalogItem{Kind: KindAlbum, MBID: rg.ID, Artist: rg.ArtistCredit.String(), Album: rg.Title, Title: rg.Title, Year: yearOf(rg.FirstRelease)})
++	}
++
++	var recs struct {
++		Recordings []struct {
++			ID           string         `json:"id"`
++			Title        string         `json:"title"`
++			Length       int            `json:"length"`
++			ArtistCredit mbArtistCredit `json:"artist-credit"`
++			Releases     []struct {
++				Title string `json:"title"`
++				Date  string `json:"date"`
++			} `json:"releases"`
++		} `json:"recordings"`
++	}
++	if err := m.get(ctx, "/recording", url.Values{"query": {query}, "limit": {strconv.Itoa(limit)}}, &recs); err != nil {
++		return out, nil // albums alone are still useful
++	}
++	for _, r := range recs.Recordings {
++		it := CatalogItem{Kind: KindTrack, MBID: r.ID, Artist: r.ArtistCredit.String(), Title: r.Title, DurationMs: r.Length}
++		if len(r.Releases) > 0 {
++			it.Album, it.Year = r.Releases[0].Title, yearOf(r.Releases[0].Date)
++		}
++		out = append(out, it)
++	}
++	return out, nil
++}
+diff --git a/core/acquire/model.go b/core/acquire/model.go
+new file mode 100644
+index 0000000..dc84c8f
+--- /dev/null
++++ b/core/acquire/model.go
+@@ -0,0 +1,67 @@
++// Package acquire adds on-demand music acquisition to Navidrome: an external
++// catalog is searched alongside the local library, and requests for tracks or
++// albums that are not yet on disk are fulfilled by pluggable Sources
++// (YouTube via yt-dlp, Soulseek via slskd, Lidarr).
++package acquire
++
++import "time"
++
++type Kind string
++
++const (
++	KindTrack Kind = "track"
++	KindAlbum Kind = "album"
++)
++
++type Status string
++
++const (
++	StatusPending     Status = "pending" // waiting for an admin to approve it
++	StatusQueued      Status = "queued"  // approved, waiting for a worker
++	StatusSearching   Status = "searching"
++	StatusDownloading Status = "downloading"
++	StatusImporting   Status = "importing" // files are on disk, waiting for the Navidrome scan
++	StatusAvailable   Status = "available"
++	StatusFailed      Status = "failed"
++)
++
++// CatalogItem is a track or album from the external catalog (MusicBrainz).
++type CatalogItem struct {
++	Kind       Kind   `json:"kind"`
++	MBID       string `json:"mbid"` // recording MBID (track) or release-group MBID (album)
++	Artist     string `json:"artist"`
++	Album      string `json:"album,omitempty"`
++	Title      string `json:"title"`
++	Year       int    `json:"year,omitempty"`
++	DurationMs int    `json:"durationMs,omitempty"`
++	// InLibrary is filled by the Service after matching against the local library.
++	InLibrary bool `json:"inLibrary"`
++	// LibraryID is the local media_file/album ID when InLibrary is true.
++	LibraryID string `json:"libraryId,omitempty"`
++}
++
++// Request is a user's request to have an item fetched.
++type Request struct {
++	ID        string    `json:"id"`
++	UserID    string    `json:"userId"`
++	Kind      Kind      `json:"kind"`
++	MBID      string    `json:"mbid"`
++	Artist    string    `json:"artist"`
++	Album     string    `json:"album,omitempty"`
++	Title     string    `json:"title"`
++	Status    Status    `json:"status"`
++	Source    string    `json:"source,omitempty"` // name of the Source that fulfilled it
++	Error     string    `json:"error,omitempty"`
++	CreatedAt time.Time `json:"createdAt"`
++	UpdatedAt time.Time `json:"updatedAt"`
++}
++
++// Result is what a Source reports after Fetch.
++type Result struct {
++	// Paths of files written under the library root. Empty for async sources.
++	Paths []string
++	// Async is true when the source hands the job to an external system
++	// (Lidarr) that will import the files on its own; the Service then waits
++	// for the library scan to find the item instead of triggering one itself.
++	Async bool
++}
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+new file mode 100644
+index 0000000..b174c39
+--- /dev/null
++++ b/core/acquire/service.go
+@@ -0,0 +1,351 @@
++package acquire
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++func newID() string {
++	b := make([]byte, 16)
++	_, _ = rand.Read(b)
++	return hex.EncodeToString(b)
++}
++
++var (
++	ErrInLibrary = errors.New("already in library")
++	ErrNotFound  = errors.New("request not found")
++	ErrBadState  = errors.New("request cannot be approved in its current state")
++)
++
++// Catalog searches the external catalog.
++type Catalog interface {
++	Search(ctx context.Context, query string, limit int) ([]CatalogItem, error)
++}
++
++// Source fetches music from somewhere. Sources are tried in priority order.
++type Source interface {
++	Name() string
++	Enabled() bool
++	// Supports reports whether the source can handle this kind of request
++	// (e.g. yt-dlp is track-oriented, Lidarr is album-oriented).
++	Supports(k Kind) bool
++	Fetch(ctx context.Context, req Request, destDir string) (Result, error)
++}
++
++// Store persists requests (SQLStore for the `acquire_request` table, MemoryStore for tests).
++type Store interface {
++	Create(ctx context.Context, r *Request) error
++	Update(ctx context.Context, r *Request) error
++	// Get returns ErrNotFound when the request does not exist.
++	Get(ctx context.Context, id string) (*Request, error)
++	// List returns the requests of one user, or of everybody when userID is empty, newest first.
++	List(ctx context.Context, userID string) ([]Request, error)
++	// ListByStatus returns all requests in any of the given statuses, oldest first.
++	ListByStatus(ctx context.Context, statuses ...Status) ([]Request, error)
++	// FindActive returns an existing non-failed request for the same MBID/kind, or nil.
++	FindActive(ctx context.Context, kind Kind, mbid string) (*Request, error)
++}
++
++// Library lets the Service interact with the rest of Navidrome without
++// importing it (keeps this package testable on its own).
++type Library interface {
++	// Match returns the local ID of an item if it is already in the library.
++	Match(ctx context.Context, item CatalogItem) (id string, ok bool)
++	// Rescan asks Navidrome to scan for new files. It may block until the scan ends.
++	Rescan(ctx context.Context) error
++}
++
++type Config struct {
++	DestDir     string // where Sources should write files; must be inside the library root
++	Workers     int
++	AutoApprove bool // false = requests wait for an admin (Jellyseerr-style approval)
++	// ImportTimeout is how long a request may stay "importing" before it fails.
++	ImportTimeout time.Duration
++	// PollInterval is how often importing requests are checked against the library.
++	PollInterval time.Duration
++	// RescanInterval is the minimum time between rescans triggered while waiting for imports.
++	RescanInterval time.Duration
++}
++
++type Service struct {
++	cfg     Config
++	catalog Catalog
++	sources []Source
++	store   Store
++	lib     Library
++
++	queue      chan string
++	mu         sync.Mutex
++	inflight   map[string]bool // queued or being processed, to avoid double processing
++	scanning   atomic.Bool
++	lastRescan time.Time
++	wg         sync.WaitGroup
++}
++
++func NewService(cfg Config, catalog Catalog, sources []Source, store Store, lib Library) *Service {
++	if cfg.Workers <= 0 {
++		cfg.Workers = 2
++	}
++	if cfg.ImportTimeout <= 0 {
++		cfg.ImportTimeout = 30 * time.Minute
++	}
++	if cfg.PollInterval <= 0 {
++		cfg.PollInterval = 15 * time.Second
++	}
++	if cfg.RescanInterval <= 0 {
++		cfg.RescanInterval = 2 * time.Minute
++	}
++	return &Service{
++		cfg: cfg, catalog: catalog, sources: sources, store: store, lib: lib,
++		queue:    make(chan string, 256),
++		inflight: map[string]bool{},
++	}
++}
++
++// Start launches the workers and the import watcher; they stop when ctx is cancelled.
++// Requests that were queued or in progress when the server stopped are picked up again.
++func (s *Service) Start(ctx context.Context) {
++	for i := 0; i < s.cfg.Workers; i++ {
++		s.wg.Go(func() {
++			for {
++				select {
++				case <-ctx.Done():
++					return
++				case id := <-s.queue:
++					s.process(ctx, id)
++				}
++			}
++		})
++	}
++	s.wg.Go(func() { s.watchImports(ctx) })
++
++	pending, err := s.store.ListByStatus(ctx, StatusQueued, StatusSearching, StatusDownloading)
++	if err != nil {
++		return
++	}
++	for _, r := range pending {
++		s.enqueue(ctx, r.ID)
++	}
++}
++
++// Wait blocks until all goroutines started by Start have returned.
++func (s *Service) Wait() { s.wg.Wait() }
++
++// SearchCatalog returns external results, flagging those already in the library
++// so the UI can show "play" vs "request".
++func (s *Service) SearchCatalog(ctx context.Context, query string, limit int) ([]CatalogItem, error) {
++	query = strings.TrimSpace(query)
++	if query == "" {
++		return nil, nil
++	}
++	items, err := s.catalog.Search(ctx, query, limit)
++	if err != nil {
++		return nil, err
++	}
++	for i := range items {
++		if id, ok := s.lib.Match(ctx, items[i]); ok {
++			items[i].InLibrary, items[i].LibraryID = true, id
++		}
++	}
++	return items, nil
++}
++
++// Submit creates a request (or returns the existing active one).
++func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (*Request, error) {
++	if item.MBID == "" || item.Title == "" {
++		return nil, errors.New("mbid and title are required")
++	}
++	if item.Kind != KindTrack && item.Kind != KindAlbum {
++		return nil, fmt.Errorf("invalid kind %q", item.Kind)
++	}
++	if id, ok := s.lib.Match(ctx, item); ok {
++		return nil, fmt.Errorf("%w (%s)", ErrInLibrary, id)
++	}
++	existing, err := s.store.FindActive(ctx, item.Kind, item.MBID)
++	if err != nil {
++		return nil, err
++	}
++	if existing != nil {
++		return existing, nil
++	}
++	now := time.Now()
++	req := &Request{
++		ID: newID(), UserID: userID, Kind: item.Kind, MBID: item.MBID,
++		Artist: item.Artist, Album: item.Album, Title: item.Title,
++		Status: StatusPending, CreatedAt: now, UpdatedAt: now,
++	}
++	if s.cfg.AutoApprove {
++		req.Status = StatusQueued
++	}
++	if err := s.store.Create(ctx, req); err != nil {
++		return nil, err
++	}
++	if req.Status == StatusQueued {
++		s.enqueue(ctx, req.ID)
++	}
++	return req, nil
++}
++
++// Approve queues a pending request (admin action when AutoApprove is false).
++// Failed requests can be approved again to retry them.
++func (s *Service) Approve(ctx context.Context, id string) (*Request, error) {
++	req, err := s.store.Get(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	if req.Status != StatusPending && req.Status != StatusFailed {
++		return nil, fmt.Errorf("%w (%s)", ErrBadState, req.Status)
++	}
++	s.setStatus(ctx, req, StatusQueued, "")
++	s.enqueue(ctx, req.ID)
++	return req, nil
++}
++
++// enqueue hands a request to the workers, unless it is already queued or running.
++// It never drops a request: when the buffer is full it waits in the background.
++func (s *Service) enqueue(ctx context.Context, id string) {
++	s.mu.Lock()
++	if s.inflight[id] {
++		s.mu.Unlock()
++		return
++	}
++	s.inflight[id] = true
++	s.mu.Unlock()
++
++	select {
++	case s.queue <- id:
++	default:
++		go func() {
++			select {
++			case s.queue <- id:
++			case <-ctx.Done():
++			}
++		}()
++	}
++}
++
++func (s *Service) done(id string) {
++	s.mu.Lock()
++	delete(s.inflight, id)
++	s.mu.Unlock()
++}
++
++func (s *Service) process(ctx context.Context, id string) {
++	defer s.done(id)
++	req, err := s.store.Get(ctx, id)
++	if err != nil || req == nil {
++		return
++	}
++	s.setStatus(ctx, req, StatusSearching, "")
++
++	var errs []string
++	for _, src := range s.sources {
++		if !src.Enabled() || !src.Supports(req.Kind) {
++			continue
++		}
++		req.Source = src.Name()
++		s.setStatus(ctx, req, StatusDownloading, "")
++		res, err := src.Fetch(ctx, *req, s.cfg.DestDir)
++		if ctx.Err() != nil {
++			return // shutting down: the request is resumed on the next Start
++		}
++		if err != nil {
++			errs = append(errs, fmt.Sprintf("%s: %v", src.Name(), err))
++			continue // fall through to the next source
++		}
++		s.setStatus(ctx, req, StatusImporting, "")
++		if !res.Async {
++			go s.rescan(ctx)
++		}
++		return // watchImports takes it from here
++	}
++	req.Source = ""
++	msg := "no enabled source supports this request"
++	if len(errs) > 0 {
++		msg = strings.Join(errs, "; ")
++	}
++	s.setStatus(ctx, req, StatusFailed, msg)
++}
++
++// watchImports marks importing requests available once the library has them,
++// and fails them after ImportTimeout. It runs in its own goroutine so that
++// slow imports (e.g. Lidarr) never hold a worker.
++func (s *Service) watchImports(ctx context.Context) {
++	t := time.NewTicker(s.cfg.PollInterval)
++	defer t.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-t.C:
++		}
++		s.checkImports(ctx)
++	}
++}
++
++func (s *Service) checkImports(ctx context.Context) {
++	reqs, err := s.store.ListByStatus(ctx, StatusImporting)
++	if err != nil {
++		return
++	}
++	waiting := false
++	for i := range reqs {
++		req := &reqs[i]
++		item := CatalogItem{Kind: req.Kind, MBID: req.MBID, Artist: req.Artist, Album: req.Album, Title: req.Title}
++		switch {
++		case s.matched(ctx, item):
++			s.setStatus(ctx, req, StatusAvailable, "")
++		case time.Since(req.UpdatedAt) > s.cfg.ImportTimeout:
++			s.setStatus(ctx, req, StatusFailed, "timed out waiting for the library scan")
++		default:
++			waiting = true
++		}
++	}
++	if waiting {
++		s.mu.Lock()
++		due := time.Since(s.lastRescan) >= s.cfg.RescanInterval
++		s.mu.Unlock()
++		if due {
++			go s.rescan(ctx)
++		}
++	}
++}
++
++func (s *Service) matched(ctx context.Context, item CatalogItem) bool {
++	_, ok := s.lib.Match(ctx, item)
++	return ok
++}
++
++// rescan triggers a library scan, skipping it when one started by us is still running.
++func (s *Service) rescan(ctx context.Context) {
++	if !s.scanning.CompareAndSwap(false, true) {
++		return
++	}
++	defer s.scanning.Store(false)
++	s.mu.Lock()
++	s.lastRescan = time.Now()
++	s.mu.Unlock()
++	_ = s.lib.Rescan(ctx)
++}
++
++func (s *Service) setStatus(ctx context.Context, req *Request, st Status, errMsg string) {
++	req.Status, req.Error, req.UpdatedAt = st, errMsg, time.Now()
++	_ = s.store.Update(ctx, req)
++}
++
++// Get returns one request.
++func (s *Service) Get(ctx context.Context, id string) (*Request, error) {
++	return s.store.Get(ctx, id)
++}
++
++// List returns the requests of a user, or of everybody when userID is empty.
++func (s *Service) List(ctx context.Context, userID string) ([]Request, error) {
++	return s.store.List(ctx, userID)
++}
+diff --git a/core/acquire/service_test.go b/core/acquire/service_test.go
+new file mode 100644
+index 0000000..0a6ef46
+--- /dev/null
++++ b/core/acquire/service_test.go
+@@ -0,0 +1,245 @@
++package acquire
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"testing"
++	"time"
++)
++
++type fakeCatalog struct{ items []CatalogItem }
++
++func (f fakeCatalog) Search(context.Context, string, int) ([]CatalogItem, error) {
++	return append([]CatalogItem(nil), f.items...), nil
++}
++
++type fakeLib struct {
++	mu    sync.Mutex
++	have  map[string]bool // by MBID
++	scans int
++}
++
++func (l *fakeLib) Match(_ context.Context, it CatalogItem) (string, bool) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	return "lib-" + it.MBID, l.have[it.MBID]
++}
++func (l *fakeLib) scanCount() int {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	return l.scans
++}
++
++func (l *fakeLib) Rescan(context.Context) error {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	l.scans++
++	return nil
++}
++
++type fakeSource struct {
++	name string
++	kind Kind
++	err  error
++	lib  *fakeLib
++}
++
++func (s *fakeSource) Name() string         { return s.name }
++func (s *fakeSource) Enabled() bool        { return true }
++func (s *fakeSource) Supports(k Kind) bool { return k == s.kind }
++func (s *fakeSource) Fetch(_ context.Context, r Request, _ string) (Result, error) {
++	if s.err != nil {
++		return Result{}, s.err
++	}
++	s.lib.mu.Lock()
++	s.lib.have[r.MBID] = true // simulate the scan finding the file
++	s.lib.mu.Unlock()
++	return Result{Paths: []string{"/music/x.opus"}}, nil
++}
++
++func fastConfig(autoApprove bool) Config {
++	return Config{AutoApprove: autoApprove, PollInterval: 10 * time.Millisecond, ImportTimeout: time.Second}
++}
++
++func waitStatus(t *testing.T, st Store, id string, want Status) *Request {
++	t.Helper()
++	for i := 0; i < 200; i++ {
++		if r, _ := st.Get(context.Background(), id); r != nil && r.Status == want {
++			return r
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	r, _ := st.Get(context.Background(), id)
++	t.Fatalf("request never reached %s (now %+v)", want, r)
++	return nil
++}
++
++func TestFallbackToNextSourceAndAvailable(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	srcs := []Source{
++		&fakeSource{name: "soulseek", kind: KindTrack, err: errors.New("no peers"), lib: lib},
++		&fakeSource{name: "youtube", kind: KindTrack, lib: lib},
++	}
++	svc := NewService(fastConfig(true), fakeCatalog{}, srcs, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++
++	req, err := svc.Submit(ctx, "u1", CatalogItem{Kind: KindTrack, MBID: "m1", Artist: "A", Title: "T"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := waitStatus(t, st, req.ID, StatusAvailable)
++	if got.Source != "youtube" {
++		t.Errorf("expected youtube to win after soulseek failed, got %q", got.Source)
++	}
++	if lib.scanCount() < 1 {
++		t.Error("expected a rescan after the download")
++	}
++	if got.Error != "" {
++		t.Errorf("error should be cleared on success, got %q", got.Error)
++	}
++}
++
++func TestSubmitRejectsLibraryItemsAndDedupes(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{"owned": true}}
++	st := NewMemoryStore()
++	svc := NewService(Config{AutoApprove: false}, fakeCatalog{}, nil, st, lib)
++	ctx := context.Background()
++
++	if _, err := svc.Submit(ctx, "u1", CatalogItem{Kind: KindTrack, MBID: "owned", Title: "T"}); err == nil {
++		t.Error("expected error for item already in library")
++	}
++	a, _ := svc.Submit(ctx, "u1", CatalogItem{Kind: KindTrack, MBID: "m2", Title: "T"})
++	b, _ := svc.Submit(ctx, "u2", CatalogItem{Kind: KindTrack, MBID: "m2", Title: "T"})
++	if a.ID != b.ID {
++		t.Error("duplicate request should return the existing one")
++	}
++	if a.Status != StatusPending {
++		t.Errorf("without auto-approve the request must stay pending, got %s", a.Status)
++	}
++}
++
++func TestSearchCatalogFlagsLibraryItems(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{"x": true}}
++	cat := fakeCatalog{items: []CatalogItem{{MBID: "x", Title: "Have"}, {MBID: "y", Title: "Missing"}}}
++	svc := NewService(Config{}, cat, nil, NewMemoryStore(), lib)
++	items, err := svc.SearchCatalog(context.Background(), "q", 10)
++	if err != nil || len(items) != 2 {
++		t.Fatalf("unexpected: %v %v", items, err)
++	}
++	if !items[0].InLibrary || items[1].InLibrary {
++		t.Errorf("library flags wrong: %+v", items)
++	}
++}
++
++func TestNoSourceFails(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	svc := NewService(Config{AutoApprove: true}, fakeCatalog{}, nil, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++	req, _ := svc.Submit(ctx, "u", CatalogItem{Kind: KindAlbum, MBID: "m3", Title: "T"})
++	waitStatus(t, st, req.ID, StatusFailed)
++}
++
++func TestApprovalFlow(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	srcs := []Source{&fakeSource{name: "youtube", kind: KindTrack, lib: lib}}
++	svc := NewService(fastConfig(false), fakeCatalog{}, srcs, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++
++	req, _ := svc.Submit(ctx, "u", CatalogItem{Kind: KindTrack, MBID: "m4", Title: "T"})
++	time.Sleep(50 * time.Millisecond)
++	if r, _ := st.Get(ctx, req.ID); r.Status != StatusPending {
++		t.Fatalf("unapproved request must not run, got %s", r.Status)
++	}
++	if _, err := svc.Approve(ctx, req.ID); err != nil {
++		t.Fatal(err)
++	}
++	waitStatus(t, st, req.ID, StatusAvailable)
++	if _, err := svc.Approve(ctx, req.ID); !errors.Is(err, ErrBadState) {
++		t.Errorf("approving an available request should fail, got %v", err)
++	}
++	if _, err := svc.Approve(ctx, "nope"); !errors.Is(err, ErrNotFound) {
++		t.Errorf("expected ErrNotFound, got %v", err)
++	}
++}
++
++// asyncSource hands the job to an external system and never adds the file itself.
++type asyncSource struct{}
++
++func (asyncSource) Name() string       { return "lidarr" }
++func (asyncSource) Enabled() bool      { return true }
++func (asyncSource) Supports(Kind) bool { return true }
++func (asyncSource) Fetch(context.Context, Request, string) (Result, error) {
++	return Result{Async: true}, nil
++}
++
++func TestImportWatcherDoesNotHoldWorkers(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	cfg := fastConfig(true)
++	cfg.Workers = 1
++	cfg.ImportTimeout = time.Hour
++	svc := NewService(cfg, fakeCatalog{}, []Source{asyncSource{}}, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++
++	// With a single worker, both requests must reach "importing" without waiting on each other.
++	a, _ := svc.Submit(ctx, "u", CatalogItem{Kind: KindAlbum, MBID: "a1", Title: "A"})
++	b, _ := svc.Submit(ctx, "u", CatalogItem{Kind: KindAlbum, MBID: "b1", Title: "B"})
++	waitStatus(t, st, a.ID, StatusImporting)
++	waitStatus(t, st, b.ID, StatusImporting)
++
++	lib.mu.Lock()
++	lib.have["a1"] = true // Lidarr finished importing album a1
++	lib.mu.Unlock()
++	waitStatus(t, st, a.ID, StatusAvailable)
++}
++
++func TestImportTimeout(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	cfg := fastConfig(true)
++	cfg.ImportTimeout = 30 * time.Millisecond
++	svc := NewService(cfg, fakeCatalog{}, []Source{asyncSource{}}, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++	req, _ := svc.Submit(ctx, "u", CatalogItem{Kind: KindAlbum, MBID: "t1", Title: "T"})
++	got := waitStatus(t, st, req.ID, StatusFailed)
++	if got.Error == "" {
++		t.Error("expected a timeout error message")
++	}
++}
++
++func TestStartResumesQueuedRequests(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	now := time.Now()
++	for _, r := range []Request{
++		{ID: "q", Kind: KindTrack, MBID: "q", Title: "Q", Status: StatusQueued, CreatedAt: now, UpdatedAt: now},
++		{ID: "d", Kind: KindTrack, MBID: "d", Title: "D", Status: StatusDownloading, CreatedAt: now, UpdatedAt: now},
++		{ID: "p", Kind: KindTrack, MBID: "p", Title: "P", Status: StatusPending, CreatedAt: now, UpdatedAt: now},
++	} {
++		_ = st.Create(context.Background(), &r)
++	}
++	srcs := []Source{&fakeSource{name: "youtube", kind: KindTrack, lib: lib}}
++	svc := NewService(fastConfig(false), fakeCatalog{}, srcs, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++	waitStatus(t, st, "q", StatusAvailable)
++	waitStatus(t, st, "d", StatusAvailable)
++	if r, _ := st.Get(ctx, "p"); r.Status != StatusPending {
++		t.Errorf("pending (unapproved) request must stay pending, got %s", r.Status)
++	}
++}
+diff --git a/core/acquire/source_lidarr.go b/core/acquire/source_lidarr.go
+new file mode 100644
+index 0000000..8985332
+--- /dev/null
++++ b/core/acquire/source_lidarr.go
+@@ -0,0 +1,110 @@
++package acquire
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++// Lidarr hands album requests to an existing Lidarr instance, which does its
++// own indexer search, download and import. Lidarr must use the same library
++// root as Navidrome (same underlying folder).
++//
++// NOTE: endpoint shapes follow Lidarr's v1 API from memory and must be
++// validated against a live instance (see PLAN.md, phase 3).
++type Lidarr struct {
++	BaseURL           string // e.g. http://lidarr:8686
++	APIKey            string
++	RootFolder        string // Lidarr root folder path
++	QualityProfileID  int
++	MetadataProfileID int
++	Client            *http.Client
++	On                bool
++}
++
++func (l *Lidarr) Name() string         { return "lidarr" }
++func (l *Lidarr) Enabled() bool        { return l.On && l.BaseURL != "" && l.APIKey != "" }
++func (l *Lidarr) Supports(k Kind) bool { return k == KindAlbum }
++
++func (l *Lidarr) do(ctx context.Context, method, path string, body any, out any) error {
++	cl := l.Client
++	if cl == nil {
++		cl = &http.Client{Timeout: 30 * time.Second}
++	}
++	var rdr *bytes.Reader
++	if body != nil {
++		b, _ := json.Marshal(body)
++		rdr = bytes.NewReader(b)
++	} else {
++		rdr = bytes.NewReader(nil)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(l.BaseURL, "/")+path, rdr)
++	if err != nil {
++		return err
++	}
++	req.Header.Set("X-Api-Key", l.APIKey)
++	req.Header.Set("Content-Type", "application/json")
++	resp, err := cl.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode >= 300 {
++		return fmt.Errorf("lidarr %s %s: HTTP %d", method, path, resp.StatusCode)
++	}
++	if out != nil {
++		return json.NewDecoder(resp.Body).Decode(out)
++	}
++	return nil
++}
++
++func (l *Lidarr) Fetch(ctx context.Context, req Request, _ string) (Result, error) {
++	// 1. Look the album up by its release-group MBID.
++	var found []struct {
++		ID     int    `json:"id"` // 0 when not yet in Lidarr
++		Title  string `json:"title"`
++		Artist struct {
++			ForeignArtistID string `json:"foreignArtistId"`
++			ArtistName      string `json:"artistName"`
++		} `json:"artist"`
++		ForeignAlbumID string `json:"foreignAlbumId"`
++	}
++	if err := l.do(ctx, http.MethodGet, "/api/v1/album/lookup?term="+url.QueryEscape("lidarr:"+req.MBID), nil, &found); err != nil {
++		return Result{}, err
++	}
++	if len(found) == 0 {
++		return Result{}, errors.New("album not found in Lidarr lookup")
++	}
++	album := found[0]
++
++	// 2. Add the album (and its artist, unmonitored apart from this album) if new.
++	if album.ID == 0 {
++		payload := map[string]any{
++			"title": album.Title, "foreignAlbumId": album.ForeignAlbumID, "monitored": true,
++			"artist": map[string]any{
++				"foreignArtistId": album.Artist.ForeignArtistID, "artistName": album.Artist.ArtistName,
++				"qualityProfileId": l.QualityProfileID, "metadataProfileId": l.MetadataProfileID,
++				"rootFolderPath": l.RootFolder, "monitored": true,
++				"addOptions": map[string]any{"monitor": "none"},
++			},
++			"addOptions": map[string]any{"searchForNewAlbum": true},
++		}
++		if err := l.do(ctx, http.MethodPost, "/api/v1/album", payload, &album); err != nil {
++			return Result{}, err
++		}
++		return Result{Async: true}, nil // searchForNewAlbum already kicks off the search
++	}
++
++	// 3. Already known to Lidarr: trigger a search.
++	cmd := map[string]any{"name": "AlbumSearch", "albumIds": []int{album.ID}}
++	if err := l.do(ctx, http.MethodPost, "/api/v1/command", cmd, nil); err != nil {
++		return Result{}, err
++	}
++	return Result{Async: true}, nil
++}
+diff --git a/core/acquire/source_soulseek.go b/core/acquire/source_soulseek.go
+new file mode 100644
+index 0000000..6887351
+--- /dev/null
++++ b/core/acquire/source_soulseek.go
+@@ -0,0 +1,327 @@
++package acquire
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"io/fs"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++// Soulseek talks to a slskd instance (https://github.com/slskd/slskd).
++// slskd downloads into its own downloads directory, so that directory must be
++// reachable by Navidrome (shared volume, DownloadDir). When the transfer
++// completes the files are moved into the library as Artist/Album/<file>.
++//
++// NOTE: endpoint shapes follow slskd's /api/v0 from memory and must be
++// validated against a live instance.
++type Soulseek struct {
++	BaseURL string // e.g. http://slskd:5030
++	APIKey  string
++	Client  *http.Client
++	On      bool
++	// DownloadDir is slskd's downloads directory as seen by Navidrome.
++	DownloadDir string
++	// PreferFLAC favors lossless files when ranking peers.
++	PreferFLAC bool
++	// Timeout for the whole download (default 30 minutes).
++	Timeout time.Duration
++	// PollInterval between transfer status checks (default 5 seconds).
++	PollInterval time.Duration
++
++	searchPoll time.Duration // tests only; default 5 seconds
++}
++
++func (s *Soulseek) Name() string { return "soulseek" }
++func (s *Soulseek) Enabled() bool {
++	return s.On && s.BaseURL != "" && s.APIKey != "" && s.DownloadDir != ""
++}
++func (s *Soulseek) Supports(k Kind) bool { return k == KindTrack || k == KindAlbum }
++
++type slskFile struct {
++	Filename string `json:"filename"`
++	Size     int64  `json:"size"`
++	BitRate  int    `json:"bitRate"`
++}
++
++type slskResponse struct {
++	Username    string     `json:"username"`
++	HasFreeSlot bool       `json:"hasFreeUploadSlot"`
++	Files       []slskFile `json:"files"`
++}
++
++func (s *Soulseek) do(ctx context.Context, method, path string, body, out any) error {
++	cl := s.Client
++	if cl == nil {
++		cl = &http.Client{Timeout: 30 * time.Second}
++	}
++	var rdr *bytes.Reader
++	if body != nil {
++		b, _ := json.Marshal(body)
++		rdr = bytes.NewReader(b)
++	} else {
++		rdr = bytes.NewReader(nil)
++	}
++	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(s.BaseURL, "/")+path, rdr)
++	if err != nil {
++		return err
++	}
++	req.Header.Set("X-API-Key", s.APIKey)
++	req.Header.Set("Content-Type", "application/json")
++	resp, err := cl.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode >= 300 {
++		return fmt.Errorf("slskd %s %s: HTTP %d", method, path, resp.StatusCode)
++	}
++	if out != nil {
++		return json.NewDecoder(resp.Body).Decode(out)
++	}
++	return nil
++}
++
++func (s *Soulseek) Fetch(ctx context.Context, req Request, destDir string) (Result, error) {
++	text := strings.TrimSpace(req.Artist + " " + req.Title)
++	if req.Kind == KindAlbum {
++		text = strings.TrimSpace(req.Artist + " " + req.Album)
++	}
++
++	var search struct {
++		ID string `json:"id"`
++	}
++	if err := s.do(ctx, http.MethodPost, "/api/v0/searches", map[string]any{"searchText": text}, &search); err != nil {
++		return Result{}, err
++	}
++
++	// Poll until the search completes (slskd searches run ~15s by default).
++	var responses []slskResponse
++	every := s.searchPoll
++	if every <= 0 {
++		every = 5 * time.Second
++	}
++	for i := 0; i < 12; i++ {
++		select {
++		case <-ctx.Done():
++			return Result{}, ctx.Err()
++		case <-time.After(every):
++		}
++		var st struct {
++			IsComplete bool `json:"isComplete"`
++		}
++		if err := s.do(ctx, http.MethodGet, "/api/v0/searches/"+url.PathEscape(search.ID), nil, &st); err != nil {
++			return Result{}, err
++		}
++		if st.IsComplete {
++			break
++		}
++	}
++	if err := s.do(ctx, http.MethodGet, "/api/v0/searches/"+url.PathEscape(search.ID)+"/responses", nil, &responses); err != nil {
++		return Result{}, err
++	}
++
++	user, files := s.pick(req, responses)
++	if len(files) == 0 {
++		return Result{}, errors.New("no matching files on Soulseek")
++	}
++	if err := s.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+url.PathEscape(user), files, nil); err != nil {
++		return Result{}, err
++	}
++	if err := s.waitTransfers(ctx, user, files); err != nil {
++		return Result{}, err
++	}
++	paths, err := s.importFiles(req, files, destDir)
++	if err != nil {
++		return Result{}, err
++	}
++	return Result{Paths: paths}, nil
++}
++
++type slskTransfer struct {
++	Filename string `json:"filename"`
++	State    string `json:"state"`
++}
++
++// waitTransfers polls slskd until every requested file finished. Any file
++// that ends in a non-successful state fails the whole fetch.
++func (s *Soulseek) waitTransfers(ctx context.Context, user string, files []slskFile) error {
++	timeout, every := s.Timeout, s.PollInterval
++	if timeout <= 0 {
++		timeout = 30 * time.Minute
++	}
++	if every <= 0 {
++		every = 5 * time.Second
++	}
++	ctx, cancel := context.WithTimeout(ctx, timeout)
++	defer cancel()
++	want := map[string]bool{}
++	for _, f := range files {
++		want[f.Filename] = true
++	}
++	for {
++		select {
++		case <-ctx.Done():
++			return fmt.Errorf("download did not finish: %w", ctx.Err())
++		case <-time.After(every):
++		}
++		var st struct {
++			Directories []struct {
++				Files []slskTransfer `json:"files"`
++			} `json:"directories"`
++		}
++		if err := s.do(ctx, http.MethodGet, "/api/v0/transfers/downloads/"+url.PathEscape(user), nil, &st); err != nil {
++			return err
++		}
++		done := 0
++		for _, d := range st.Directories {
++			for _, t := range d.Files {
++				if !want[t.Filename] || !strings.HasPrefix(t.State, "Completed") {
++					continue
++				}
++				if !strings.Contains(t.State, "Succeeded") {
++					return fmt.Errorf("transfer of %s ended as %q", remoteBase(t.Filename), t.State)
++				}
++				done++
++			}
++		}
++		if done >= len(want) {
++			return nil
++		}
++	}
++}
++
++// importFiles moves downloaded files from slskd's folder into the library.
++// slskd stores a remote `a\b\Album\01.flac` as <DownloadDir>/Album/01.flac.
++func (s *Soulseek) importFiles(req Request, files []slskFile, destDir string) ([]string, error) {
++	album := req.Album
++	if album == "" && req.Kind == KindAlbum {
++		album = req.Title
++	}
++	dir := filepath.Join(destDir, sanitize(req.Artist), sanitize(album))
++	if err := ensureInside(destDir, dir); err != nil {
++		return nil, err
++	}
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return nil, err
++	}
++	var paths []string
++	for _, f := range files {
++		src := filepath.Join(s.DownloadDir, sanitize(remoteParent(f.Filename)), remoteBase(f.Filename))
++		if _, err := os.Stat(src); err != nil {
++			if src = findFile(s.DownloadDir, remoteBase(f.Filename)); src == "" {
++				return paths, fmt.Errorf("downloaded file %s not found in %s", remoteBase(f.Filename), s.DownloadDir)
++			}
++		}
++		dst := filepath.Join(dir, sanitize(remoteBase(f.Filename)))
++		if err := moveFile(src, dst); err != nil {
++			return paths, err
++		}
++		paths = append(paths, dst)
++	}
++	return paths, nil
++}
++
++// Remote Soulseek paths use Windows separators.
++func remoteParts(name string) []string {
++	return strings.FieldsFunc(name, func(r rune) bool { return r == '\\' || r == '/' })
++}
++
++func remoteBase(name string) string {
++	p := remoteParts(name)
++	if len(p) == 0 {
++		return name
++	}
++	return p[len(p)-1]
++}
++
++func remoteParent(name string) string {
++	p := remoteParts(name)
++	if len(p) < 2 {
++		return ""
++	}
++	return p[len(p)-2]
++}
++
++func findFile(root, base string) string {
++	var found string
++	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
++		if err == nil && !d.IsDir() && d.Name() == base {
++			found = p
++			return fs.SkipAll
++		}
++		return nil
++	})
++	return found
++}
++
++// moveFile renames, falling back to copy+delete across filesystems.
++func moveFile(src, dst string) error {
++	if err := os.Rename(src, dst); err == nil {
++		return nil
++	}
++	in, err := os.Open(src)
++	if err != nil {
++		return err
++	}
++	defer in.Close()
++	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
++	if err != nil {
++		return err
++	}
++	if _, err := io.Copy(out, in); err != nil {
++		out.Close()
++		_ = os.Remove(dst)
++		return err
++	}
++	if err := out.Close(); err != nil {
++		return err
++	}
++	return os.Remove(src)
++}
++
++// pick chooses the best peer: audio files matching the title (track) or the
++// most complete folder (album), preferring free slots and lossless/high bitrate.
++func (s *Soulseek) pick(req Request, rs []slskResponse) (string, []slskFile) {
++	bestScore, bestUser := -1, ""
++	var best []slskFile
++	want := strings.ToLower(req.Title)
++	for _, r := range rs {
++		var cand []slskFile
++		for _, f := range r.Files {
++			ext := strings.ToLower(filepath.Ext(f.Filename))
++			if ext != ".flac" && ext != ".mp3" && ext != ".m4a" && ext != ".ogg" && ext != ".opus" {
++				continue
++			}
++			if req.Kind == KindTrack && !strings.Contains(strings.ToLower(f.Filename), want) {
++				continue
++			}
++			cand = append(cand, f)
++		}
++		if len(cand) == 0 {
++			continue
++		}
++		if req.Kind == KindTrack {
++			cand = cand[:1]
++		}
++		score := len(cand)
++		if r.HasFreeSlot {
++			score += 100
++		}
++		if s.PreferFLAC && strings.HasSuffix(strings.ToLower(cand[0].Filename), ".flac") {
++			score += 50
++		}
++		if score > bestScore {
++			bestScore, bestUser, best = score, r.Username, cand
++		}
++	}
++	return bestUser, best
++}
+diff --git a/core/acquire/source_soulseek_test.go b/core/acquire/source_soulseek_test.go
+new file mode 100644
+index 0000000..8c68594
+--- /dev/null
++++ b/core/acquire/source_soulseek_test.go
+@@ -0,0 +1,100 @@
++package acquire
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// fakeSlskd emulates the slskd endpoints the Soulseek source uses. When the
++// download is queued it "downloads" the file into dlDir after a couple of polls.
++func fakeSlskd(t *testing.T, dlDir, finalState string) *httptest.Server {
++	var polls atomic.Int32
++	const remote = `@@music\Artist\Album\01 - Song.flac`
++	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.Header.Get("X-API-Key") != "key" {
++			w.WriteHeader(http.StatusUnauthorized)
++			return
++		}
++		switch {
++		case r.Method == http.MethodPost && r.URL.Path == "/api/v0/searches":
++			_ = json.NewEncoder(w).Encode(map[string]string{"id": "s1"})
++		case r.Method == http.MethodGet && r.URL.Path == "/api/v0/searches/s1":
++			_ = json.NewEncoder(w).Encode(map[string]bool{"isComplete": true})
++		case r.URL.Path == "/api/v0/searches/s1/responses":
++			_ = json.NewEncoder(w).Encode([]slskResponse{
++				{Username: "slow", Files: []slskFile{{Filename: `x\Song.mp3`}}},
++				{Username: "peer", HasFreeSlot: true, Files: []slskFile{{Filename: remote, Size: 4}, {Filename: `x\cover.jpg`}}},
++			})
++		case r.Method == http.MethodPost && r.URL.Path == "/api/v0/transfers/downloads/peer":
++			var files []slskFile
++			_ = json.NewDecoder(r.Body).Decode(&files)
++			if len(files) != 1 || files[0].Filename != remote {
++				t.Errorf("unexpected files queued: %+v", files)
++			}
++		case r.Method == http.MethodGet && r.URL.Path == "/api/v0/transfers/downloads/peer":
++			state := "InProgress"
++			if polls.Add(1) >= 2 {
++				state = finalState
++				_ = os.MkdirAll(filepath.Join(dlDir, "Album"), 0o755)
++				_ = os.WriteFile(filepath.Join(dlDir, "Album", "01 - Song.flac"), []byte("flac"), 0o644)
++			}
++			_ = json.NewEncoder(w).Encode(map[string]any{"directories": []any{
++				map[string]any{"files": []slskTransfer{{Filename: remote, State: state}}},
++			}})
++		default:
++			t.Errorf("unexpected call %s %s", r.Method, r.URL.Path)
++			w.WriteHeader(http.StatusNotFound)
++		}
++	}))
++}
++
++func TestSoulseekDownloadsAndImports(t *testing.T) {
++	dl, lib := t.TempDir(), t.TempDir()
++	srv := fakeSlskd(t, dl, "Completed, Succeeded")
++	defer srv.Close()
++	s := &Soulseek{BaseURL: srv.URL, APIKey: "key", DownloadDir: dl, On: true, PollInterval: time.Millisecond}
++	s.searchPoll = time.Millisecond
++
++	res, err := s.Fetch(context.Background(), Request{Kind: KindTrack, Artist: "Artist", Album: "Album", Title: "Song"}, lib)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := filepath.Join(lib, "Artist", "Album", "01 - Song.flac")
++	if len(res.Paths) != 1 || res.Paths[0] != want {
++		t.Fatalf("paths = %v, want %s", res.Paths, want)
++	}
++	if _, err := os.Stat(want); err != nil {
++		t.Error("file was not moved into the library")
++	}
++}
++
++func TestSoulseekFailedTransfer(t *testing.T) {
++	dl := t.TempDir()
++	srv := fakeSlskd(t, dl, "Completed, Errored")
++	defer srv.Close()
++	s := &Soulseek{BaseURL: srv.URL, APIKey: "key", DownloadDir: dl, On: true, PollInterval: time.Millisecond}
++	s.searchPoll = time.Millisecond
++	_, err := s.Fetch(context.Background(), Request{Kind: KindTrack, Artist: "Artist", Title: "Song"}, t.TempDir())
++	if err == nil || !strings.Contains(err.Error(), "Errored") {
++		t.Fatalf("expected a transfer error, got %v", err)
++	}
++}
++
++func TestSanitizeAndEnsureInside(t *testing.T) {
++	for in, want := range map[string]string{"../../etc": "_.._etc", "..": "Unknown", " AC/DC ": "AC_DC", ".hidden": "hidden", "": "Unknown"} {
++		if got := sanitize(in); got != want {
++			t.Errorf("sanitize(%q) = %q, want %q", in, got, want)
++		}
++	}
++	if ensureInside("/music", "/music/a/b") != nil || ensureInside("/music", "/music/../etc") == nil {
++		t.Error("ensureInside misbehaves")
++	}
++}
+diff --git a/core/acquire/source_youtube.go b/core/acquire/source_youtube.go
+new file mode 100644
+index 0000000..167fb71
+--- /dev/null
++++ b/core/acquire/source_youtube.go
+@@ -0,0 +1,135 @@
++package acquire
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"time"
++)
++
++// YouTube fetches single tracks with yt-dlp. Albums are not supported here
++// (quality and track boundaries are unreliable); use Lidarr or Soulseek.
++//
++// The file is named and tagged from the MusicBrainz request (not from the video
++// title), so the library scan can match it back to the request by recording MBID.
++type YouTube struct {
++	Binary string // default "yt-dlp"
++	FFmpeg string // default "ffmpeg"; also required by yt-dlp for audio extraction
++	Format string // audio format, default "opus" (lossless re-encode is impossible from YouTube)
++	On     bool
++}
++
++func (y *YouTube) Name() string         { return "youtube" }
++func (y *YouTube) Enabled() bool        { return y.On }
++func (y *YouTube) Supports(k Kind) bool { return k == KindTrack }
++
++func (y *YouTube) Fetch(ctx context.Context, req Request, destDir string) (Result, error) {
++	bin := cmp(y.Binary, "yt-dlp")
++	format := cmp(y.Format, "opus")
++	dir := filepath.Join(destDir, sanitize(req.Artist), sanitize(req.Album))
++	if err := ensureInside(destDir, dir); err != nil {
++		return Result{}, err
++	}
++	// Passed as a single argv element prefixed with ytsearch1:, so user text can
++	// never be interpreted as an option or run through a shell.
++	query := "ytsearch1:" + strings.TrimSpace(req.Artist+" - "+req.Title+" official audio")
++	outTpl := filepath.Join(dir, sanitize(req.Title)+".%(ext)s")
++
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
++	defer cancel()
++	args := []string{
++		"-x", "--audio-format", format,
++		"--embed-thumbnail",
++		"--no-playlist",
++		"--match-filter", "duration < 900", // skip mixes and full-album uploads
++		"--print", "after_move:filepath",
++		"-o", outTpl,
++	}
++	if y.FFmpeg != "" {
++		args = append(args, "--ffmpeg-location", y.FFmpeg)
++	}
++	cmd := exec.CommandContext(ctx, bin, append(args, query)...)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	if err := cmd.Run(); err != nil {
++		return Result{}, fmt.Errorf("yt-dlp: %w: %s", err, strings.TrimSpace(stderr.String()))
++	}
++	var paths []string
++	for _, line := range strings.Split(stdout.String(), "\n") {
++		if p := strings.TrimSpace(line); p != "" {
++			paths = append(paths, p)
++		}
++	}
++	if len(paths) == 0 {
++		return Result{}, errors.New("yt-dlp produced no file (filtered out or not found)")
++	}
++	for _, p := range paths {
++		if err := tagFile(ctx, cmp(y.FFmpeg, "ffmpeg"), p, req); err != nil {
++			_ = os.Remove(p)
++			return Result{}, err
++		}
++	}
++	return Result{Paths: paths}, nil
++}
++
++// tagFile rewrites the file's tags with the MusicBrainz data of the request,
++// so Navidrome's scanner fills artist/title/album and the recording MBID.
++func tagFile(ctx context.Context, ffmpeg, path string, req Request) error {
++	tmp := strings.TrimSuffix(path, filepath.Ext(path)) + ".tagging" + filepath.Ext(path)
++	tags := []string{"title=" + req.Title, "artist=" + req.Artist, "album_artist=" + req.Artist}
++	if req.Album != "" {
++		tags = append(tags, "album="+req.Album)
++	}
++	if req.Kind == KindTrack {
++		tags = append(tags, "MUSICBRAINZ_TRACKID="+req.MBID)
++	}
++	args := []string{"-y", "-v", "error", "-i", path, "-map", "0", "-c", "copy"}
++	for _, t := range tags {
++		// Ogg/Opus keep tags on the audio stream, MP4/MP3 on the container: set both,
++		// so yt-dlp's video title never survives as the track title.
++		args = append(args, "-metadata", t, "-metadata:s:a:0", t)
++	}
++	args = append(args, tmp)
++	out, err := exec.CommandContext(ctx, ffmpeg, args...).CombinedOutput()
++	if err != nil {
++		_ = os.Remove(tmp)
++		return fmt.Errorf("tagging %s: %w: %s", filepath.Base(path), err, strings.TrimSpace(string(out)))
++	}
++	return os.Rename(tmp, path)
++}
++
++func cmp(v, def string) string {
++	if v == "" {
++		return def
++	}
++	return v
++}
++
++// sanitize turns catalog text into a single safe path component.
++func sanitize(s string) string {
++	r := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_", "\x00", "")
++	s = strings.TrimSpace(r.Replace(s))
++	s = strings.TrimLeft(s, ".") // no "..", no hidden files
++	s = strings.TrimRight(s, ". ")
++	if r := []rune(s); len(r) > 120 {
++		s = strings.TrimSpace(string(r[:120]))
++	}
++	if s == "" {
++		return "Unknown"
++	}
++	return s
++}
++
++// ensureInside rejects paths that would escape root.
++func ensureInside(root, path string) error {
++	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
++	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
++		return fmt.Errorf("path %q escapes %q", path, root)
++	}
++	return nil
++}
+diff --git a/core/acquire/store_memory.go b/core/acquire/store_memory.go
+new file mode 100644
+index 0000000..06a3d7e
+--- /dev/null
++++ b/core/acquire/store_memory.go
+@@ -0,0 +1,81 @@
++package acquire
++
++import (
++	"context"
++	"slices"
++	"sort"
++	"sync"
++)
++
++// MemoryStore is a non-persistent Store for tests and early development.
++type MemoryStore struct {
++	mu   sync.Mutex
++	data map[string]Request
++}
++
++func NewMemoryStore() *MemoryStore { return &MemoryStore{data: map[string]Request{}} }
++
++func (m *MemoryStore) Create(_ context.Context, r *Request) error {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	m.data[r.ID] = *r
++	return nil
++}
++
++func (m *MemoryStore) Update(_ context.Context, r *Request) error {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if _, ok := m.data[r.ID]; !ok {
++		return ErrNotFound
++	}
++	m.data[r.ID] = *r
++	return nil
++}
++
++func (m *MemoryStore) Get(_ context.Context, id string) (*Request, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	r, ok := m.data[id]
++	if !ok {
++		return nil, ErrNotFound
++	}
++	return &r, nil
++}
++
++func (m *MemoryStore) List(_ context.Context, userID string) ([]Request, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	var out []Request
++	for _, r := range m.data {
++		if userID == "" || r.UserID == userID {
++			out = append(out, r)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
++	return out, nil
++}
++
++func (m *MemoryStore) ListByStatus(_ context.Context, statuses ...Status) ([]Request, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	var out []Request
++	for _, r := range m.data {
++		if slices.Contains(statuses, r.Status) {
++			out = append(out, r)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
++	return out, nil
++}
++
++func (m *MemoryStore) FindActive(_ context.Context, kind Kind, mbid string) (*Request, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	for _, r := range m.data {
++		if r.Kind == kind && r.MBID == mbid && r.Status != StatusFailed {
++			c := r
++			return &c, nil
++		}
++	}
++	return nil, nil
++}
+diff --git a/core/acquire/store_sql.go b/core/acquire/store_sql.go
+new file mode 100644
+index 0000000..af256be
+--- /dev/null
++++ b/core/acquire/store_sql.go
+@@ -0,0 +1,108 @@
++package acquire
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"strings"
++)
++
++// SQLStore implements Store on the `acquire_request` table
++// (db/migrations/20261010000000_create_acquire_request.sql).
++type SQLStore struct {
++	DB *sql.DB
++}
++
++func NewSQLStore(db *sql.DB) *SQLStore { return &SQLStore{DB: db} }
++
++const requestColumns = `id, user_id, kind, mbid, artist, album, title, status, source, error, created_at, updated_at`
++
++func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
++	var r Request
++	err := row.Scan(&r.ID, &r.UserID, &r.Kind, &r.MBID, &r.Artist, &r.Album, &r.Title,
++		&r.Status, &r.Source, &r.Error, &r.CreatedAt, &r.UpdatedAt)
++	return r, err
++}
++
++func (s *SQLStore) Create(ctx context.Context, r *Request) error {
++	_, err := s.DB.ExecContext(ctx, `INSERT INTO acquire_request (`+requestColumns+`)
++		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++		r.ID, r.UserID, r.Kind, r.MBID, r.Artist, r.Album, r.Title,
++		r.Status, r.Source, r.Error, r.CreatedAt, r.UpdatedAt)
++	return err
++}
++
++func (s *SQLStore) Update(ctx context.Context, r *Request) error {
++	res, err := s.DB.ExecContext(ctx, `UPDATE acquire_request
++		SET status = ?, source = ?, error = ?, updated_at = ? WHERE id = ?`,
++		r.Status, r.Source, r.Error, r.UpdatedAt, r.ID)
++	if err != nil {
++		return err
++	}
++	if n, _ := res.RowsAffected(); n == 0 {
++		return ErrNotFound
++	}
++	return nil
++}
++
++func (s *SQLStore) Get(ctx context.Context, id string) (*Request, error) {
++	row := s.DB.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM acquire_request WHERE id = ?`, id)
++	r, err := scanRequest(row)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, ErrNotFound
++	}
++	if err != nil {
++		return nil, err
++	}
++	return &r, nil
++}
++
++func (s *SQLStore) query(ctx context.Context, q string, args ...any) ([]Request, error) {
++	rows, err := s.DB.QueryContext(ctx, q, args...)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	var out []Request
++	for rows.Next() {
++		r, err := scanRequest(rows)
++		if err != nil {
++			return nil, err
++		}
++		out = append(out, r)
++	}
++	return out, rows.Err()
++}
++
++func (s *SQLStore) List(ctx context.Context, userID string) ([]Request, error) {
++	if userID == "" {
++		return s.query(ctx, `SELECT `+requestColumns+` FROM acquire_request ORDER BY created_at DESC`)
++	}
++	return s.query(ctx, `SELECT `+requestColumns+` FROM acquire_request WHERE user_id = ? ORDER BY created_at DESC`, userID)
++}
++
++func (s *SQLStore) ListByStatus(ctx context.Context, statuses ...Status) ([]Request, error) {
++	if len(statuses) == 0 {
++		return nil, nil
++	}
++	args := make([]any, len(statuses))
++	for i, st := range statuses {
++		args[i] = st
++	}
++	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(statuses)), ",")
++	return s.query(ctx, `SELECT `+requestColumns+` FROM acquire_request
++		WHERE status IN (`+placeholders+`) ORDER BY created_at`, args...)
++}
++
++func (s *SQLStore) FindActive(ctx context.Context, kind Kind, mbid string) (*Request, error) {
++	row := s.DB.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM acquire_request
++		WHERE kind = ? AND mbid = ? AND status != ? ORDER BY created_at DESC LIMIT 1`, kind, mbid, StatusFailed)
++	r, err := scanRequest(row)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++	return &r, nil
++}
+diff --git a/core/acquire/store_sql_test.go b/core/acquire/store_sql_test.go
+new file mode 100644
+index 0000000..1d0bd02
+--- /dev/null
++++ b/core/acquire/store_sql_test.go
+@@ -0,0 +1,84 @@
++package acquire
++
++import (
++	"context"
++	"database/sql"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	_ "github.com/mattn/go-sqlite3"
++)
++
++func newSQLStore(t *testing.T) *SQLStore {
++	t.Helper()
++	db, err := sql.Open("sqlite3", ":memory:")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { db.Close() })
++	db.SetMaxOpenConns(1)
++	mig, err := os.ReadFile("../../db/migrations/20261010000000_create_acquire_request.sql")
++	if err != nil {
++		t.Fatal(err)
++	}
++	up := strings.Split(string(mig), "-- +goose Down")[0]
++	if _, err := db.Exec(`CREATE TABLE user (id VARCHAR(255) PRIMARY KEY);` + up); err != nil {
++		t.Fatal(err)
++	}
++	return NewSQLStore(db)
++}
++
++func TestSQLStore(t *testing.T) {
++	st := newSQLStore(t)
++	ctx := context.Background()
++	t0 := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
++	reqs := []Request{
++		{ID: "a", UserID: "u1", Kind: KindTrack, MBID: "m1", Artist: "Ar", Title: "T1", Status: StatusFailed, CreatedAt: t0, UpdatedAt: t0},
++		{ID: "b", UserID: "u1", Kind: KindTrack, MBID: "m1", Artist: "Ar", Title: "T1", Status: StatusQueued, CreatedAt: t0.Add(time.Minute), UpdatedAt: t0},
++		{ID: "c", UserID: "u2", Kind: KindAlbum, MBID: "m2", Album: "Al", Title: "Al", Status: StatusPending, CreatedAt: t0.Add(2 * time.Minute), UpdatedAt: t0},
++	}
++	for i := range reqs {
++		if err := st.Create(ctx, &reqs[i]); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	got, err := st.Get(ctx, "c")
++	if err != nil || got.Album != "Al" || got.Kind != KindAlbum || !got.CreatedAt.Equal(reqs[2].CreatedAt) {
++		t.Fatalf("Get: %+v %v", got, err)
++	}
++	if _, err := st.Get(ctx, "zzz"); err != ErrNotFound {
++		t.Errorf("Get missing: want ErrNotFound, got %v", err)
++	}
++
++	if l, _ := st.List(ctx, "u1"); len(l) != 2 || l[0].ID != "b" {
++		t.Errorf("List(u1) should be newest first: %+v", l)
++	}
++	if l, _ := st.List(ctx, ""); len(l) != 3 {
++		t.Errorf("List(all) = %d", len(l))
++	}
++	if l, _ := st.ListByStatus(ctx, StatusQueued, StatusPending); len(l) != 2 || l[0].ID != "b" {
++		t.Errorf("ListByStatus should be oldest first: %+v", l)
++	}
++
++	active, err := st.FindActive(ctx, KindTrack, "m1")
++	if err != nil || active == nil || active.ID != "b" {
++		t.Errorf("FindActive must skip failed requests: %+v %v", active, err)
++	}
++	if none, err := st.FindActive(ctx, KindTrack, "nope"); none != nil || err != nil {
++		t.Errorf("FindActive(nope) = %+v %v", none, err)
++	}
++
++	got.Status, got.Source, got.Error = StatusFailed, "youtube", "boom"
++	if err := st.Update(ctx, got); err != nil {
++		t.Fatal(err)
++	}
++	if again, _ := st.Get(ctx, "c"); again.Status != StatusFailed || again.Error != "boom" || again.Source != "youtube" {
++		t.Errorf("Update not persisted: %+v", again)
++	}
++	if err := st.Update(ctx, &Request{ID: "zzz"}); err != ErrNotFound {
++		t.Errorf("Update missing: want ErrNotFound, got %v", err)
++	}
++}
+diff --git a/core/seer/library.go b/core/seer/library.go
+new file mode 100644
+index 0000000..6394e5b
+--- /dev/null
++++ b/core/seer/library.go
+@@ -0,0 +1,83 @@
++package seer
++
++import (
++	"context"
++
++	. "github.com/Masterminds/squirrel"
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++)
++
++// library adapts Navidrome's DataStore and Scanner to acquire.Library.
++type library struct {
++	ds      model.DataStore
++	scanner model.Scanner
++}
++
++// Match looks the item up by MusicBrainz ID first, then by artist and title.
++// It uses the caller's context, so users only match libraries they can see.
++func (l *library) Match(ctx context.Context, item acquire.CatalogItem) (string, bool) {
++	if item.Kind == acquire.KindAlbum {
++		return l.matchAlbum(ctx, item)
++	}
++	return l.matchTrack(ctx, item)
++}
++
++func (l *library) matchTrack(ctx context.Context, item acquire.CatalogItem) (string, bool) {
++	filters := []Sqlizer{Eq{"media_file.mbz_recording_id": item.MBID}}
++	if item.Title != "" && item.Artist != "" {
++		filters = append(filters, And{
++			Expr("media_file.title = ? COLLATE NOCASE", item.Title),
++			Or{
++				Expr("media_file.artist = ? COLLATE NOCASE", item.Artist),
++				Expr("media_file.album_artist = ? COLLATE NOCASE", item.Artist),
++			},
++		})
++	}
++	for _, f := range filters {
++		mfs, err := l.ds.MediaFile().GetAll(ctx, model.QueryOptions{Max: 1, Filters: And{f, Eq{"media_file.missing": false}}})
++		if err != nil {
++			log.Warn(ctx, "Seer: error matching track", "mbid", item.MBID, err)
++			return "", false
++		}
++		if len(mfs) > 0 {
++			return mfs[0].ID, true
++		}
++	}
++	return "", false
++}
++
++func (l *library) matchAlbum(ctx context.Context, item acquire.CatalogItem) (string, bool) {
++	name := item.Album
++	if name == "" {
++		name = item.Title
++	}
++	filters := []Sqlizer{Eq{"album.mbz_release_group_id": item.MBID}}
++	if name != "" && item.Artist != "" {
++		filters = append(filters, And{
++			Expr("album.name = ? COLLATE NOCASE", name),
++			Expr("album.album_artist = ? COLLATE NOCASE", item.Artist),
++		})
++	}
++	for _, f := range filters {
++		als, err := l.ds.Album().GetAll(ctx, model.QueryOptions{Max: 1, Filters: And{f, Eq{"album.missing": false}}})
++		if err != nil {
++			log.Warn(ctx, "Seer: error matching album", "mbid", item.MBID, err)
++			return "", false
++		}
++		if len(als) > 0 {
++			return als[0].ID, true
++		}
++	}
++	return "", false
++}
++
++// Rescan runs a quick (incremental) scan of all libraries. It blocks until the scan ends.
++func (l *library) Rescan(ctx context.Context) error {
++	_, err := l.scanner.ScanAll(ctx, false)
++	if err != nil {
++		log.Warn(ctx, "Seer: rescan failed", err)
++	}
++	return err
++}
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+new file mode 100644
+index 0000000..7672317
+--- /dev/null
++++ b/core/seer/seer.go
+@@ -0,0 +1,98 @@
++// Package seer wires the on-demand acquisition engine (core/acquire) into
++// Navidrome: configuration, library matching, scanning and persistence.
++package seer
++
++import (
++	"context"
++	"database/sql"
++	"path/filepath"
++	"strings"
++
++	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/utils/singleton"
++)
++
++// Seer is the acquisition service shared by the API and the background workers.
++type Seer struct {
++	*acquire.Service
++}
++
++// Enabled reports whether the feature is turned on in the configuration.
++func Enabled() bool { return conf.Server.Seer.Enabled }
++
++// GetInstance returns the process-wide Seer. Workers only run after Start.
++func GetInstance(ds model.DataStore, scanner model.Scanner, db *sql.DB) *Seer {
++	return singleton.GetInstance(func() *Seer {
++		return New(ds, scanner, db)
++	})
++}
++
++// New builds a Seer from conf.Server.Seer.
++func New(ds model.DataStore, scanner model.Scanner, db *sql.DB) *Seer {
++	opts := conf.Server.Seer
++	cfg := acquire.Config{
++		DestDir:       destFolder(ds),
++		Workers:       opts.Workers,
++		AutoApprove:   opts.AutoApprove,
++		ImportTimeout: opts.ImportTimeout,
++	}
++	catalog := &acquire.MusicBrainz{UserAgent: opts.UserAgent, BaseURL: opts.MusicBrainzURL}
++	lib := &library{ds: ds, scanner: scanner}
++	return &Seer{Service: acquire.NewService(cfg, catalog, sources(), acquire.NewSQLStore(db), lib)}
++}
++
++// Start launches the workers when the feature is enabled.
++func (s *Seer) Start(ctx context.Context) {
++	if !Enabled() {
++		return
++	}
++	log.Info(ctx, "Starting Seer acquisition workers", "sources", conf.Server.Seer.Sources)
++	s.Service.Start(ctx)
++}
++
++// sources builds the enabled sources in the configured priority order.
++func sources() []acquire.Source {
++	opts := conf.Server.Seer
++	all := map[string]acquire.Source{
++		"youtube": &acquire.YouTube{
++			On: opts.YouTube.Enabled, Binary: opts.YouTube.Path, Format: opts.YouTube.Format,
++			FFmpeg: conf.Server.FFmpegPath,
++		},
++		"soulseek": &acquire.Soulseek{
++			On: opts.Soulseek.Enabled, BaseURL: opts.Soulseek.URL, APIKey: opts.Soulseek.ApiKey,
++			DownloadDir: opts.Soulseek.DownloadFolder, PreferFLAC: opts.Soulseek.PreferFLAC,
++		},
++		"lidarr": &acquire.Lidarr{
++			On: opts.Lidarr.Enabled, BaseURL: opts.Lidarr.URL, APIKey: opts.Lidarr.ApiKey,
++			RootFolder: opts.Lidarr.RootFolder, QualityProfileID: opts.Lidarr.QualityProfileID,
++			MetadataProfileID: opts.Lidarr.MetadataProfileID,
++		},
++	}
++	var out []acquire.Source
++	for _, name := range strings.Split(opts.Sources, ",") {
++		name = strings.ToLower(strings.TrimSpace(name))
++		if src, ok := all[name]; ok {
++			out = append(out, src)
++			delete(all, name)
++		} else if name != "" {
++			log.Warn("Seer: unknown source in Seer.Sources", "source", name)
++		}
++	}
++	return out
++}
++
++// destFolder returns the configured destination, or "Seer" inside the first library.
++func destFolder(ds model.DataStore) string {
++	if dest := conf.Server.Seer.DestFolder; dest != "" {
++		return dest
++	}
++	libs, err := ds.Library().GetAll(context.Background())
++	if err != nil || len(libs) == 0 {
++		log.Warn("Seer: no library found and Seer.DestFolder is empty", err)
++		return ""
++	}
++	return filepath.Join(libs[0].Path, "Seer")
++}
+diff --git a/db/migrations/20261010000000_create_acquire_request.sql b/db/migrations/20261010000000_create_acquire_request.sql
+new file mode 100644
+index 0000000..31abb4f
+--- /dev/null
++++ b/db/migrations/20261010000000_create_acquire_request.sql
+@@ -0,0 +1,20 @@
++-- +goose Up
++CREATE TABLE acquire_request (
++    id         VARCHAR(255) NOT NULL PRIMARY KEY,
++    user_id    VARCHAR(255) NOT NULL REFERENCES user(id) ON DELETE CASCADE,
++    kind       VARCHAR(16)  NOT NULL,
++    mbid       VARCHAR(64)  NOT NULL,
++    artist     VARCHAR(255) NOT NULL DEFAULT '',
++    album      VARCHAR(255) NOT NULL DEFAULT '',
++    title      VARCHAR(255) NOT NULL DEFAULT '',
++    status     VARCHAR(16)  NOT NULL DEFAULT 'pending',
++    source     VARCHAR(32)  NOT NULL DEFAULT '',
++    error      TEXT         NOT NULL DEFAULT '',
++    created_at DATETIME     NOT NULL,
++    updated_at DATETIME     NOT NULL
++);
++CREATE INDEX acquire_request_user ON acquire_request(user_id);
++CREATE INDEX acquire_request_mbid ON acquire_request(kind, mbid);
++
++-- +goose Down
++DROP TABLE acquire_request;
+diff --git a/server/nativeapi/config.go b/server/nativeapi/config.go
+index cfecfa6..ed66949 100644
+--- a/server/nativeapi/config.go
++++ b/server/nativeapi/config.go
+@@ -31,6 +31,8 @@ var sensitiveFieldsFullMask = []string{
+ 	"DevAutoCreateAdminPassword",
+ 	"PasswordEncryptionKey",
+ 	"Prometheus.Password",
++	"Seer.Soulseek.ApiKey",
++	"Seer.Lidarr.ApiKey",
+ }
+ 
+ type configResponse struct {
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+new file mode 100644
+index 0000000..a71e25c
+--- /dev/null
++++ b/server/seerapi/seerapi.go
+@@ -0,0 +1,158 @@
++// Package seerapi exposes the Seer (on-demand acquisition) endpoints under /api/seer.
++package seerapi
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"strconv"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/core/seer"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/model/request"
++	"github.com/navidrome/navidrome/server"
++)
++
++// Service is the part of the Seer used by the API.
++type Service interface {
++	SearchCatalog(ctx context.Context, query string, limit int) ([]acquire.CatalogItem, error)
++	Submit(ctx context.Context, userID string, item acquire.CatalogItem) (*acquire.Request, error)
++	Approve(ctx context.Context, id string) (*acquire.Request, error)
++	Get(ctx context.Context, id string) (*acquire.Request, error)
++	List(ctx context.Context, userID string) ([]acquire.Request, error)
++}
++
++type Router struct {
++	http.Handler
++	ds  model.DataStore
++	svc Service
++}
++
++func New(ds model.DataStore, s *seer.Seer) *Router {
++	return NewWithService(ds, s)
++}
++
++// NewWithService builds the router around any Service (used by tests).
++func NewWithService(ds model.DataStore, svc Service) *Router {
++	r := &Router{ds: ds, svc: svc}
++	r.Handler = r.routes()
++	return r
++}
++
++func (api *Router) routes() http.Handler {
++	r := chi.NewRouter()
++	r.Group(func(r chi.Router) {
++		if api.ds != nil {
++			r.Use(server.Authenticator(api.ds))
++			r.Use(server.JWTRefresher)
++		}
++		r.Get("/catalog", api.searchCatalog)
++		r.Route("/requests", func(r chi.Router) {
++			r.Get("/", api.listRequests)
++			r.Post("/", api.createRequest)
++			r.Get("/{id}", api.getRequest)
++			r.With(adminOnly).Post("/{id}/approve", api.approveRequest)
++		})
++	})
++	return r
++}
++
++func (api *Router) searchCatalog(w http.ResponseWriter, r *http.Request) {
++	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
++	if limit <= 0 || limit > 50 {
++		limit = 10
++	}
++	items, err := api.svc.SearchCatalog(r.Context(), r.URL.Query().Get("q"), limit)
++	if err != nil {
++		log.Error(r.Context(), "Seer: catalog search failed", err)
++		http.Error(w, "catalog search failed", http.StatusBadGateway)
++		return
++	}
++	if items == nil {
++		items = []acquire.CatalogItem{}
++	}
++	writeJSON(w, http.StatusOK, items)
++}
++
++// listRequests returns the caller's requests; admins see everyone's unless ?mine=true.
++func (api *Router) listRequests(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	userID := user.ID
++	if user.IsAdmin && r.URL.Query().Get("mine") != "true" {
++		userID = ""
++	}
++	reqs, err := api.svc.List(r.Context(), userID)
++	if err != nil {
++		log.Error(r.Context(), "Seer: listing requests failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	if reqs == nil {
++		reqs = []acquire.Request{}
++	}
++	w.Header().Set("X-Total-Count", strconv.Itoa(len(reqs)))
++	writeJSON(w, http.StatusOK, reqs)
++}
++
++func (api *Router) createRequest(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	var item acquire.CatalogItem
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&item); err != nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	req, err := api.svc.Submit(r.Context(), user.ID, item)
++	switch {
++	case errors.Is(err, acquire.ErrInLibrary):
++		http.Error(w, err.Error(), http.StatusConflict)
++	case err != nil:
++		http.Error(w, err.Error(), http.StatusBadRequest)
++	default:
++		writeJSON(w, http.StatusCreated, req)
++	}
++}
++
++func (api *Router) getRequest(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	req, err := api.svc.Get(r.Context(), chi.URLParam(r, "id"))
++	if err != nil || (!user.IsAdmin && req.UserID != user.ID) {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	writeJSON(w, http.StatusOK, req)
++}
++
++func (api *Router) approveRequest(w http.ResponseWriter, r *http.Request) {
++	req, err := api.svc.Approve(r.Context(), chi.URLParam(r, "id"))
++	switch {
++	case errors.Is(err, acquire.ErrNotFound):
++		http.Error(w, "not found", http.StatusNotFound)
++	case errors.Is(err, acquire.ErrBadState):
++		http.Error(w, err.Error(), http.StatusConflict)
++	case err != nil:
++		log.Error(r.Context(), "Seer: approve failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++	default:
++		writeJSON(w, http.StatusOK, req)
++	}
++}
++
++func adminOnly(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if user, ok := request.UserFrom(r.Context()); !ok || !user.IsAdmin {
++			http.Error(w, "Access denied: admin privileges required", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
++
++func writeJSON(w http.ResponseWriter, status int, v any) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_ = json.NewEncoder(w).Encode(v)
++}
+diff --git a/server/seerapi/seerapi_test.go b/server/seerapi/seerapi_test.go
+new file mode 100644
+index 0000000..5100de0
+--- /dev/null
++++ b/server/seerapi/seerapi_test.go
+@@ -0,0 +1,100 @@
++package seerapi
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/model/request"
++)
++
++type fakeService struct {
++	reqs     map[string]*acquire.Request
++	listedBy *string
++}
++
++func (f *fakeService) SearchCatalog(context.Context, string, int) ([]acquire.CatalogItem, error) {
++	return []acquire.CatalogItem{{Kind: acquire.KindTrack, MBID: "m", Title: "T"}}, nil
++}
++func (f *fakeService) Submit(_ context.Context, userID string, item acquire.CatalogItem) (*acquire.Request, error) {
++	if item.MBID == "owned" {
++		return nil, acquire.ErrInLibrary
++	}
++	r := &acquire.Request{ID: "new", UserID: userID, MBID: item.MBID, Status: acquire.StatusPending}
++	f.reqs[r.ID] = r
++	return r, nil
++}
++func (f *fakeService) Approve(_ context.Context, id string) (*acquire.Request, error) {
++	r, ok := f.reqs[id]
++	if !ok {
++		return nil, acquire.ErrNotFound
++	}
++	r.Status = acquire.StatusQueued
++	return r, nil
++}
++func (f *fakeService) Get(_ context.Context, id string) (*acquire.Request, error) {
++	if r, ok := f.reqs[id]; ok {
++		return r, nil
++	}
++	return nil, acquire.ErrNotFound
++}
++func (f *fakeService) List(_ context.Context, userID string) ([]acquire.Request, error) {
++	f.listedBy = &userID
++	return nil, nil
++}
++
++func do(t *testing.T, h http.Handler, user model.User, method, path, body string) *httptest.ResponseRecorder {
++	t.Helper()
++	r := httptest.NewRequest(method, path, strings.NewReader(body))
++	r = r.WithContext(request.WithUser(r.Context(), user))
++	w := httptest.NewRecorder()
++	h.ServeHTTP(w, r)
++	return w
++}
++
++func TestSeerAPI(t *testing.T) {
++	svc := &fakeService{reqs: map[string]*acquire.Request{"other": {ID: "other", UserID: "u2"}}}
++	api := NewWithService(nil, svc)
++	user := model.User{ID: "u1"}
++	admin := model.User{ID: "adm", IsAdmin: true}
++
++	if w := do(t, api, user, "GET", "/catalog?q=x", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"mbid":"m"`) {
++		t.Errorf("catalog: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, user, "POST", "/requests", `{"kind":"track","mbid":"x","title":"T"}`); w.Code != 201 || svc.reqs["new"].UserID != "u1" {
++		t.Errorf("create: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, user, "POST", "/requests", `{"kind":"track","mbid":"owned","title":"T"}`); w.Code != http.StatusConflict {
++		t.Errorf("create owned: %d", w.Code)
++	}
++	if w := do(t, api, user, "POST", "/requests", `not json`); w.Code != http.StatusBadRequest {
++		t.Errorf("create bad body: %d", w.Code)
++	}
++	if w := do(t, api, user, "GET", "/requests/other", ""); w.Code != http.StatusNotFound {
++		t.Errorf("users must not see other users' requests: %d", w.Code)
++	}
++	if w := do(t, api, admin, "GET", "/requests/other", ""); w.Code != 200 {
++		t.Errorf("admin get: %d", w.Code)
++	}
++	if w := do(t, api, user, "POST", "/requests/new/approve", ""); w.Code != http.StatusForbidden {
++		t.Errorf("non-admin approve: %d", w.Code)
++	}
++	if w := do(t, api, admin, "POST", "/requests/new/approve", ""); w.Code != 200 || svc.reqs["new"].Status != acquire.StatusQueued {
++		t.Errorf("admin approve: %d", w.Code)
++	}
++	if w := do(t, api, admin, "POST", "/requests/nope/approve", ""); w.Code != http.StatusNotFound {
++		t.Errorf("approve missing: %d", w.Code)
++	}
++
++	do(t, api, user, "GET", "/requests", "")
++	if *svc.listedBy != "u1" {
++		t.Errorf("users list only their own requests, listed %q", *svc.listedBy)
++	}
++	if w := do(t, api, admin, "GET", "/requests", ""); *svc.listedBy != "" || w.Body.String() != "[]\n" {
++		t.Errorf("admins list everything, listed %q body %q", *svc.listedBy, w.Body)
++	}
++}
+-- 
+2.43.0
+

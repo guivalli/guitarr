@@ -1,0 +1,459 @@
+diff --git a/core/seer/covers.go b/core/seer/covers.go
+index 06d0976..ece94e4 100644
+--- a/core/seer/covers.go
++++ b/core/seer/covers.go
+@@ -1,9 +1,13 @@
+ package seer
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"image"
++	_ "image/jpeg"
++	_ "image/png"
+ 	"os"
+ 	"path/filepath"
+ 	"sort"
+@@ -12,6 +16,7 @@ import (
+ 	. "github.com/Masterminds/squirrel"
+ 	"github.com/navidrome/navidrome/conf"
+ 	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/core/artwork"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
+ 	"go.senan.xyz/taglib"
+@@ -25,6 +30,9 @@ type CoverResult struct {
+ 	Source string `json:"source,omitempty"`
+ 	// Skipped: the album already has a cover and force was not asked.
+ 	Skipped bool `json:"skipped,omitempty"`
++	// Refreshed: the cover was already on disk but Navidrome kept a stale pointer to a file that is
++	// gone (a renamed or moved track); its artwork state was cleared so it resolves again.
++	Refreshed bool `json:"refreshed,omitempty"`
+ }
+ 
+ // ImageWriter is implemented by a TagIO that can embed a picture in an audio file.
+@@ -61,13 +69,20 @@ func (e *Editor) FetchCover(ctx context.Context, albumID string, force bool) (*C
+ 	}
+ 	res := &CoverResult{AlbumID: albumID}
+ 	if !force {
+-		has, err := e.albumHasCover(ctx, []model.Album{*album})
++		states, err := e.coverStates(ctx, []model.Album{*album})
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		if has[albumID] {
++		switch states[albumID] {
++		case coverOK:
+ 			res.Skipped = true
+ 			return res, nil
++		case coverStale:
++			if err := artwork.Refresh(ctx, e.ds, model.KindAlbumArtwork, albumID); err != nil {
++				return nil, err
++			}
++			res.Refreshed = true
++			return res, nil
+ 		}
+ 	}
+ 
+@@ -94,10 +109,72 @@ func (e *Editor) FetchCover(ctx context.Context, albumID string, force bool) (*C
+ 	if err := e.rescan(ctx, files); err != nil {
+ 		return nil, err
+ 	}
++	e.refreshArtwork(ctx, albumID)
+ 	res.Found, res.Source = true, cover.Source
+ 	return res, nil
+ }
+ 
++// ErrBadImage: the uploaded file cannot be used as a cover (not an image, wrong format, too big).
++var ErrBadImage = errors.New("unusable image")
++
++// maxCoverUpload caps an uploaded cover; larger pictures only slow the player down.
++const maxCoverUpload = 15 << 20
++
++// SetCoverImage saves a picture the admin chose as the album's cover (same placement rules as a
++// downloaded one) and replaces whatever cover the album had. Only JPEG and PNG are accepted: those
++// are the formats that can also be embedded in the tracks.
++func (e *Editor) SetCoverImage(ctx context.Context, albumID string, data []byte) (*CoverResult, error) {
++	if len(data) == 0 {
++		return nil, fmt.Errorf("%w: empty file", ErrBadImage)
++	}
++	if len(data) > maxCoverUpload {
++		return nil, fmt.Errorf("%w: larger than %d MB", ErrBadImage, maxCoverUpload>>20)
++	}
++	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
++	if err != nil {
++		return nil, fmt.Errorf("%w: the file is not a valid image", ErrBadImage)
++	}
++	ext := ""
++	switch format {
++	case "jpeg":
++		ext = ".jpg"
++	case "png":
++		ext = ".png"
++	default:
++		return nil, fmt.Errorf("%w: use a JPG or PNG image (got %s)", ErrBadImage, format)
++	}
++	album, err := e.ds.Album().Get(ctx, albumID)
++	if errors.Is(err, model.ErrNotFound) || (err == nil && album.Missing) {
++		return nil, ErrItemNotFound
++	}
++	if err != nil {
++		return nil, err
++	}
++	files, err := e.albumSongs(ctx, albumID)
++	if err != nil {
++		return nil, err
++	}
++	cover := &acquire.Cover{Data: data, Ext: ext, Source: "manual", Width: cfg.Width, Height: cfg.Height}
++	where, err := e.storeCover(ctx, files, cover, true)
++	if err != nil {
++		return nil, fmt.Errorf("could not save the cover (is the music folder writable?): %w", err)
++	}
++	log.Info(ctx, "Seer: cover uploaded", "album", album.Name, "size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height), "where", where)
++	if err := e.rescan(ctx, files); err != nil {
++		return nil, err
++	}
++	e.refreshArtwork(ctx, albumID)
++	return &CoverResult{AlbumID: albumID, Found: true, Source: "manual"}, nil
++}
++
++// refreshArtwork makes Navidrome resolve the album's image again. Best effort: the files are
++// already in place, so a failure here only delays the new cover until the next retry.
++func (e *Editor) refreshArtwork(ctx context.Context, albumID string) {
++	if err := artwork.Refresh(context.WithoutCancel(ctx), e.ds, model.KindAlbumArtwork, albumID); err != nil {
++		log.Warn(ctx, "Seer: could not refresh album artwork", "album", albumID, err)
++	}
++}
++
+ // storeCover puts the cover where Navidrome will find it and says where ("folder" or "embedded").
+ func (e *Editor) storeCover(ctx context.Context, files []model.MediaFile, c *acquire.Cover, force bool) (string, error) {
+ 	// the folder with most of the album's tracks is the album's folder
+@@ -265,22 +342,69 @@ func coverFileName(name string, patterns []string) bool {
+ 	return false
+ }
+ 
+-// albumsWithoutCover returns the albums Navidrome shows a placeholder for.
+-func (e *Editor) albumsWithoutCover(ctx context.Context, albums model.Albums) ([]model.Album, error) {
++// coverState: what Navidrome serves for an album.
++type coverState int
++
++const (
++	coverNone  coverState = iota // no image anywhere: it shows the placeholder
++	coverOK                      // a real image is available
++	coverStale                   // the image exists, but Navidrome points at a file that is gone
++)
++
++// coverStates classifies the albums. Beyond the disk walk of albumHasCover it reads the state
++// Navidrome keeps per album (item_artwork): that is what is actually served, and after a track is
++// renamed, moved or retagged it can keep naming the old file for good ("Bocas ordinárias" had
++// real embedded art in its tracks but showed the placeholder).
++func (e *Editor) coverStates(ctx context.Context, albums []model.Album) (map[string]coverState, error) {
+ 	has, err := e.albumHasCover(ctx, albums)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	var out []model.Album
++	out := make(map[string]coverState, len(albums))
+ 	for _, a := range albums {
+-		if !has[a.ID] {
+-			out = append(out, a)
++		st := coverNone
++		if has[a.ID] {
++			st = coverOK
++		}
++		ia, err := e.ds.Artwork().GetItemArtwork(ctx, model.KindAlbumArtwork, a.ID, model.ImageTypePrimary)
++		if err == nil && ia != nil {
++			switch {
++			case ia.SourcePath != "":
++				if _, serr := os.Stat(ia.SourcePath); serr == nil {
++					st = coverOK // served from a file that is there (embedded, folder or upload)
++				} else if st == coverOK {
++					st = coverStale
++				}
++			case ia.Source == "" && ia.LastFailure != "" && st == coverOK:
++				st = coverStale // gave up resolving although the image is on disk
++			}
+ 		}
++		out[a.ID] = st
+ 	}
+-	sort.SliceStable(out, func(i, j int) bool { return out[i].SongCount > out[j].SongCount })
+ 	return out, nil
+ }
+ 
++// albumsWithoutCover returns the albums Navidrome shows a placeholder for (stale reports which of
++// them already have the image and only need a refresh).
++func (e *Editor) albumsWithoutCover(ctx context.Context, albums model.Albums) (missing []model.Album, stale map[string]bool, err error) {
++	states, err := e.coverStates(ctx, albums)
++	if err != nil {
++		return nil, nil, err
++	}
++	stale = map[string]bool{}
++	for _, a := range albums {
++		switch states[a.ID] {
++		case coverNone:
++			missing = append(missing, a)
++		case coverStale:
++			missing = append(missing, a)
++			stale[a.ID] = true
++		}
++	}
++	sort.SliceStable(missing, func(i, j int) bool { return missing[i].SongCount > missing[j].SongCount })
++	return missing, stale, nil
++}
++
+ // albumHasCover maps album id -> true when Navidrome has a real image to show for it. It mirrors
+ // the CoverArtPriority walk but checks the disk, because the database keeps paths of files that
+ // were renamed or deleted, and lists images (track thumbnails) that never become a cover.
+diff --git a/core/seer/covers_test.go b/core/seer/covers_test.go
+index dc8485b..f54bc08 100644
+--- a/core/seer/covers_test.go
++++ b/core/seer/covers_test.go
+@@ -3,6 +3,7 @@ package seer
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"image"
+ 	"image/jpeg"
+ 	"net/http"
+@@ -191,3 +192,100 @@ func TestFetchCoverEmbedsWhenFolderIsShared(t *testing.T) {
+ 		t.Error("picture was not embedded in the tracks")
+ 	}
+ }
++
++// Real case: "Bocas ordinárias" had embedded art in its tracks, but Navidrome kept serving the
++// placeholder because its stored artwork state named a track that was moved away.
++func TestCoverStatesStaleArtworkState(t *testing.T) {
++	root := t.TempDir()
++	good := filepath.Join(root, "A", "ok", "02.flac")
++	_ = os.MkdirAll(filepath.Dir(good), 0o755)
++	if err := os.WriteFile(good, []byte("x"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	folder := model.Folder{ID: "f1", LibraryPath: root, Path: "A", Name: "ok", ImageFiles: []string{"cover.jpg"}}
++	_ = os.WriteFile(filepath.Join(root, "A", "ok", "cover.jpg"), []byte("x"), 0o644)
++	repo := tests.CreateMockArtworkRepo()
++	put := func(id, source, path, failure string) {
++		if err := repo.PutItemArtwork(context.Background(), &model.ItemArtwork{ItemKind: "al", ItemID: id, ImageType: model.ImageTypePrimary,
++			Source: source, SourcePath: path, LastFailure: failure}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	put("stale", "embedded", filepath.Join(root, "A", "ok", "01-moved.flac"), "")
++	put("fine", "embedded", good, "")
++	put("gave-up", "", "", "[]")
++	ds := &tests.MockDataStore{MockedFolder: &fakeFolders{all: []model.Folder{folder}}, MockedArtwork: repo}
++	e := NewEditor(ds, nil, nil, nil, nil)
++	albums := []model.Album{
++		{ID: "stale", FolderIDs: []string{"f1"}},
++		{ID: "fine", FolderIDs: []string{"f1"}},
++		{ID: "gave-up", FolderIDs: []string{"f1"}},
++		{ID: "no-state", FolderIDs: []string{"f1"}},
++		{ID: "nothing", FolderIDs: []string{"nowhere"}},
++	}
++	got, err := e.coverStates(context.Background(), albums)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := map[string]coverState{"stale": coverStale, "fine": coverOK, "gave-up": coverStale, "no-state": coverOK, "nothing": coverNone}
++	for id, w := range want {
++		if got[id] != w {
++			t.Errorf("%s: state = %v, want %v", id, got[id], w)
++		}
++	}
++}
++
++func TestFetchCoverRefreshesStaleState(t *testing.T) {
++	root, ds, srv := fetchCoverSetup(t)
++	_ = os.WriteFile(filepath.Join(root, "Artist", "Album", "cover.jpg"), []byte("x"), 0o644)
++	folder := model.Folder{ID: "f1", LibraryPath: root, Path: "Artist", Name: "Album", ImageFiles: []string{"cover.jpg"}}
++	ds.MockedFolder = &fakeFolders{all: []model.Folder{folder}}
++	albums := tests.CreateMockAlbumRepo()
++	albums.SetData(model.Albums{{ID: "al1", Name: "Album", AlbumArtist: "Artist", FolderIDs: []string{"f1"}}})
++	ds.MockedAlbum = albums
++	repo := tests.CreateMockArtworkRepo()
++	_ = repo.PutItemArtwork(context.Background(), &model.ItemArtwork{ItemKind: "al", ItemID: "al1", ImageType: model.ImageTypePrimary,
++		Source: "embedded", SourcePath: filepath.Join(root, "gone.flac")})
++	ds.MockedArtwork = repo
++	e := NewEditor(ds, &fakeScanner{}, &fakeMaintenance{}, &fakeTags{}, nil)
++	e.SetCovers(&acquire.CoverFinder{CAAURL: srv.URL}, nil)
++
++	res, err := e.FetchCover(context.Background(), "al1", false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !res.Refreshed || res.Found {
++		t.Errorf("result = %+v, want refreshed without a download", res)
++	}
++	if ia, _ := repo.GetItemArtwork(context.Background(), model.KindAlbumArtwork, "al1", model.ImageTypePrimary); ia != nil {
++		t.Errorf("stale state was not cleared: %+v", ia)
++	}
++}
++
++func TestSetCoverImage(t *testing.T) {
++	root, ds, _ := fetchCoverSetup(t)
++	var img bytes.Buffer
++	_ = jpeg.Encode(&img, image.NewRGBA(image.Rect(0, 0, 50, 60)), nil)
++	sc := &fakeScanner{}
++	e := NewEditor(ds, sc, &fakeMaintenance{}, &fakeTags{}, nil)
++
++	res, err := e.SetCoverImage(context.Background(), "al1", img.Bytes())
++	if err != nil || !res.Found || res.Source != "manual" {
++		t.Fatalf("res = %+v err = %v", res, err)
++	}
++	got, err := os.ReadFile(filepath.Join(root, "Artist", "Album", "cover.jpg"))
++	if err != nil || !bytes.Equal(got, img.Bytes()) {
++		t.Errorf("cover.jpg not written: %v", err)
++	}
++	if len(sc.targets) != 1 {
++		t.Errorf("scans = %v", sc.targets)
++	}
++	for name, data := range map[string][]byte{"empty": nil, "not an image": []byte("hello")} {
++		if _, err := e.SetCoverImage(context.Background(), "al1", data); !errors.Is(err, ErrBadImage) {
++			t.Errorf("%s: err = %v, want ErrBadImage", name, err)
++		}
++	}
++	if _, err := e.SetCoverImage(context.Background(), "nope", img.Bytes()); !errors.Is(err, ErrItemNotFound) {
++		t.Errorf("missing album: %v", err)
++	}
++}
+diff --git a/core/seer/report.go b/core/seer/report.go
+index 5c957d6..4220efb 100644
+--- a/core/seer/report.go
++++ b/core/seer/report.go
+@@ -40,6 +40,8 @@ type AlbumVariant struct {
+ 	MbzAlbumID        string `json:"mbzAlbumId,omitempty"`
+ 	MbzReleaseGroupID string `json:"mbzReleaseGroupId,omitempty"`
+ 	MbzAlbumArtistID  string `json:"mbzAlbumArtistId,omitempty"`
++	// Stale (no-cover list only): the image is on disk but Navidrome points at a file that is gone.
++	Stale bool `json:"stale,omitempty"`
+ }
+ 
+ // AlbumGroup is a set of albums that are the same album written differently.
+@@ -108,7 +110,7 @@ func (e *Editor) Report(ctx context.Context) (*MetaReport, error) {
+ 		}
+ 	}
+ 	// The cover check only adds to the report: a failure here must not hide the rest of it.
+-	if missing, err := e.albumsWithoutCover(ctx, candidates); err != nil {
++	if missing, stale, err := e.albumsWithoutCover(ctx, candidates); err != nil {
+ 		log.Warn(ctx, "Seer: could not check album covers", err)
+ 	} else {
+ 		rep.NoCoverTotal = len(missing)
+@@ -117,7 +119,8 @@ func (e *Editor) Report(ctx context.Context) (*MetaReport, error) {
+ 				break
+ 			}
+ 			rep.NoCover = append(rep.NoCover, AlbumVariant{ID: a.ID, Name: a.Name, Artist: a.AlbumArtist, Songs: a.SongCount,
+-				Year: a.MinYear, MbzAlbumID: a.MbzAlbumID, MbzReleaseGroupID: a.MbzReleaseGroupID, MbzAlbumArtistID: a.MbzAlbumArtistID})
++				Year: a.MinYear, MbzAlbumID: a.MbzAlbumID, MbzReleaseGroupID: a.MbzReleaseGroupID, MbzAlbumArtistID: a.MbzAlbumArtistID,
++				Stale: stale[a.ID]})
+ 		}
+ 	}
+ 	return rep, nil
+diff --git a/server/seerapi/library.go b/server/seerapi/library.go
+index 51ad689..6e6f9b8 100644
+--- a/server/seerapi/library.go
++++ b/server/seerapi/library.go
+@@ -3,6 +3,7 @@ package seerapi
+ import (
+ 	"encoding/json"
+ 	"errors"
++	"io"
+ 	"net/http"
+ 
+ 	"github.com/go-chi/chi/v5"
+@@ -90,3 +91,25 @@ func (api *Router) fetchCover(w http.ResponseWriter, r *http.Request) {
+ 		writeJSON(w, http.StatusOK, res)
+ 	}
+ }
++
++// uploadCover takes a JPEG or PNG as the request body and makes it the album's cover.
++func (api *Router) uploadCover(w http.ResponseWriter, r *http.Request) {
++	const limit = 16 << 20
++	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
++	if err != nil {
++		http.Error(w, "image too large", http.StatusRequestEntityTooLarge)
++		return
++	}
++	res, err := api.editor.SetCoverImage(r.Context(), chi.URLParam(r, "id"), data)
++	switch {
++	case errors.Is(err, seer.ErrItemNotFound):
++		http.Error(w, "not found", http.StatusNotFound)
++	case errors.Is(err, seer.ErrBadImage):
++		http.Error(w, err.Error(), http.StatusBadRequest)
++	case err != nil:
++		log.Error(r.Context(), "Seer: cover upload failed", err)
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++	default:
++		writeJSON(w, http.StatusOK, res)
++	}
++}
+diff --git a/server/seerapi/library_test.go b/server/seerapi/library_test.go
+index 6750c53..ab9b47e 100644
+--- a/server/seerapi/library_test.go
++++ b/server/seerapi/library_test.go
+@@ -40,6 +40,16 @@ func (f *fakeEditor) FetchCover(_ context.Context, id string, force bool) (*seer
+ 	f.calls = append(f.calls, fmt.Sprintf("fetchCover:%s:%v", id, force))
+ 	return &seer.CoverResult{AlbumID: id, Found: true, Source: "Deezer"}, nil
+ }
++func (f *fakeEditor) SetCoverImage(_ context.Context, id string, data []byte) (*seer.CoverResult, error) {
++	if id == "missing" {
++		return nil, seer.ErrItemNotFound
++	}
++	if string(data) == "bad" {
++		return nil, fmt.Errorf("%w: nope", seer.ErrBadImage)
++	}
++	f.calls = append(f.calls, fmt.Sprintf("setCover:%s:%d", id, len(data)))
++	return &seer.CoverResult{AlbumID: id, Found: true, Source: "manual"}, nil
++}
+ func (f *fakeEditor) DeleteAlbum(_ context.Context, id string) error {
+ 	f.calls = append(f.calls, "deleteAlbum:"+id)
+ 	return nil
+@@ -91,3 +101,26 @@ func TestLibraryAPI(t *testing.T) {
+ 		t.Errorf("no editor: %d", w.Code)
+ 	}
+ }
++
++func TestUploadCoverAPI(t *testing.T) {
++	ed := &fakeEditor{}
++	api := NewWithServices(nil, &fakeService{}, ed)
++	user := model.User{ID: "u1"}
++	admin := model.User{ID: "adm", IsAdmin: true}
++
++	if w := do(t, api, user, "PUT", "/library/album/al1/cover", "img"); w.Code != 403 {
++		t.Errorf("non-admin upload: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/library/album/al1/cover", "image-bytes"); w.Code != 200 || !strings.Contains(w.Body.String(), `"source":"manual"`) {
++		t.Errorf("upload: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, admin, "PUT", "/library/album/missing/cover", "img"); w.Code != 404 {
++		t.Errorf("missing album: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/library/album/al1/cover", "bad"); w.Code != 400 {
++		t.Errorf("bad image: %d", w.Code)
++	}
++	if got := strings.Join(ed.calls, ","); got != "setCover:al1:11" {
++		t.Errorf("calls = %s", got)
++	}
++}
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index df01352..3890ee4 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -61,6 +61,7 @@ type Editor interface {
+ 	DeleteAlbum(ctx context.Context, id string) error
+ 	Report(ctx context.Context) (*seer.MetaReport, error)
+ 	FetchCover(ctx context.Context, albumID string, force bool) (*seer.CoverResult, error)
++	SetCoverImage(ctx context.Context, albumID string, data []byte) (*seer.CoverResult, error)
+ }
+ 
+ type Router struct {
+@@ -172,6 +173,7 @@ func (api *Router) routes() http.Handler {
+ 				r.Delete("/song/{id}", api.deleteSong)
+ 				r.Put("/album/{id}", api.editAlbum)
+ 				r.Post("/album/{id}/cover", api.fetchCover)
++				r.Put("/album/{id}/cover", api.uploadCover)
+ 				r.Get("/metadata-report", api.metadataReport)
+ 				r.Delete("/album/{id}", api.deleteAlbum)
+ 			})

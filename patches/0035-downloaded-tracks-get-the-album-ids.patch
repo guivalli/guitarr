@@ -1,0 +1,180 @@
+diff --git a/core/acquire/catalog_musicbrainz.go b/core/acquire/catalog_musicbrainz.go
+index a1d45b8b..a2b414ee 100644
+--- a/core/acquire/catalog_musicbrainz.go
++++ b/core/acquire/catalog_musicbrainz.go
+@@ -296,6 +296,23 @@ func (r mbRecording) item() (CatalogItem, bool) {
+ 	}, true
+ }
+ 
++// RecordingReleaseGroup is the release group of the most representative release of a recording,
++// for requests made without one (imports, older requests).
++func (m *MusicBrainz) RecordingReleaseGroup(ctx context.Context, mbid string) (string, error) {
++	if !ValidMBID(mbid) {
++		return "", ErrNotFound
++	}
++	var rec mbRecording
++	if err := m.get(ctx, "/recording/"+mbid, url.Values{"inc": {"releases+release-groups+artist-credits"}}, &rec); err != nil {
++		return "", err
++	}
++	it, ok := rec.item()
++	if !ok {
++		return "", ErrNotFound
++	}
++	return it.CoverID, nil
++}
++
+ func yearOf(date string) int {
+ 	if len(date) >= 4 {
+ 		if y, err := strconv.Atoi(date[:4]); err == nil {
+diff --git a/core/acquire/retag.go b/core/acquire/retag.go
+index b45ab5f5..f3786905 100644
+--- a/core/acquire/retag.go
++++ b/core/acquire/retag.go
+@@ -23,13 +23,25 @@ type tagPlan struct {
+ // "greatest hits" or "Greatest Hits (Explicit)" and the library fills with near duplicates.
+ // A failure never fails the request: it only adds a warning.
+ func (s *Service) retag(ctx context.Context, req *Request, res Result) Result {
+-	if res.Tagged || len(res.Paths) == 0 || !ValidMBID(req.MBID) {
++	if len(res.Paths) == 0 || !ValidMBID(req.MBID) {
++		return res
++	}
++	if res.Tagged {
++		// The web sources wrote the track's own tags; the album-level ids (release, release group,
++		// artist) are still missing, and without them the library shows "no MusicBrainz code".
++		if req.Kind == KindTrack {
++			s.tagAlbumLevel(ctx, *req, res.Paths[0])
++		}
+ 		return res
+ 	}
+ 	var plans []tagPlan
+ 	switch req.Kind {
+ 	case KindTrack:
+-		plans = []tagPlan{{path: res.Paths[0], tags: requestTags(*req)}}
++		tags := requestTags(*req)
++		if d := s.releaseOf(ctx, *req); d != nil {
++			tags = append(tags, trackAlbumTags(d, *req)...)
++		}
++		plans = []tagPlan{{path: res.Paths[0], tags: tags}}
+ 	case KindAlbum:
+ 		detail, err := s.catalog.Album(ctx, req.MBID)
+ 		if err != nil || detail == nil {
+@@ -50,6 +62,80 @@ func (s *Service) retag(ctx context.Context, req *Request, res Result) Result {
+ 	return res
+ }
+ 
++// releaseGroupOf is the release group a requested track belongs to: the one the request was made
++// from (CoverID of a catalog track) or, for a request without it, the one MusicBrainz lists for
++// the recording.
++func (s *Service) releaseGroupOf(ctx context.Context, req Request) string {
++	if ValidMBID(req.ReleaseGroupID) {
++		return req.ReleaseGroupID
++	}
++	if ValidMBID(req.CoverID) {
++		return req.CoverID
++	}
++	if f, ok := s.catalog.(interface {
++		RecordingReleaseGroup(ctx context.Context, mbid string) (string, error)
++	}); ok {
++		if id, err := f.RecordingReleaseGroup(ctx, req.MBID); err == nil && ValidMBID(id) {
++			return id
++		}
++	}
++	return ""
++}
++
++// releaseOf is the release (album) a requested track is tagged with; nil when it is unknown.
++func (s *Service) releaseOf(ctx context.Context, req Request) *AlbumDetail {
++	rg := s.releaseGroupOf(ctx, req)
++	if rg == "" {
++		return nil
++	}
++	d, err := s.catalog.Album(ctx, rg)
++	if err != nil || d == nil {
++		return nil
++	}
++	return d
++}
++
++// tagAlbumLevel adds the album ids and the track position to a file whose title and artist are
++// already right. A failure only leaves the file as it was: Organizar Metadados can still fix it.
++func (s *Service) tagAlbumLevel(ctx context.Context, req Request, path string) {
++	d := s.releaseOf(ctx, req)
++	if d == nil {
++		return
++	}
++	_ = writeTags(ctx, cmp(s.cfg.FFmpeg, "ffmpeg"), path, trackAlbumTags(d, req))
++}
++
++// trackAlbumTags are the album-level tags of one requested track, plus its position and artist id
++// when the release lists it (by recording id, then by title).
++func trackAlbumTags(d *AlbumDetail, req Request) []string {
++	al := d.Album
++	tags := []string{"album=" + al.Title, "album_artist=" + al.Artist}
++	if al.Year > 0 {
++		tags = append(tags, "date="+strconv.Itoa(al.Year))
++	}
++	if ValidMBID(al.MBID) {
++		tags = append(tags, "MUSICBRAINZ_RELEASEGROUPID="+al.MBID)
++	}
++	if ValidMBID(al.ReleaseID) {
++		tags = append(tags, "MUSICBRAINZ_ALBUMID="+al.ReleaseID)
++	}
++	if ValidMBID(al.ArtistMBID) {
++		tags = append(tags, "MUSICBRAINZ_ALBUMARTISTID="+al.ArtistMBID)
++	}
++	want := looseKey(req.Title)
++	for i, t := range d.Tracks {
++		if t.MBID != req.MBID && (want == "" || looseKey(t.Title) != want) {
++			continue
++		}
++		tags = append(tags, fmt.Sprintf("track=%d", cmp0(t.TrackNumber, i+1)))
++		if ValidMBID(t.ArtistMBID) {
++			tags = append(tags, "MUSICBRAINZ_ARTISTID="+t.ArtistMBID)
++		}
++		break
++	}
++	return tags
++}
++
+ func addWarning(res Result, w string) Result {
+ 	if res.Warning == "" {
+ 		res.Warning = w
+diff --git a/core/acquire/retag_test.go b/core/acquire/retag_test.go
+index e37e9543..f6210b35 100644
+--- a/core/acquire/retag_test.go
++++ b/core/acquire/retag_test.go
+@@ -63,3 +63,22 @@ func TestLooseKey(t *testing.T) {
+ 		t.Error("looseKey should ignore case, accents and punctuation")
+ 	}
+ }
++
++func TestTrackAlbumTagsAddReleaseIds(t *testing.T) {
++	got := strings.Join(trackAlbumTags(sampleAlbum(), Request{MBID: recID2, Title: "whatever"}), "|")
++	for _, want := range []string{"album=Greatest Hits", "date=2005", "track=2",
++		"MUSICBRAINZ_RELEASEGROUPID=" + rgID, "MUSICBRAINZ_ALBUMID=" + relID, "MUSICBRAINZ_ALBUMARTISTID=" + artID, "MUSICBRAINZ_ARTISTID=" + artID} {
++		if !strings.Contains(got, want) {
++			t.Errorf("tags missing %q in %s", want, got)
++		}
++	}
++	// recording not on the chosen release: matched by title; unknown track: album ids only
++	byTitle := strings.Join(trackAlbumTags(sampleAlbum(), Request{MBID: recID1[:len(recID1)-1] + "9", Title: "DAMMIT"}), "|")
++	if !strings.Contains(byTitle, "track=1") {
++		t.Errorf("title match missing: %s", byTitle)
++	}
++	none := strings.Join(trackAlbumTags(sampleAlbum(), Request{MBID: recID1[:len(recID1)-1] + "9", Title: "Other"}), "|")
++	if strings.Contains(none, "track=") || !strings.Contains(none, "MUSICBRAINZ_ALBUMID="+relID) {
++		t.Errorf("unmatched track tags = %s", none)
++	}
++}
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index edde320d..510b9577 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -509,6 +509,7 @@ func (s *Service) fetchAlbumTracks(ctx context.Context, req *Request) (Result, e
+ 		for _, src := range s.trackSources() {
+ 			res, err := src.Fetch(ctx, tr, s.cfg.DestDir)
+ 			if err == nil && len(res.Paths) > 0 {
++				_ = writeTags(ctx, cmp(s.cfg.FFmpeg, "ffmpeg"), res.Paths[0], trackAlbumTags(detail, tr))
+ 				paths = append(paths, res.Paths...)
+ 				got = true
+ 				break

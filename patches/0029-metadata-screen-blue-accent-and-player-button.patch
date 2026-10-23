@@ -1,0 +1,838 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] Seer: metadata screen, blue accent, Seer look kept on Seer screens, player button
+
+Seer screens always use the Seer look, whatever theme is picked elsewhere; the accent is blue
+(statuses stay green); the player play button is a plain round control; the metadata
+report gets its own admin screen (entry on the Seer page) with the five problem lists.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index da2b483..8a66efd 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -700,6 +700,29 @@
+           "title": "Pronto!",
+           "text": "Você pode rever este tour em Configurações, na parte do Seer, quando quiser."
+         }
++      },
++      "metadata": {
++        "title": "Metadados",
++        "intro": "Confira a biblioteca e corrija os problemas. Cada linha abre o álbum ou a faixa para editar.",
++        "loading": "Carregando o relatório…",
++        "loadError": "Não consegui carregar o relatório de metadados",
++        "songs": "músicas",
++        "albums": "álbuns",
++        "artists": "artistas",
++        "withMbid": "músicas com ID de álbum do MusicBrainz",
++        "noMbid": "Álbuns sem ID do MusicBrainz",
++        "albumGroups": "Álbuns escritos de jeitos diferentes",
++        "artistGroups": "Artistas escritos de jeitos diferentes",
++        "unknown": "Faixas sem álbum ou artista",
++        "noCover": "Álbuns sem capa",
++        "edit": "Editar",
++        "findInCatalog": "Buscar no catálogo",
++        "back": "Voltar ao Seer",
++        "sameEdition": "mesma edição",
++        "possibleDuplicate": "possível duplicata",
++        "artistLine": "%{tracks} faixas · %{albums} álbuns",
++        "more": "…e mais %{count}",
++        "none": "Nada para mostrar aqui."
+       }
+     },
+     "podcast": {
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 2f8b552..6b56d08 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -703,6 +703,29 @@
+           "title": "All set!",
+           "text": "You can see this tour again in Settings, under Seer, whenever you want."
+         }
++      },
++      "metadata": {
++        "title": "Metadata",
++        "intro": "Check the library for problems and fix them. Each row opens the album or track to edit it.",
++        "loading": "Loading the report…",
++        "loadError": "Could not load the metadata report",
++        "songs": "songs",
++        "albums": "albums",
++        "artists": "artists",
++        "withMbid": "songs with a MusicBrainz album ID",
++        "noMbid": "Albums without a MusicBrainz ID",
++        "albumGroups": "Albums written in different ways",
++        "artistGroups": "Artists written in different ways",
++        "unknown": "Tracks with no album or artist",
++        "noCover": "Albums without cover art",
++        "edit": "Edit",
++        "findInCatalog": "Find in catalog",
++        "back": "Back to Seer",
++        "sameEdition": "same edition",
++        "possibleDuplicate": "possible duplicate",
++        "artistLine": "%{tracks} tracks · %{albums} albums",
++        "more": "…and %{count} more",
++        "none": "Nothing to show here."
+       }
+     },
+     "podcast": {
+diff --git a/ui/src/seer/ImportView.jsx b/ui/src/seer/ImportView.jsx
+index bc4f626..5687c84 100644
+--- a/ui/src/seer/ImportView.jsx
++++ b/ui/src/seer/ImportView.jsx
+@@ -16,7 +16,7 @@ import SyncIcon from '@material-ui/icons/Sync'
+ import { useNotify, useTranslate } from 'react-admin'
+ import { useHistory } from 'react-router-dom'
+ import { useRefreshOnEvents } from '../common'
+-import { GREEN } from './actions'
++import { ACCENT, GREEN } from './actions'
+ import {
+   deleteImport,
+   getImport,
+@@ -75,9 +75,9 @@ const useStyles = makeStyles((theme) => {
+       '&:hover': { borderColor: theme.palette.text.primary },
+     },
+     on: {
+-      background: `${GREEN}26`,
+-      borderColor: GREEN,
+-      color: dark ? GREEN : '#0a7a35',
++      background: `${ACCENT}26`,
++      borderColor: ACCENT,
++      color: dark ? ACCENT : '#0a7a35',
+     },
+     row: {
+       display: 'grid',
+diff --git a/ui/src/seer/ImportsPanel.jsx b/ui/src/seer/ImportsPanel.jsx
+index e9e0547..3d8019d 100644
+--- a/ui/src/seer/ImportsPanel.jsx
++++ b/ui/src/seer/ImportsPanel.jsx
+@@ -8,7 +8,7 @@ import QueueMusicIcon from '@material-ui/icons/QueueMusic'
+ import { useNotify, useTranslate } from 'react-admin'
+ import { useHistory } from 'react-router-dom'
+ import { importFile, importLink } from './api'
+-import { GREEN } from './actions'
++import { ACCENT, GREEN } from './actions'
+ import { Grid } from './components'
+ 
+ export const SOURCE_COLORS = {
+@@ -67,7 +67,7 @@ const useStyles = makeStyles((theme) => {
+       borderRadius: 999,
+       fontWeight: 800,
+       fontSize: 15,
+-      background: GREEN,
++      background: ACCENT,
+       color: '#000',
+       transition: 'transform 150ms ease',
+       '&:hover': { transform: 'scale(1.04)' },
+@@ -84,7 +84,7 @@ const useStyles = makeStyles((theme) => {
+       background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+       '& svg': { fontSize: 18 },
+     },
+-    chipOn: { background: `${GREEN}33`, color: dark ? GREEN : '#0a7a35' },
++    chipOn: { background: `${ACCENT}33`, color: dark ? ACCENT : '#0a7a35' },
+     card: {
+       display: 'block',
+       width: '100%',
+diff --git a/ui/src/seer/MetadataView.jsx b/ui/src/seer/MetadataView.jsx
+new file mode 100644
+index 0000000..baea501
+--- /dev/null
++++ b/ui/src/seer/MetadataView.jsx
+@@ -0,0 +1,257 @@
++import { useEffect, useState } from 'react'
++import { Button, Chip, Paper, Typography } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import { useHistory } from 'react-router-dom'
++import { useNotify, useTranslate } from 'react-admin'
++import { getMetadataReport } from './api'
++import { Section } from './components'
++
++// How many rows each list shows; the real totals are always printed.
++const LIMIT = 60
++
++const useStyles = makeStyles((theme) => ({
++  summary: {
++    display: 'grid',
++    gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
++    gap: theme.spacing(1.5),
++    margin: theme.spacing(2, 0),
++  },
++  stat: {
++    padding: theme.spacing(2),
++    borderRadius: 16,
++    background: theme.palette.background.paper,
++  },
++  statValue: { fontSize: 26, fontWeight: 800, lineHeight: 1.1 },
++  row: {
++    display: 'flex',
++    alignItems: 'center',
++    gap: theme.spacing(1.5),
++    padding: theme.spacing(1.25, 1.5),
++    borderRadius: 12,
++    background: theme.palette.background.paper,
++    marginBottom: theme.spacing(1),
++  },
++  rowText: { flex: 1, minWidth: 0 },
++  rowTitle: { fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
++  rowMeta: { color: theme.palette.text.secondary, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
++  group: {
++    padding: theme.spacing(1.5),
++    borderRadius: 16,
++    border: `1px solid ${theme.palette.divider}`,
++    marginBottom: theme.spacing(1.5),
++  },
++  empty: { color: theme.palette.text.secondary, padding: theme.spacing(1, 0) },
++  more: { color: theme.palette.text.secondary, fontSize: 13, marginTop: theme.spacing(1) },
++}))
++
++const albumLine = (a) =>
++  [a.artist, a.year ? String(a.year) : '', `${a.songs} faixas`].filter(Boolean).join(' · ')
++
++const MetadataRow = ({ title, meta, actions, chip }) => {
++  const classes = useStyles()
++  return (
++    <div className={classes.row}>
++      <div className={classes.rowText}>
++        <div className={classes.rowTitle}>{title}</div>
++        <div className={classes.rowMeta}>{meta}</div>
++      </div>
++      {chip}
++      {actions}
++    </div>
++  )
++}
++
++// A list section: shows LIMIT rows and says how many more there are.
++const Rows = ({ items, render, empty }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  if (items.length === 0) {
++    return <Typography className={classes.empty}>{empty}</Typography>
++  }
++  return (
++    <>
++      {items.slice(0, LIMIT).map(render)}
++      {items.length > LIMIT && (
++        <Typography className={classes.more}>
++          {translate('resources.seer.metadata.more', { count: items.length - LIMIT })}
++        </Typography>
++      )}
++    </>
++  )
++}
++
++export const MetadataView = () => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const notify = useNotify()
++  const history = useHistory()
++  const [report, setReport] = useState(null)
++
++  useEffect(() => {
++    getMetadataReport()
++      .then(setReport)
++      .catch(() => notify('resources.seer.metadata.loadError', 'warning'))
++  }, [notify])
++
++  const editAlbum = (id) => history.push(`/album/${id}/show`)
++  const editSong = (id) => history.push(`/song/${id}/show`)
++  const searchFor = (q) => history.push(`/seer?q=${encodeURIComponent(q)}`)
++
++  const albumActions = (a) => (
++    <>
++      <Button size="small" onClick={() => editAlbum(a.id)}>
++        {translate('resources.seer.metadata.edit')}
++      </Button>
++      {!a.mbzAlbumId && (
++        <Button size="small" onClick={() => searchFor(`${a.artist} ${a.name}`)}>
++          {translate('resources.seer.metadata.findInCatalog')}
++        </Button>
++      )}
++    </>
++  )
++
++  const albumRow = (a) => (
++    <MetadataRow
++      key={a.id}
++      title={a.name}
++      meta={albumLine(a)}
++      actions={albumActions(a)}
++    />
++  )
++
++  const back = (
++    <Button size="small" onClick={() => history.push('/seer')}>
++      {translate('resources.seer.metadata.back')}
++    </Button>
++  )
++
++  if (!report) {
++    return (
++      <Section title={translate('resources.seer.metadata.title')}>
++        <Typography className={classes.empty}>
++          {translate('resources.seer.metadata.loading')}
++        </Typography>
++      </Section>
++    )
++  }
++
++  const withMbid = report.songs ? Math.round((report.songsWithAlbumMbid / report.songs) * 100) : 0
++
++  return (
++    <Section
++      title={translate('resources.seer.metadata.title')}
++      action={back}
++    >
++      <Typography color="textSecondary">{translate('resources.seer.metadata.intro')}</Typography>
++
++      <div className={classes.summary}>
++        <Paper className={classes.stat} elevation={0}>
++          <div className={classes.statValue}>{report.songs}</div>
++          <Typography variant="body2" color="textSecondary">{translate('resources.seer.metadata.songs')}</Typography>
++        </Paper>
++        <Paper className={classes.stat} elevation={0}>
++          <div className={classes.statValue}>{report.albums}</div>
++          <Typography variant="body2" color="textSecondary">{translate('resources.seer.metadata.albums')}</Typography>
++        </Paper>
++        <Paper className={classes.stat} elevation={0}>
++          <div className={classes.statValue}>{report.artists}</div>
++          <Typography variant="body2" color="textSecondary">{translate('resources.seer.metadata.artists')}</Typography>
++        </Paper>
++        <Paper className={classes.stat} elevation={0}>
++          <div className={classes.statValue}>{withMbid}%</div>
++          <Typography variant="body2" color="textSecondary">{translate('resources.seer.metadata.withMbid')}</Typography>
++        </Paper>
++      </div>
++
++      <Section title={`${translate('resources.seer.metadata.noMbid')} (${report.noMbid?.length ?? 0})`}>
++        <div style={{ marginTop: 12 }}>
++          <Rows
++            items={report.noMbid || []}
++            render={albumRow}
++            empty={translate('resources.seer.metadata.none')}
++          />
++        </div>
++      </Section>
++
++      <Section title={`${translate('resources.seer.metadata.albumGroups')} (${report.albumGroups?.length ?? 0})`}>
++        <div style={{ marginTop: 12 }}>
++          {(report.albumGroups || []).length === 0 && (
++            <Typography className={classes.empty}>{translate('resources.seer.metadata.none')}</Typography>
++          )}
++          {(report.albumGroups || []).slice(0, LIMIT).map((g, i) => (
++            <div key={i} className={classes.group}>
++              <Chip
++                size="small"
++                color={g.sameReleaseGroup ? 'default' : 'secondary'}
++                label={translate(
++                  g.sameReleaseGroup
++                    ? 'resources.seer.metadata.sameEdition'
++                    : 'resources.seer.metadata.possibleDuplicate',
++                )}
++                style={{ marginBottom: 8 }}
++              />
++              {g.variants.map(albumRow)}
++            </div>
++          ))}
++        </div>
++      </Section>
++
++      <Section title={`${translate('resources.seer.metadata.artistGroups')} (${report.artistGroups?.length ?? 0})`}>
++        <div style={{ marginTop: 12 }}>
++          {(report.artistGroups || []).length === 0 && (
++            <Typography className={classes.empty}>{translate('resources.seer.metadata.none')}</Typography>
++          )}
++          {(report.artistGroups || []).slice(0, LIMIT).map((g, i) => (
++            <div key={i} className={classes.group}>
++              {g.variants.map((v) => (
++                <MetadataRow
++                  key={v.name}
++                  title={v.name}
++                  meta={translate('resources.seer.metadata.artistLine', { tracks: v.tracks, albums: v.albums?.length ?? 0 })}
++                  actions={
++                    <Button size="small" onClick={() => searchFor(v.name)}>
++                      {translate('resources.seer.metadata.findInCatalog')}
++                    </Button>
++                  }
++                />
++              ))}
++            </div>
++          ))}
++        </div>
++      </Section>
++
++      <Section title={`${translate('resources.seer.metadata.unknown')} (${report.unknown?.length ?? 0})`}>
++        <div style={{ marginTop: 12 }}>
++          <Rows
++            items={report.unknown || []}
++            empty={translate('resources.seer.metadata.none')}
++            render={(t) => (
++              <MetadataRow
++                key={t.id}
++                title={t.title || t.path}
++                meta={[t.artist, t.album, t.path].filter(Boolean).join(' · ')}
++                actions={
++                  <Button size="small" onClick={() => editSong(t.id)}>
++                    {translate('resources.seer.metadata.edit')}
++                  </Button>
++                }
++              />
++            )}
++          />
++        </div>
++      </Section>
++
++      <Section
++        title={`${translate('resources.seer.metadata.noCover')} (${report.noCoverTotal ?? report.noCover?.length ?? 0})`}
++      >
++        <div style={{ marginTop: 12 }}>
++          <Rows
++            items={report.noCover || []}
++            render={albumRow}
++            empty={translate('resources.seer.metadata.none')}
++          />
++        </div>
++      </Section>
++    </Section>
++  )
++}
+diff --git a/ui/src/seer/SeerPage.jsx b/ui/src/seer/SeerPage.jsx
+index b52c606..817e2e5 100644
+--- a/ui/src/seer/SeerPage.jsx
++++ b/ui/src/seer/SeerPage.jsx
+@@ -4,7 +4,8 @@ import { makeStyles } from '@material-ui/core/styles'
+ import CloseIcon from '@material-ui/icons/Close'
+ import SearchIcon from '@material-ui/icons/Search'
+ import MicIcon from '@material-ui/icons/Mic'
+-import { Title, useNotify, useTranslate } from 'react-admin'
++import LibraryMusicIcon from '@material-ui/icons/LibraryMusic'
++import { Title, usePermissions, useNotify, useTranslate } from 'react-admin'
+ import { useHistory, useLocation } from 'react-router-dom'
+ import { useRefreshOnEvents } from '../common'
+ import config from '../config'
+@@ -20,6 +21,7 @@ import {
+ import { ArtistView } from './ArtistView'
+ import { ImportsPanel } from './ImportsPanel'
+ import { ImportView } from './ImportView'
++import { MetadataView } from './MetadataView'
+ import { Section } from './components'
+ import { RequestsList } from './RequestsList'
+ import { SearchView } from './SearchView'
+@@ -81,7 +83,7 @@ const useStyles = makeStyles((theme) => {
+       marginTop: theme.spacing(2),
+       color: 'white',
+       background:
+-        'radial-gradient(1200px 400px at 0% 0%, #1ed76055, transparent 60%), radial-gradient(900px 500px at 100% 100%, #7c4dff66, transparent 60%), linear-gradient(135deg, #10241a 0%, #1a1035 100%)',
++        'radial-gradient(1200px 400px at 0% 0%, #3b8cff55, transparent 60%), radial-gradient(900px 500px at 100% 100%, #7c4dff66, transparent 60%), linear-gradient(135deg, #10241a 0%, #1a1035 100%)',
+       [theme.breakpoints.down('xs')]: { padding: theme.spacing(4, 3) },
+     },
+     welcomeTitle: {
+@@ -114,7 +116,7 @@ const useStyles = makeStyles((theme) => {
+         position: 'absolute',
+         inset: '38%',
+         borderRadius: '50%',
+-        background: 'linear-gradient(135deg, #1ed760, #7c4dff)',
++        background: 'linear-gradient(135deg, #3b8cff, #7c4dff)',
+       },
+       [theme.breakpoints.down('xs')]: { display: 'none' },
+     },
+@@ -136,6 +138,8 @@ const SeerPage = () => {
+   const notify = useNotify()
+   const history = useHistory()
+   const location = useLocation()
++  const { permissions } = usePermissions()
++  const isAdmin = permissions === 'admin'
+   const params = useMemo(
+     () => new URLSearchParams(location.search),
+     [location.search],
+@@ -143,6 +147,7 @@ const SeerPage = () => {
+   const artist = params.get('artist')
+   const album = params.get('album')
+   const importId = params.get('import')
++  const view = params.get('view')
+   const detail = artist || album || importId
+   const [query, setQuery] = useState(params.get('q') || '')
+   const [debounced, setDebounced] = useState(query.trim())
+@@ -192,7 +197,7 @@ const SeerPage = () => {
+ 
+   // Keep the query in the URL, so "back" from an artist returns to the results.
+   useEffect(() => {
+-    if (detail) return
++    if (detail || view) return
+     const search = debounced ? `?q=${encodeURIComponent(debounced)}` : ''
+     if (location.search !== search) history.replace(`/seer${search}`)
+   }, [debounced, detail, history, location.search])
+@@ -235,6 +240,8 @@ const SeerPage = () => {
+     body = <AlbumView key={album} mbid={album} />
+   } else if (importId) {
+     body = <ImportView key={importId} id={importId} />
++  } else if (view === 'metadata' && isAdmin) {
++    body = <MetadataView />
+   } else if (searchKey) {
+     body = (
+       <SearchView
+@@ -272,6 +279,24 @@ const SeerPage = () => {
+           >
+             {translate('resources.podcast.name', { smart_count: 2, _: 'Podcasts' })} (YouTube / RSS)
+           </Button>
++          {isAdmin && (
++            <Button
++              variant="outlined"
++              startIcon={<LibraryMusicIcon />}
++              onClick={() => history.push('/seer?view=metadata')}
++              style={{
++                marginTop: 18,
++                marginLeft: 12,
++                color: '#fff',
++                borderColor: 'rgba(255,255,255,0.4)',
++                borderRadius: 20,
++                textTransform: 'none',
++                fontWeight: 600,
++              }}
++            >
++              {translate('resources.seer.metadata.title')}
++            </Button>
++          )}
+         </div>
+         <div data-tour="imports">
+           <ImportsPanel
+@@ -300,7 +325,7 @@ const SeerPage = () => {
+             translate('resources.seer.name', { smart_count: 2 })
+           }
+         />
+-        {!detail && (
++        {!detail && !view && (
+           <div className={classes.bar}>
+             <div className={classes.search} data-tour="search">
+               <SearchIcon />
+diff --git a/ui/src/seer/StorageWidget.jsx b/ui/src/seer/StorageWidget.jsx
+index 647816a..cfdcdd8 100644
+--- a/ui/src/seer/StorageWidget.jsx
++++ b/ui/src/seer/StorageWidget.jsx
+@@ -13,7 +13,7 @@ import { makeStyles } from '@material-ui/core/styles'
+ import StorageIcon from '@material-ui/icons/Storage'
+ import { useLocale, useNotify, usePermissions, useTranslate } from 'react-admin'
+ import { useRefreshOnEvents } from '../common'
+-import { GREEN } from './actions'
++import { ACCENT } from './actions'
+ import { getStorage, setStorageLimit } from './api'
+ import { DuplicatesPanel } from './DuplicatesPanel'
+ 
+@@ -43,7 +43,7 @@ export const usage = (info) => {
+ }
+ 
+ const barColor = (info, pct) =>
+-  info.full ? '#ff5c7a' : pct > 0.85 ? '#f5a524' : GREEN
++  info.full ? '#ff5c7a' : pct > 0.85 ? '#f5a524' : ACCENT
+ 
+ const useStyles = makeStyles((theme) => {
+   const dark = theme.palette.type === 'dark'
+@@ -115,9 +115,9 @@ const useStyles = makeStyles((theme) => {
+       '&:hover': { borderColor: theme.palette.text.primary },
+     },
+     presetOn: {
+-      background: `${GREEN}26`,
+-      borderColor: GREEN,
+-      color: dark ? GREEN : '#0a7a35',
++      background: `${ACCENT}26`,
++      borderColor: ACCENT,
++      color: dark ? ACCENT : '#0a7a35',
+     },
+     big: {
+       fontSize: 34,
+diff --git a/ui/src/seer/actions.jsx b/ui/src/seer/actions.jsx
+index 9855422..84c576a 100644
+--- a/ui/src/seer/actions.jsx
++++ b/ui/src/seer/actions.jsx
+@@ -26,13 +26,14 @@ export const findRequest = (requests, item) =>
+   )
+ 
+ export const GREEN = '#1ed760'
++export const ACCENT = '#3b8cff'
+ 
+ const useStyles = makeStyles((theme) => ({
+   fab: {
+     width: 48,
+     height: 48,
+     borderRadius: '50%',
+-    background: GREEN,
++    background: ACCENT,
+     color: '#000',
+     boxShadow: '0 8px 18px rgba(0,0,0,0.35)',
+     transition: 'transform 150ms ease, background 150ms ease',
+@@ -63,14 +64,14 @@ const useStyles = makeStyles((theme) => ({
+   pillLarge: {
+     padding: '12px 28px',
+     fontSize: 15,
+-    background: GREEN,
++    background: ACCENT,
+     color: '#000',
+     border: 'none',
+-    boxShadow: '0 8px 24px rgba(30,215,96,0.25)',
++    boxShadow: '0 8px 24px rgba(59,140,255,0.25)',
+     '&:hover': { background: '#3be477', transform: 'scale(1.04)' },
+   },
+   owned: {
+-    color: GREEN,
++    color: ACCENT,
+     display: 'inline-flex',
+     alignItems: 'center',
+     gap: 4,
+@@ -179,7 +180,7 @@ export const ItemAction = ({
+     return (
+       <CircularProgress
+         size={variant === 'fab' ? 40 : 22}
+-        style={{ color: GREEN }}
++        style={{ color: ACCENT }}
+       />
+     )
+   }
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index 24040a9..495f66e 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -173,3 +173,6 @@ export const setSeerConfig = (changes) =>
+     method: 'PUT',
+     body: JSON.stringify(changes),
+   }).then(({ json }) => json)
++
++export const getMetadataReport = () =>
++  httpClient(`${SEER_URL}/library/metadata-report`).then(({ json }) => json)
+diff --git a/ui/src/themes/seer.css.js b/ui/src/themes/seer.css.js
+index 0fba9e1..f123e13 100644
+--- a/ui/src/themes/seer.css.js
++++ b/ui/src/themes/seer.css.js
+@@ -1,6 +1,18 @@
+-const green = '#1ed760'
++const accent = '#3b8cff'
+ 
+ const stylesheet = `
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .play-btn,
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .play-btn:focus {
++    border: none !important;
++    box-shadow: none !important;
++    outline: none !important;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .play-btn svg,
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .group svg {
++    font-size: 20px !important;
++}
++
+ .react-jinke-music-player-main .music-player-panel {
+     background: rgba(10, 10, 14, 0.92);
+     -webkit-backdrop-filter: blur(20px) saturate(140%);
+@@ -70,7 +82,7 @@ const stylesheet = `
+ }
+ 
+ .react-jinke-music-player-main .music-player-panel .panel-content .rc-slider:hover .rc-slider-track {
+-    background-color: ${green} !important;
++    background-color: ${accent} !important;
+ }
+ 
+ .react-jinke-music-player-main .music-player-panel .panel-content .rc-slider-handle {
+@@ -89,7 +101,7 @@ const stylesheet = `
+ }
+ 
+ .react-jinke-music-player-main .music-player-panel .panel-content .rc-slider-handle:active {
+-    box-shadow: 0 0 0 4px rgba(30, 215, 96, 0.3);
++    box-shadow: 0 0 0 4px rgba(59, 140, 255, 0.3);
+ }
+ 
+ .react-jinke-music-player-main ::-webkit-scrollbar-thumb {
+@@ -98,12 +110,12 @@ const stylesheet = `
+ }
+ 
+ .react-jinke-music-player-main .loading svg {
+-    color: ${green} !important;
++    color: ${accent} !important;
+ }
+ 
+ .react-jinke-music-player-main .audio-item.playing svg,
+ .react-jinke-music-player-main .audio-item.playing .player-singer {
+-    color: ${green} !important;
++    color: ${accent} !important;
+ }
+ 
+ .audio-lists-panel {
+@@ -136,12 +148,12 @@ const stylesheet = `
+ 
+ .audio-lists-panel-content .audio-item.playing,
+ .audio-lists-panel-content .audio-item.playing svg {
+-    color: ${green};
++    color: ${accent};
+ }
+ 
+ .audio-lists-panel-content .audio-item:active .group:not([class=".player-delete"]) svg,
+ .audio-lists-panel-content .audio-item:hover .group:not([class=".player-delete"]) svg {
+-    color: ${green};
++    color: ${accent};
+ }
+ 
+ /* Mobile */
+@@ -183,12 +195,12 @@ const stylesheet = `
+ .react-jinke-music-player .music-player-controller {
+     border: none;
+     background: #18181e;
+-    color: ${green};
++    color: ${accent};
+     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+ }
+ 
+ .react-jinke-music-player .music-player-controller .music-player-controller-setting {
+-    background: rgba(30, 215, 96, 0.3);
++    background: rgba(59, 140, 255, 0.3);
+ }
+ `
+ 
+diff --git a/ui/src/themes/seer.js b/ui/src/themes/seer.js
+index 45952db..a08bd51 100644
+--- a/ui/src/themes/seer.js
++++ b/ui/src/themes/seer.js
+@@ -1,9 +1,9 @@
+ import stylesheet from './seer.css.js'
+ 
+ // Seer: the default look of Navidrome Seer. Near-black surfaces floating on
+-// a black canvas, generous rounding, pill controls and one green accent.
+-const green = '#1ed760'
+-const greenDark = '#17b350'
++// a black canvas, generous rounding, pill controls and one blue accent.
++const accent = '#3b8cff'
++const accentDark = '#2a6fd6'
+ const canvas = '#000000'
+ const surface = '#121216'
+ const raised = '#1b1b21'
+@@ -20,21 +20,21 @@ const playFab = {
+   height: 56,
+   padding: 0,
+   borderRadius: '50%',
+-  background: green,
++  background: accent,
+   color: '#000',
+   border: 0,
+-  boxShadow: '0 8px 24px rgba(30,215,96,0.25)',
++  boxShadow: '0 8px 24px rgba(59,140,255,0.25)',
+   transition: 'transform .15s ease, background-color .15s ease',
+   '&:hover': {
+     transform: 'scale(1.06)',
+-    backgroundColor: `${green} !important`,
++    backgroundColor: `${accent} !important`,
+   },
+   '& svg': { fontSize: 30, color: '#000 !important' },
+   '& > span:first-child > span': { display: 'none' },
+   '& > span:first-child': { padding: 0 },
+ }
+ 
+-// For Album, Playlist and Artist action bars: a big green play button
++// For Album, Playlist and Artist action bars: a big blue play button
+ // followed by quiet round icon buttons.
+ const musicListActions = {
+   padding: '1rem 0',
+@@ -88,7 +88,7 @@ export default {
+   shape: { borderRadius: 12 },
+   palette: {
+     type: 'dark',
+-    primary: { light: '#5ff08d', main: green, dark: greenDark },
++    primary: { light: '#8ab8ff', main: accent, dark: accentDark },
+     secondary: { main: '#ffffff', contrastText: '#000' },
+     background: { default: canvas, paper: surface },
+     text: { primary: text, secondary: muted },
+@@ -158,7 +158,7 @@ export default {
+       },
+       containedPrimary: {
+         color: '#000',
+-        '&:hover': { backgroundColor: greenDark },
++        '&:hover': { backgroundColor: accentDark },
+       },
+       outlined: { borderColor: 'rgba(255,255,255,0.3)' },
+       textSecondary: { color: text },
+@@ -259,7 +259,7 @@ export default {
+       },
+     },
+     MuiTabs: {
+-      indicator: { backgroundColor: green, height: 3, borderRadius: 3 },
++      indicator: { backgroundColor: accent, height: 3, borderRadius: 3 },
+     },
+     MuiTab: { root: { textTransform: 'none', fontWeight: 700 } },
+     MuiLinearProgress: {
+@@ -303,7 +303,7 @@ export default {
+       active: {
+         color: `${text} !important`,
+         backgroundColor: 'rgba(255,255,255,0.09)',
+-        '& svg': { color: green },
++        '& svg': { color: accent },
+       },
+       icon: { minWidth: 40 },
+     },
+@@ -344,7 +344,7 @@ export default {
+         margin: '0 2px',
+       },
+       currentPageButton: {
+-        backgroundColor: `${green} !important`,
++        backgroundColor: `${accent} !important`,
+         color: '#000',
+       },
+     },
+@@ -378,7 +378,7 @@ export default {
+       albumSubtitle: { color: muted, fontSize: 13 },
+       albumVersion: { color: muted },
+       albumPlayButton: {
+-        backgroundColor: green,
++        backgroundColor: accent,
+         color: '#000 !important',
+         borderRadius: '50%',
+         boxShadow: '0 8px 16px rgba(0,0,0,0.4)',
+@@ -386,14 +386,14 @@ export default {
+         margin: 6,
+         transition: 'transform .15s ease',
+         '&:hover': {
+-          background: `${green} !important`,
++          background: `${accent} !important`,
+           transform: 'scale(1.08)',
+         },
+       },
+     },
+     NDAlbumDetails: {
+       root: {
+-        ...header('rgba(30,215,96,0.22)'),
++        ...header('rgba(59,140,255,0.22)'),
+         padding: '24px !important',
+       },
+       cardContents: { alignItems: 'flex-end', gap: 8 },
+diff --git a/ui/src/themes/useCurrentTheme.js b/ui/src/themes/useCurrentTheme.js
+index fbb5e9b..360a634 100644
+--- a/ui/src/themes/useCurrentTheme.js
++++ b/ui/src/themes/useCurrentTheme.js
+@@ -1,17 +1,22 @@
+ import { useSelector } from 'react-redux'
++import { useLocation } from 'react-router-dom'
+ import useMediaQuery from '@material-ui/core/useMediaQuery'
+ import themes from './index'
+ import { AUTO_THEME_ID } from '../consts'
+ import config from '../config'
+ import { useEffect, useMemo } from 'react'
+ 
++// The Seer screens keep their own look, whatever theme the user picked for the rest of Navidrome.
++const SEER_PATHS = ['/seer', '/podcast']
++
+ const useCurrentTheme = () => {
+   // Runs above the ThemeProvider carrying the prop below, so it needs its own noSsr or the
+   // auto theme renders dark first and flips.
+   const prefersLightMode = useMediaQuery('(prefers-color-scheme: light)', {
+     noSsr: true,
+   })
+-  const theme = useSelector((state) => {
++  const location = useLocation()
++  const selectedTheme = useSelector((state) => {
+     if (state.theme === AUTO_THEME_ID) {
+       return prefersLightMode ? themes.LightTheme : themes.DarkTheme
+     }
+@@ -23,6 +28,9 @@ const useCurrentTheme = () => {
+       'DarkTheme'
+     return themes[themeName]
+   })
++  const onSeerScreen =
++    config.seerEnabled && SEER_PATHS.some((p) => location.pathname.startsWith(p))
++  const theme = onSeerScreen ? themes.SeerTheme : selectedTheme
+ 
+   useEffect(() => {
+     const styles = document.getElementsByTagName('style')

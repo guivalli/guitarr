@@ -1,0 +1,98 @@
+diff --git a/core/seer/report.go b/core/seer/report.go
+index cde6cb5..6c66d85 100644
+--- a/core/seer/report.go
++++ b/core/seer/report.go
+@@ -2,6 +2,7 @@ package seer
+ 
+ import (
+ 	"context"
++	"path/filepath"
+ 	"sort"
+ 	"strings"
+ 	"unicode"
+@@ -96,7 +97,34 @@ func (e *Editor) Report(ctx context.Context) (*MetaReport, error) {
+ 	return buildMetaReport(albums, files), nil
+ }
+ 
++// isPodcastPath tells downloaded podcast episodes (Seer/Podcasts/<channel>/...) from music.
++func isPodcastPath(p string) bool {
++	return strings.Contains("/"+strings.ToLower(filepath.ToSlash(p)), "/podcasts/")
++}
++
++// withoutPodcasts drops podcast episodes and the "albums" made only of them: a channel is not an
++// album and has no MusicBrainz release to match.
++func withoutPodcasts(albums model.Albums, files model.MediaFiles) (model.Albums, model.MediaFiles) {
++	music := make(model.MediaFiles, 0, len(files))
++	hasMusic := map[string]bool{}
++	for _, f := range files {
++		if isPodcastPath(f.Path) {
++			continue
++		}
++		music = append(music, f)
++		hasMusic[f.AlbumID] = true
++	}
++	keep := make(model.Albums, 0, len(albums))
++	for _, a := range albums {
++		if hasMusic[a.ID] {
++			keep = append(keep, a)
++		}
++	}
++	return keep, music
++}
++
+ func buildMetaReport(albums model.Albums, files model.MediaFiles) *MetaReport {
++	albums, files = withoutPodcasts(albums, files)
+ 	r := &MetaReport{Songs: len(files), Albums: len(albums),
+ 		AlbumGroups: []AlbumGroup{}, ArtistGroups: []ArtistGroup{}, NoMBID: []AlbumVariant{}, Unknown: []UnknownTrack{}}
+ 
+diff --git a/core/seer/report_test.go b/core/seer/report_test.go
+index 4e699b6..d5b8605 100644
+--- a/core/seer/report_test.go
++++ b/core/seer/report_test.go
+@@ -13,11 +13,15 @@ func TestBuildReportFindsNearDuplicates(t *testing.T) {
+ 		{ID: "a3", Name: "Dude Ranch", AlbumArtist: "blink\u2010182", SongCount: 16},
+ 		{ID: "a4", Name: "Dude Ranch", AlbumArtist: "blink-182", SongCount: 2},
+ 		{ID: "a5", Name: "[Unknown Album]", AlbumArtist: "[Unknown Artist]", SongCount: 1},
++		{ID: "p1", Name: "Foro de Teresina", AlbumArtist: "piau\u00ed", SongCount: 1},
+ 	}
+ 	files := model.MediaFiles{
+-		{ID: "s1", Title: "Faixa", Artist: "Charlie Brown Jr.", Album: "X"},
+-		{ID: "s2", Title: "Faixa 2", Artist: "Charlie Brown Jr", Album: "X", MbzAlbumID: "m"},
+-		{ID: "s3", Title: "?", Artist: "[Unknown Artist]", Album: "[Unknown Album]"},
++		{ID: "s1", AlbumID: "a1", Path: "Seer/Raimundos/Cantigas/01.flac", Title: "Faixa", Artist: "Charlie Brown Jr.", Album: "X"},
++		{ID: "s2", AlbumID: "a2", Path: "Seer/Raimundos/Cantigas2/01.flac", Title: "Faixa 2", Artist: "Charlie Brown Jr", Album: "X", MbzAlbumID: "m"},
++		{ID: "s3", AlbumID: "a5", Path: "Seer/Gloria/Gloria/Minha paz.opus", Title: "?", Artist: "[Unknown Artist]", Album: "[Unknown Album]"},
++		{ID: "s4", AlbumID: "a3", Path: "Seer/blink/Dude Ranch/01.flac", Title: "A", Artist: "blink\u2010182", Album: "Dude Ranch"},
++		{ID: "s5", AlbumID: "a4", Path: "Seer/blink/Dude Ranch2/01.flac", Title: "B", Artist: "blink-182", Album: "Dude Ranch"},
++		{ID: "e1", AlbumID: "p1", Path: "Seer/Podcasts/Foro de Teresina/2026-10-09 - ep.mp3", Title: "ep", Artist: "piau\u00ed", Album: "Foro de Teresina"},
+ 	}
+ 	r := buildMetaReport(albums, files)
+ 	if len(r.AlbumGroups) != 2 {
+@@ -34,12 +38,23 @@ func TestBuildReportFindsNearDuplicates(t *testing.T) {
+ 	if len(r.Unknown) != 1 || r.Unknown[0].ID != "s3" {
+ 		t.Errorf("unknown = %+v", r.Unknown)
+ 	}
+-	if r.WithMBID != 1 || r.Songs != 3 {
+-		t.Errorf("counts: %+v", r)
++	if r.WithMBID != 1 || r.Songs != 5 || r.Albums != 5 {
++		t.Errorf("counts (podcast episode must not count): %+v", r)
+ 	}
+ 	for _, v := range r.NoMBID {
+-		if isUnknown(v.Name) {
+-			t.Errorf("[Unknown Album] must not be listed as a match candidate")
++		if isUnknown(v.Name) || v.ID == "p1" {
++			t.Errorf("%q must not be listed as a match candidate", v.Name)
++		}
++	}
++}
++
++func TestIsPodcastPath(t *testing.T) {
++	for p, want := range map[string]bool{
++		"Seer/Podcasts/Canal/2026-01-01 - ep.mp3": true, "Podcasts/Canal/ep.mp3": true,
++		"Seer/Blink/Podcasts Of Doom/01.flac": false, "Seer/Artista/Album/01.flac": false,
++	} {
++		if got := isPodcastPath(p); got != want {
++			t.Errorf("isPodcastPath(%q) = %v, want %v", p, got, want)
+ 		}
+ 	}
+ }

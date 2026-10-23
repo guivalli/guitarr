@@ -1,0 +1,25 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] Seer: a deleted download can be requested again
+
+A request stays marked available after its file is deleted, and Submit reused it
+as the active request, so asking again did nothing. When the item is no longer in
+the library, retire the stale request and create a new one.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+diff --git a/core/acquire/service.go new/core/acquire/service.go
+index 762ed11..d5d0967 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -271,6 +271,11 @@ func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if existing != nil && existing.Status == StatusAvailable {
++		// Not in the library anymore (its file was deleted after the download): the request is stale.
++		s.setStatus(ctx, existing, StatusFailed, "file was removed from the library")
++		existing = nil
++	}
+ 	if existing != nil {
+ 		return existing, nil
+ 	}

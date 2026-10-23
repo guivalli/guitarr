@@ -1,0 +1,1265 @@
+From 7cdb0465e633e468c089a5782ed728e3b661fd6f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 11 Oct 2026 03:05:49 +0000
+Subject: [PATCH 09/10] Seer: more ways to download, with automatic fallback
+
+YouTube now searches YouTube Music before YouTube, scores the results
+against the request, and tries the best three with three yt-dlp player
+clients, dropping downloads that hang. SoundCloud is a new source. Albums
+no source could get are built track by track from the tracklist.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ SEER.md                                       |  17 +-
+ conf/configuration.go                         |  20 +-
+ core/acquire/model.go                         |  33 +-
+ core/acquire/service.go                       |  85 +++-
+ core/acquire/service_test.go                  |  79 ++++
+ core/acquire/source_web.go                    | 362 ++++++++++++++++++
+ core/acquire/source_web_test.go               | 189 +++++++++
+ core/acquire/source_youtube.go                |  76 +---
+ core/acquire/store_sql.go                     |   8 +-
+ core/acquire/store_sql_test.go                |   2 +-
+ core/seer/seer.go                             |   5 +
+ ...011120000_add_acquire_request_duration.sql |   5 +
+ resources/i18n/pt-br.json                     |   7 +
+ ui/src/i18n/en.json                           |   7 +
+ ui/src/seer/RequestsList.jsx                  |  43 ++-
+ ui/src/seer/Seer.test.jsx                     |  20 +-
+ 16 files changed, 857 insertions(+), 101 deletions(-)
+ create mode 100644 core/acquire/source_web.go
+ create mode 100644 core/acquire/source_web_test.go
+ create mode 100644 db/migrations/20261011120000_add_acquire_request_duration.sql
+
+diff --git a/SEER.md b/SEER.md
+index e4f5e5e..9807869 100644
+--- a/SEER.md
++++ b/SEER.md
+@@ -61,7 +61,7 @@ Chrome/Edge on Android or desktop offer "Install app", also from the user menu.
+ [Seer]
+ Enabled = true
+ AutoApprove = false              # false: an admin must approve each request
+-Sources = "lidarr,soulseek,youtube"  # priority order; first one that succeeds wins
++Sources = "lidarr,soulseek,youtube,soundcloud"  # priority order; first one that succeeds wins
+ DestFolder = ""                  # default: <first library>/Seer. Must be inside a library
+ Workers = 2
+ ImportTimeout = "30m"            # how long to wait for the scan to find a download
+@@ -74,7 +74,10 @@ MusicBrainzURL = "https://musicbrainz.org/ws/2"
+ Enabled = true
+ Path = "yt-dlp"
+ Format = "opus"
+-Cookies = ""                     # cookies.txt for private YouTube Music lists
++Cookies = ""                     # cookies.txt: private YouTube Music lists, and downloads YouTube blocks
++
++[Seer.SoundCloud]                # tracks only, through the same yt-dlp
++Enabled = true
+ 
+ [Seer.Spotify]                   # optional, for playlist imports
+ ClientID = ""
+@@ -133,6 +136,16 @@ cause is in the server log, "Seer: MusicBrainz request failed").
+    releases, one format); a track that fails is retried once and then taken from
+    another peer's copy of the album. If at least half the album arrived it is
+    imported and the missing tracks are listed on the request; otherwise it fails. Lidarr is asked to search and imports on its own.
++   Web sources (YouTube, SoundCloud) search first and score the results
++   against the request (title as whole words, artist, length within a few
++   seconds, "live"/"cover"/"remix" uploads pushed down unless asked for).
++   YouTube searches YouTube Music (official "Topic" audio) before regular
++   YouTube; each of the 3 best results is tried with yt-dlp's default client
++   and then two other player clients, and a try that takes over 4 minutes is
++   dropped for the next result. If no album source gets an album, it is built
++   track by track from the MusicBrainz tracklist through the web sources
++   (source "tracks", progress "track N of M" on the request), kept if at
++   least half arrived, with the missing tracks listed.
+ 3. A watcher (not the workers) waits for the library scan to find the item,
+    rescanning every 2 minutes, and fails the request after `ImportTimeout`.
+ 
+diff --git a/conf/configuration.go b/conf/configuration.go
+index ecf49dd..22538bd 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -241,12 +241,13 @@ type seerOptions struct {
+ 	UserAgent      string // sent to MusicBrainz
+ 	MusicBrainzURL string // MusicBrainz web service base URL (for mirrors)
+ 	ImportTimeout  time.Duration
+-	StorageLimit   string              // e.g. "500GB": no new downloads once the library is this big. Editable in the UI
+-	MinFreeSpace   string              // no new downloads when the disk has less than this free
+-	YouTube        seerYouTubeOptions  `json:",omitzero"`
+-	Soulseek       seerSoulseekOptions `json:",omitzero"`
+-	Lidarr         seerLidarrOptions   `json:",omitzero"`
+-	Spotify        seerSpotifyOptions  `json:",omitzero"`
++	StorageLimit   string                // e.g. "500GB": no new downloads once the library is this big. Editable in the UI
++	MinFreeSpace   string                // no new downloads when the disk has less than this free
++	YouTube        seerYouTubeOptions    `json:",omitzero"`
++	Soulseek       seerSoulseekOptions   `json:",omitzero"`
++	Lidarr         seerLidarrOptions     `json:",omitzero"`
++	SoundCloud     seerSoundCloudOptions `json:",omitzero"`
++	Spotify        seerSpotifyOptions    `json:",omitzero"`
+ }
+ 
+ type seerYouTubeOptions struct {
+@@ -256,6 +257,10 @@ type seerYouTubeOptions struct {
+ 	Cookies string // optional cookies.txt, lets playlist imports read private lists (Liked music)
+ }
+ 
++type seerSoundCloudOptions struct {
++	Enabled bool // second web source (yt-dlp), tried after YouTube when listed in Sources
++}
++
+ type seerSpotifyOptions struct {
+ 	ClientID     string // optional app credentials from developer.spotify.com, for playlist imports
+ 	ClientSecret string
+@@ -1145,7 +1150,7 @@ func setViperDefaults() {
+ 	viper.SetDefault("seer.autoapprove", false)
+ 	viper.SetDefault("seer.workers", 2)
+ 	viper.SetDefault("seer.destfolder", "")
+-	viper.SetDefault("seer.sources", "lidarr,soulseek,youtube")
++	viper.SetDefault("seer.sources", "lidarr,soulseek,youtube,soundcloud")
+ 	viper.SetDefault("seer.useragent", "")
+ 	viper.SetDefault("seer.musicbrainzurl", "https://musicbrainz.org/ws/2")
+ 	viper.SetDefault("seer.importtimeout", 30*time.Minute)
+@@ -1155,6 +1160,7 @@ func setViperDefaults() {
+ 	viper.SetDefault("seer.youtube.path", "yt-dlp")
+ 	viper.SetDefault("seer.youtube.format", "opus")
+ 	viper.SetDefault("seer.youtube.cookies", "")
++	viper.SetDefault("seer.soundcloud.enabled", true)
+ 	viper.SetDefault("seer.spotify.clientid", "")
+ 	viper.SetDefault("seer.spotify.clientsecret", "")
+ 	viper.SetDefault("seer.soulseek.enabled", false)
+diff --git a/core/acquire/model.go b/core/acquire/model.go
+index 161faf8..77b1423 100644
+--- a/core/acquire/model.go
++++ b/core/acquire/model.go
+@@ -64,19 +64,26 @@ type AlbumDetail struct {
+ 
+ // Request is a user's request to have an item fetched.
+ type Request struct {
+-	ID        string    `json:"id"`
+-	UserID    string    `json:"userId"`
+-	Kind      Kind      `json:"kind"`
+-	MBID      string    `json:"mbid"`
+-	Artist    string    `json:"artist"`
+-	Album     string    `json:"album,omitempty"`
+-	Title     string    `json:"title"`
+-	CoverID   string    `json:"coverId,omitempty"`
+-	Status    Status    `json:"status"`
+-	Source    string    `json:"source,omitempty"` // name of the Source that fulfilled it
+-	Error     string    `json:"error,omitempty"`
+-	CreatedAt time.Time `json:"createdAt"`
+-	UpdatedAt time.Time `json:"updatedAt"`
++	ID      string `json:"id"`
++	UserID  string `json:"userId"`
++	Kind    Kind   `json:"kind"`
++	MBID    string `json:"mbid"`
++	Artist  string `json:"artist"`
++	Album   string `json:"album,omitempty"`
++	Title   string `json:"title"`
++	CoverID string `json:"coverId,omitempty"`
++	// DurationMs is the catalog length of a track, used to pick the right upload.
++	DurationMs int       `json:"durationMs,omitempty"`
++	Status     Status    `json:"status"`
++	Source     string    `json:"source,omitempty"` // name of the Source that fulfilled it
++	Error      string    `json:"error,omitempty"`
++	CreatedAt  time.Time `json:"createdAt"`
++	UpdatedAt  time.Time `json:"updatedAt"`
++
++	// Set only on the per-track requests of an album fetched track by track.
++	TrackNumber    int    `json:"-"`
++	AlbumArtist    string `json:"-"`
++	ReleaseGroupID string `json:"-"`
+ }
+ 
+ // Result is what a Source reports after Fetch.
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index b6ef4d6..400b71a 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/hex"
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -227,7 +228,7 @@ func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (
+ 	now := time.Now()
+ 	req := &Request{
+ 		ID: newID(), UserID: userID, Kind: item.Kind, MBID: item.MBID,
+-		Artist: item.Artist, Album: item.Album, Title: item.Title, CoverID: item.CoverID,
++		Artist: item.Artist, Album: item.Album, Title: item.Title, CoverID: item.CoverID, DurationMs: item.DurationMs,
+ 		Status: StatusPending, CreatedAt: now, UpdatedAt: now,
+ 	}
+ 	if s.cfg.AutoApprove {
+@@ -327,6 +328,20 @@ func (s *Service) process(ctx context.Context, id string) {
+ 		}
+ 		return // watchImports takes it from here
+ 	}
++	// No album source worked: build the album from single tracks instead.
++	if req.Kind == KindAlbum && len(s.trackSources()) > 0 {
++		req.Source = "tracks"
++		res, err := s.fetchAlbumTracks(ctx, req)
++		if ctx.Err() != nil {
++			return
++		}
++		if err == nil {
++			s.setStatus(ctx, req, StatusImporting, res.Warning)
++			go s.rescan(ctx)
++			return
++		}
++		errs = append(errs, "track by track: "+err.Error())
++	}
+ 	req.Source = ""
+ 	msg := "no enabled source supports this request"
+ 	if len(errs) > 0 {
+@@ -335,6 +350,74 @@ func (s *Service) process(ctx context.Context, id string) {
+ 	s.setStatus(ctx, req, StatusFailed, msg)
+ }
+ 
++// trackSources are the sources used to build an album track by track: the
++// track-only ones (web). Album-capable ones (Soulseek) already had their go at
++// the whole album, and searching them again per track is slow.
++func (s *Service) trackSources() []Source {
++	var out []Source
++	for _, src := range s.sources {
++		if src.Enabled() && src.Supports(KindTrack) && !src.Supports(KindAlbum) {
++			out = append(out, src)
++		}
++	}
++	return out
++}
++
++// fetchAlbumTracks downloads an album one track at a time through the track
++// sources (each track tries every source in order). Like a Soulseek album, it
++// is kept when at least half of the tracks arrived; missing ones go in Warning.
++func (s *Service) fetchAlbumTracks(ctx context.Context, req *Request) (Result, error) {
++	detail, err := s.catalog.Album(ctx, req.MBID)
++	if err != nil {
++		return Result{}, fmt.Errorf("tracklist: %w", err)
++	}
++	if len(detail.Tracks) == 0 {
++		return Result{}, errors.New("the catalog has no tracklist for this album")
++	}
++	album := cmp(req.Album, req.Title)
++	var paths, missing []string
++	for i, t := range detail.Tracks {
++		if ctx.Err() != nil {
++			return Result{}, ctx.Err()
++		}
++		s.setStatus(ctx, req, StatusDownloading, fmt.Sprintf("track %d of %d", i+1, len(detail.Tracks)))
++		num := t.TrackNumber
++		if num == 0 {
++			num = i + 1
++		}
++		tr := Request{
++			ID: req.ID, UserID: req.UserID, Kind: KindTrack, MBID: t.MBID,
++			Artist: cmp(t.Artist, req.Artist), Album: album, Title: t.Title,
++			DurationMs: t.DurationMs, TrackNumber: num, AlbumArtist: req.Artist,
++			ReleaseGroupID: req.MBID,
++		}
++		got := false
++		for _, src := range s.trackSources() {
++			res, err := src.Fetch(ctx, tr, s.cfg.DestDir)
++			if err == nil && len(res.Paths) > 0 {
++				paths = append(paths, res.Paths...)
++				got = true
++				break
++			}
++		}
++		if !got {
++			missing = append(missing, fmt.Sprintf("%d. %s", num, t.Title))
++		}
++	}
++	if len(paths)*2 < len(detail.Tracks) {
++		for _, p := range paths {
++			_ = os.Remove(p)
++		}
++		return Result{}, fmt.Errorf("only %d of %d tracks found", len(paths), len(detail.Tracks))
++	}
++	res := Result{Paths: paths}
++	if len(missing) > 0 {
++		res.Warning = fmt.Sprintf("%d of %d tracks could not be downloaded: %s",
++			len(missing), len(detail.Tracks), strings.Join(missing, ", "))
++	}
++	return res, nil
++}
++
+ // watchImports marks importing requests available once the library has them,
+ // and fails them after ImportTimeout. It runs in its own goroutine so that
+ // slow imports (e.g. Lidarr) never hold a worker.
+diff --git a/core/acquire/service_test.go b/core/acquire/service_test.go
+index 1f1821b..c11791b 100644
+--- a/core/acquire/service_test.go
++++ b/core/acquire/service_test.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"os"
++	"path/filepath"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -292,3 +294,80 @@ func TestStorageLimit(t *testing.T) {
+ 		t.Fatalf("source was called %d times while storage was full", n)
+ 	}
+ }
++
++// trackSource downloads tracks whose title is not in fail, writing real files.
++type trackSource struct {
++	dir  string
++	fail map[string]bool
++	mu   sync.Mutex
++	got  []Request
++}
++
++func (s *trackSource) Name() string         { return "web" }
++func (s *trackSource) Enabled() bool        { return true }
++func (s *trackSource) Supports(k Kind) bool { return k == KindTrack }
++func (s *trackSource) Fetch(_ context.Context, r Request, dest string) (Result, error) {
++	s.mu.Lock()
++	s.got = append(s.got, r)
++	s.mu.Unlock()
++	if s.fail[r.Title] {
++		return Result{}, errors.New("not found")
++	}
++	p := filepath.Join(dest, fmt.Sprintf("%02d.opus", r.TrackNumber))
++	return Result{Paths: []string{p}}, os.WriteFile(p, []byte("x"), 0o600)
++}
++
++func TestAlbumFallsBackToTrackByTrack(t *testing.T) {
++	tracks := []CatalogItem{
++		{Kind: KindTrack, MBID: "t1", Title: "Um", Artist: "Banda", TrackNumber: 1, DurationMs: 1000},
++		{Kind: KindTrack, MBID: "t2", Title: "Dois", Artist: "Banda feat. X", TrackNumber: 2},
++		{Kind: KindTrack, MBID: "t3", Title: "Três", TrackNumber: 3},
++		{Kind: KindTrack, MBID: "t4", Title: "Quatro", TrackNumber: 4},
++	}
++	for _, tc := range []struct {
++		name   string
++		fail   map[string]bool
++		status Status
++	}{
++		{"most tracks found", map[string]bool{"Três": true}, StatusImporting},
++		{"too few tracks", map[string]bool{"Um": true, "Dois": true, "Três": true}, StatusFailed},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			dest := t.TempDir()
++			lib := &fakeLib{have: map[string]bool{}}
++			st := NewMemoryStore()
++			albums := &fakeSource{name: "soulseek", kind: KindAlbum, err: errors.New("no peers")}
++			web := &trackSource{dir: dest, fail: tc.fail}
++			cfg := fastConfig(true)
++			cfg.DestDir = dest
++			cfg.ImportTimeout = time.Hour
++			svc := NewService(cfg, fakeCatalog{items: tracks}, []Source{albums, web}, st, lib)
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			svc.Start(ctx)
++			req, err := svc.Submit(ctx, "u", CatalogItem{Kind: KindAlbum, MBID: "rg1", Title: "Disco", Artist: "Banda"})
++			if err != nil {
++				t.Fatal(err)
++			}
++			got := waitStatus(t, st, req.ID, tc.status)
++			files, _ := filepath.Glob(filepath.Join(dest, "*.opus"))
++			switch tc.status {
++			case StatusImporting:
++				if got.Source != "tracks" || !strings.Contains(got.Error, "1 of 4 tracks could not be downloaded: 3. Três") || len(files) != 3 {
++					t.Errorf("request %+v, files %v", got, files)
++				}
++				web.mu.Lock()
++				first := web.got[0]
++				second := web.got[1]
++				web.mu.Unlock()
++				if first.Album != "Disco" || first.AlbumArtist != "Banda" || first.ReleaseGroupID != "rg1" || first.DurationMs != 1000 || second.Artist != "Banda feat. X" {
++					t.Errorf("track requests: %+v / %+v", first, second)
++				}
++			case StatusFailed:
++				if !strings.Contains(got.Error, "no peers") || !strings.Contains(got.Error, "only 1 of 4 tracks") || len(files) != 0 {
++					t.Errorf("request %+v, files left %v", got, files)
++				}
++			}
++		})
++	}
++}
+diff --git a/core/acquire/source_web.go b/core/acquire/source_web.go
+new file mode 100644
+index 0000000..0ec7410
+--- /dev/null
++++ b/core/acquire/source_web.go
+@@ -0,0 +1,362 @@
++package acquire
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"math"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"time"
++	"unicode"
++
++	"golang.org/x/text/unicode/norm"
++)
++
++// ytdlp downloads single tracks from sites yt-dlp understands. Each site is a
++// search (a yt-dlp search prefix or URL); the results are scored against the
++// request (title, artist, length, "live"/"cover" noise) and the best ones are
++// downloaded in turn, each with a few yt-dlp settings, until one works. A slow
++// or stuck download is abandoned after AttemptTimeout.
++type ytdlp struct {
++	Binary         string
++	FFmpeg         string
++	Format         string
++	Cookies        string
++	AttemptTimeout time.Duration // per download try, default 4 minutes
++	Candidates     int           // results downloaded per search before giving up, default 3
++}
++
++// webSite is one place to search.
++type webSite struct {
++	name  string
++	query func(artist, title string) string
++	// variants are extra yt-dlp arguments tried in order for each candidate
++	// (YouTube changes often; another player client usually still works).
++	variants [][]string
++	cookies  bool
++}
++
++var (
++	siteYouTubeMusic = webSite{
++		name: "YouTube Music",
++		query: func(artist, title string) string {
++			return "https://music.youtube.com/search?q=" + url.QueryEscape(artist+" "+title) + "#songs"
++		},
++		variants: youtubeVariants,
++		cookies:  true,
++	}
++	siteYouTube = webSite{
++		name:     "YouTube",
++		query:    func(artist, title string) string { return "ytsearch6:" + artist + " - " + title },
++		variants: youtubeVariants,
++		cookies:  true,
++	}
++	siteSoundCloud = webSite{
++		name:     "SoundCloud",
++		query:    func(artist, title string) string { return "scsearch6:" + artist + " " + title },
++		variants: [][]string{nil},
++	}
++	youtubeVariants = [][]string{
++		nil,
++		{"--extractor-args", "youtube:player_client=web_safari,mweb"},
++		{"--extractor-args", "youtube:player_client=tv,ios"},
++	}
++)
++
++var errTooSlow = errors.New("download took too long")
++
++type webCandidate struct {
++	URL      string
++	Title    string
++	Channel  string
++	Duration float64
++	score    int
++}
++
++// fetch tries each site in order and returns the first file that downloaded.
++func (y *ytdlp) fetch(ctx context.Context, sites []webSite, req Request, destDir string) (Result, string, error) {
++	dir := filepath.Join(destDir, sanitize(cmp(req.AlbumArtist, req.Artist)), sanitize(req.Album))
++	if err := ensureInside(destDir, dir); err != nil {
++		return Result{}, "", err
++	}
++	name := sanitize(req.Title)
++	if req.TrackNumber > 0 {
++		name = fmt.Sprintf("%02d - %s", req.TrackNumber, name)
++	}
++	outTpl := filepath.Join(dir, name+".%(ext)s")
++
++	var errs []string
++	for _, site := range sites {
++		if ctx.Err() != nil {
++			return Result{}, "", ctx.Err()
++		}
++		cands, err := y.search(ctx, site, req)
++		if err != nil {
++			errs = append(errs, fmt.Sprintf("%s: %v", site.name, err))
++			continue
++		}
++		if len(cands) == 0 {
++			errs = append(errs, site.name+": nothing that matches")
++			continue
++		}
++		path, err := y.downloadFirst(ctx, site, cands, outTpl)
++		if err != nil {
++			errs = append(errs, fmt.Sprintf("%s: %v", site.name, err))
++			continue
++		}
++		if err := tagFile(ctx, cmp(y.FFmpeg, "ffmpeg"), path, req); err != nil {
++			_ = os.Remove(path)
++			errs = append(errs, err.Error())
++			continue
++		}
++		return Result{Paths: []string{path}}, site.name, nil
++	}
++	return Result{}, "", errors.New(strings.Join(errs, "; "))
++}
++
++// search lists the site's results for the request, best first, dropping the
++// ones that are clearly something else.
++func (y *ytdlp) search(ctx context.Context, site webSite, req Request) ([]webCandidate, error) {
++	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
++	defer cancel()
++	args := []string{"--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "20"}
++	if site.cookies && y.Cookies != "" {
++		args = append(args, "--cookies", y.Cookies)
++	}
++	// The query is one argv element after "--": user text is never an option.
++	args = append(args, "--", site.query(strings.TrimSpace(req.Artist), strings.TrimSpace(req.Title)))
++	var stdout, stderr bytes.Buffer
++	cmd := exec.CommandContext(ctx, cmp(y.Binary, "yt-dlp"), args...)
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	cmd.WaitDelay = 2 * time.Second
++	if err := cmd.Run(); err != nil {
++		return nil, fmt.Errorf("search failed: %w: %s", err, lastLine(stderr.String()))
++	}
++	var out struct {
++		Entries []struct {
++			URL        string   `json:"url"`
++			WebpageURL string   `json:"webpage_url"`
++			ID         string   `json:"id"`
++			Title      string   `json:"title"`
++			Track      string   `json:"track"`
++			Channel    string   `json:"channel"`
++			Uploader   string   `json:"uploader"`
++			Artist     string   `json:"artist"`
++			Artists    []string `json:"artists"`
++			Duration   float64  `json:"duration"`
++		} `json:"entries"`
++	}
++	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
++		return nil, fmt.Errorf("unexpected search output: %w", err)
++	}
++	var cands []webCandidate
++	for _, e := range out.Entries {
++		u := cmp(e.WebpageURL, e.URL)
++		if u == "" || !strings.HasPrefix(u, "http") {
++			continue
++		}
++		c := webCandidate{URL: u, Title: cmp(e.Track, e.Title), Duration: e.Duration}
++		c.Channel = strings.Join(append(e.Artists, e.Artist, e.Channel, e.Uploader), " ")
++		c.score = scoreCandidate(req, c)
++		if c.score >= 40 {
++			cands = append(cands, c)
++		}
++	}
++	sort.SliceStable(cands, func(i, j int) bool { return cands[i].score > cands[j].score })
++	n := y.Candidates
++	if n <= 0 {
++		n = 3
++	}
++	if len(cands) > n {
++		cands = cands[:n]
++	}
++	return cands, nil
++}
++
++var noiseWords = regexp.MustCompile(` (live|ao vivo|en vivo|cover|karaoke|instrumental|remix|8d|slowed|sped up|nightcore|reaction|tutorial|lesson|aula|full album|album completo) `)
++
++// words lowercases, drops accents and turns punctuation into single spaces,
++// padded with spaces so " word " matches whole words only.
++func words(s string) string {
++	var sb strings.Builder
++	sb.WriteByte(' ')
++	space := true
++	for _, r := range norm.NFD.String(strings.ToLower(s)) {
++		switch {
++		case unicode.IsLetter(r) || unicode.IsDigit(r):
++			sb.WriteRune(r)
++			space = false
++		case unicode.Is(unicode.Mn, r): // accents
++		default:
++			if !space {
++				sb.WriteByte(' ')
++				space = true
++			}
++		}
++	}
++	if !space {
++		sb.WriteByte(' ')
++	}
++	return sb.String()
++}
++
++// scoreCandidate rates how likely a search result is the requested recording.
++func scoreCandidate(req Request, c webCandidate) int {
++	if c.Duration > 900 {
++		return 0 // mixes and full-album uploads
++	}
++	title, artist := words(req.Title), words(req.Artist)
++	ct, ch := words(c.Title), words(c.Channel)
++	score := 0
++	switch {
++	case strings.TrimSpace(title) == "":
++		return 0
++	case ct == title:
++		score += 60
++	case strings.Contains(ct, title):
++		score += 45
++	case strings.Contains(title, ct) && len(ct) >= 5:
++		score += 25
++	default:
++		return 0
++	}
++	if artist != " " && (strings.Contains(ch, artist) || strings.Contains(ct, artist)) {
++		score += 30
++	}
++	if strings.Contains(ch, " topic ") || strings.Contains(ch, "vevo") || strings.Contains(ct, " official audio ") || strings.Contains(ct, " audio oficial ") {
++		score += 10
++	}
++	if noiseWords.MatchString(ct) && !noiseWords.MatchString(title) {
++		score -= 50
++	}
++	if req.DurationMs > 0 && c.Duration > 0 {
++		diff := math.Abs(c.Duration - float64(req.DurationMs)/1000)
++		switch {
++		case diff <= 4:
++			score += 30
++		case diff <= 12:
++			score += 15
++		case diff > 40:
++			score -= 60
++		}
++	}
++	return score
++}
++
++// downloadFirst tries the candidates in order, each with the site's variants.
++func (y *ytdlp) downloadFirst(ctx context.Context, site webSite, cands []webCandidate, outTpl string) (string, error) {
++	var last error
++	for _, c := range cands {
++		for _, extra := range site.variants {
++			if ctx.Err() != nil {
++				return "", ctx.Err()
++			}
++			path, err := y.download(ctx, site, c.URL, outTpl, extra)
++			if err == nil {
++				return path, nil
++			}
++			last = err
++			if errors.Is(err, errTooSlow) {
++				break // slow, not blocked: another setting won't help, try the next upload
++			}
++		}
++	}
++	return "", last
++}
++
++func (y *ytdlp) download(ctx context.Context, site webSite, link, outTpl string, extra []string) (string, error) {
++	timeout := y.AttemptTimeout
++	if timeout <= 0 {
++		timeout = 4 * time.Minute
++	}
++	ctx, cancel := context.WithTimeout(ctx, timeout)
++	defer cancel()
++	args := []string{
++		"-x", "--audio-format", cmp(y.Format, "opus"),
++		"--embed-thumbnail",
++		"--no-playlist",
++		"--no-warnings",
++		"--retries", "3", "--fragment-retries", "3", "--socket-timeout", "20",
++		"--match-filter", "duration < 900",
++		"--print", "after_move:filepath",
++		"-o", outTpl,
++	}
++	if y.FFmpeg != "" {
++		args = append(args, "--ffmpeg-location", y.FFmpeg)
++	}
++	if site.cookies && y.Cookies != "" {
++		args = append(args, "--cookies", y.Cookies)
++	}
++	args = append(args, extra...)
++	args = append(args, "--", link)
++	var stdout, stderr bytes.Buffer
++	cmd := exec.CommandContext(ctx, cmp(y.Binary, "yt-dlp"), args...)
++	cmd.Stdout, cmd.Stderr = &stdout, &stderr
++	cmd.WaitDelay = 2 * time.Second // don't wait on children (ffmpeg) holding the pipes after a timeout
++	err := cmd.Run()
++	if ctx.Err() == context.DeadlineExceeded {
++		return "", fmt.Errorf("%w (%s)", errTooSlow, timeout)
++	}
++	if err != nil {
++		return "", fmt.Errorf("download failed: %s", lastLine(stderr.String()))
++	}
++	for _, line := range strings.Split(stdout.String(), "\n") {
++		if p := strings.TrimSpace(line); p != "" {
++			return p, nil
++		}
++	}
++	return "", errors.New("yt-dlp produced no file")
++}
++
++func lastLine(s string) string {
++	lines := strings.Split(strings.TrimSpace(s), "\n")
++	return strings.TrimSpace(lines[len(lines)-1])
++}
++
++// YouTube searches YouTube Music first (official "Topic" uploads, clean audio),
++// then regular YouTube.
++type YouTube struct {
++	Binary         string // default "yt-dlp"
++	FFmpeg         string // default "ffmpeg"; also required by yt-dlp for audio extraction
++	Format         string // audio format, default "opus"
++	Cookies        string // optional cookies.txt, helps with age-restricted or blocked videos
++	AttemptTimeout time.Duration
++	On             bool
++}
++
++func (y *YouTube) Name() string         { return "youtube" }
++func (y *YouTube) Enabled() bool        { return y.On }
++func (y *YouTube) Supports(k Kind) bool { return k == KindTrack }
++
++func (y *YouTube) Fetch(ctx context.Context, req Request, destDir string) (Result, error) {
++	d := &ytdlp{Binary: y.Binary, FFmpeg: y.FFmpeg, Format: y.Format, Cookies: y.Cookies, AttemptTimeout: y.AttemptTimeout}
++	res, _, err := d.fetch(ctx, []webSite{siteYouTubeMusic, siteYouTube}, req, destDir)
++	return res, err
++}
++
++// SoundCloud is a second web source, useful when YouTube blocks or has nothing.
++type SoundCloud struct {
++	Binary         string
++	FFmpeg         string
++	Format         string
++	AttemptTimeout time.Duration
++	On             bool
++}
++
++func (s *SoundCloud) Name() string         { return "soundcloud" }
++func (s *SoundCloud) Enabled() bool        { return s.On }
++func (s *SoundCloud) Supports(k Kind) bool { return k == KindTrack }
++
++func (s *SoundCloud) Fetch(ctx context.Context, req Request, destDir string) (Result, error) {
++	d := &ytdlp{Binary: s.Binary, FFmpeg: s.FFmpeg, Format: s.Format, AttemptTimeout: s.AttemptTimeout}
++	res, _, err := d.fetch(ctx, []webSite{siteSoundCloud}, req, destDir)
++	return res, err
++}
+diff --git a/core/acquire/source_web_test.go b/core/acquire/source_web_test.go
+new file mode 100644
+index 0000000..3a4c2fa
+--- /dev/null
++++ b/core/acquire/source_web_test.go
+@@ -0,0 +1,189 @@
++package acquire
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++// fakeWebTools writes a fake yt-dlp and ffmpeg. yt-dlp answers searches from
++// the JSON files in dir (music.json, yt.json, sc.json) and "downloads" by
++// writing the -o file, except for URLs that say fail, slow or needsclient
++// (which only works with --extractor-args). Every call is logged to calls.log.
++func fakeWebTools(t *testing.T, searches map[string]string) (dir, ytdlpBin, ffmpegBin string) {
++	t.Helper()
++	dir = t.TempDir()
++	for name, body := range searches {
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	ytdlpBin = filepath.Join(dir, "yt-dlp")
++	script := `#!/bin/sh
++D="` + dir + `"
++echo "$*" >> "$D/calls.log"
++out=""; client=""; search=""; url=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    -o) out="$2"; shift;;
++    --extractor-args) client="$2"; shift;;
++    --flat-playlist) search=1;;
++    --) url="$2"; shift;;
++  esac
++  shift
++done
++if [ -n "$search" ]; then
++  case "$url" in
++    https://music.youtube.com/*) f=music.json;;
++    ytsearch*) f=yt.json;;
++    scsearch*) f=sc.json;;
++  esac
++  if [ ! -f "$D/$f" ]; then echo "ERROR: search blocked" >&2; exit 1; fi
++  cat "$D/$f"; exit 0
++fi
++case "$url" in
++  *fail*) echo "ERROR: [youtube] Sign in to confirm you're not a bot" >&2; exit 1;;
++  *slow*) sleep 5;;
++  *needsclient*) [ -z "$client" ] && { echo "ERROR: HTTP Error 403: Forbidden" >&2; exit 1; };;
++esac
++f=$(echo "$out" | sed 's/%(ext)s/opus/')
++mkdir -p "$(dirname "$f")"; echo "$url" > "$f"; echo "$f"
++`
++	if err := os.WriteFile(ytdlpBin, []byte(script), 0o755); err != nil { //nolint:gosec
++		t.Fatal(err)
++	}
++	ffmpegBin = filepath.Join(dir, "ffmpeg")
++	// copies the input to the last argument and logs the metadata it was given
++	ff := `#!/bin/sh
++D="` + dir + `"
++in=""; last=""
++prev=""
++for a in "$@"; do
++  [ "$prev" = "-i" ] && in="$a"
++  [ "$prev" = "-metadata" ] && echo "$a" >> "$D/tags.log"
++  prev="$a"; last="$a"
++done
++cp "$in" "$last"
++`
++	if err := os.WriteFile(ffmpegBin, []byte(ff), 0o755); err != nil { //nolint:gosec
++		t.Fatal(err)
++	}
++	return dir, ytdlpBin, ffmpegBin
++}
++
++func readFile(t *testing.T, p string) string {
++	t.Helper()
++	b, _ := os.ReadFile(p)
++	return string(b)
++}
++
++func TestScoreCandidate(t *testing.T) {
++	req := Request{Artist: "Charlie Brown Jr.", Title: "Só os Loucos Sabem", DurationMs: 181000}
++	official := scoreCandidate(req, webCandidate{Title: "Só Os Loucos Sabem", Channel: "Charlie Brown Jr. - Topic", Duration: 182})
++	live := scoreCandidate(req, webCandidate{Title: "Charlie Brown Jr - Só os Loucos Sabem (Ao Vivo)", Channel: "Fã clube", Duration: 260})
++	other := scoreCandidate(req, webCandidate{Title: "Proibida pra Mim", Channel: "Charlie Brown Jr. - Topic", Duration: 181})
++	long := scoreCandidate(req, webCandidate{Title: "Só os Loucos Sabem", Channel: "Charlie Brown Jr.", Duration: 3600})
++	if official < 100 || live >= 40 || other != 0 || long != 0 {
++		t.Errorf("official=%d live=%d other=%d long=%d", official, live, other, long)
++	}
++	// a live version is fine when the live version was requested
++	req.Title = "Só os Loucos Sabem (Ao Vivo)"
++	req.DurationMs = 0
++	if s := scoreCandidate(req, webCandidate{Title: "Só os Loucos Sabem (Ao Vivo)", Channel: "Charlie Brown Jr."}); s < 40 {
++		t.Errorf("requested live version scored %d", s)
++	}
++}
++
++func TestYouTubeTriesCandidatesAndPlayerClients(t *testing.T) {
++	music := `{"entries":[
++		{"url":"https://music.youtube.com/watch?v=live","title":"Paranoid Android (Live)","channel":"Radiohead - Topic","duration":420},
++		{"url":"https://music.youtube.com/watch?v=fail1","title":"Paranoid Android","channel":"Radiohead - Topic","duration":387},
++		{"url":"https://music.youtube.com/watch?v=needsclient","title":"Paranoid Android","channel":"Radiohead","duration":386},
++		{"url":"https://music.youtube.com/watch?v=other","title":"Karma Police","channel":"Radiohead - Topic","duration":261}]}`
++	dir, bin, ff := fakeWebTools(t, map[string]string{"music.json": music})
++	dest := filepath.Join(dir, "music")
++	y := &YouTube{On: true, Binary: bin, FFmpeg: ff, Cookies: "/data/cookies.txt"}
++	req := Request{Kind: KindTrack, MBID: "rec-1", Artist: "Radiohead", Album: "OK Computer", Title: "Paranoid Android", DurationMs: 387000}
++	res, err := y.Fetch(context.Background(), req, dest)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(res.Paths) != 1 || !strings.HasSuffix(res.Paths[0], filepath.Join("Radiohead", "OK Computer", "Paranoid Android.opus")) {
++		t.Fatalf("paths = %v", res.Paths)
++	}
++	if got := readFile(t, res.Paths[0]); !strings.Contains(got, "needsclient") {
++		t.Errorf("downloaded %q, want the needsclient upload", got)
++	}
++	calls := readFile(t, filepath.Join(dir, "calls.log"))
++	if strings.Contains(calls, "v=live") || strings.Contains(calls, "v=other") {
++		t.Errorf("tried a live version or another song:\n%s", calls)
++	}
++	if strings.Count(calls, "v=fail1") != 3 || !strings.Contains(calls, "player_client=web_safari,mweb -- https://music.youtube.com/watch?v=needsclient") {
++		t.Errorf("expected each player client on the failing upload, then the second upload:\n%s", calls)
++	}
++	if !strings.Contains(calls, "--cookies /data/cookies.txt") {
++		t.Errorf("cookies not passed:\n%s", calls)
++	}
++	tags := readFile(t, filepath.Join(dir, "tags.log"))
++	if !strings.Contains(tags, "MUSICBRAINZ_TRACKID=rec-1") || !strings.Contains(tags, "title=Paranoid Android") {
++		t.Errorf("tags = %s", tags)
++	}
++}
++
++func TestYouTubeFallsBackToRegularSearchAndSkipsSlowDownloads(t *testing.T) {
++	yt := `{"entries":[
++		{"url":"https://www.youtube.com/watch?v=slow","title":"AmarElo","channel":"Emicida - Topic","duration":300},
++		{"url":"https://www.youtube.com/watch?v=ok","title":"Emicida - AmarElo","channel":"Emicida","duration":301}]}`
++	// no music.json: the YouTube Music search fails
++	dir, bin, ff := fakeWebTools(t, map[string]string{"yt.json": yt})
++	y := &YouTube{On: true, Binary: bin, FFmpeg: ff, AttemptTimeout: 300 * time.Millisecond}
++	start := time.Now()
++	res, err := y.Fetch(context.Background(), Request{Kind: KindTrack, MBID: "r", Artist: "Emicida", Title: "AmarElo"}, filepath.Join(dir, "m"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := readFile(t, res.Paths[0]); !strings.Contains(got, "v=ok") {
++		t.Errorf("downloaded %q", got)
++	}
++	if !strings.Contains(readFile(t, filepath.Join(dir, "calls.log")), "v=slow") {
++		t.Error("the slow upload should have been tried first")
++	}
++	if time.Since(start) > 4*time.Second {
++		t.Errorf("slow download was not abandoned (%s)", time.Since(start))
++	}
++}
++
++func TestSoundCloudAndErrors(t *testing.T) {
++	sc := `{"entries":[{"webpage_url":"https://soundcloud.com/a/b","title":"Racionais - Negro Drama","uploader":"racionais","duration":411}]}`
++	dir, bin, ff := fakeWebTools(t, map[string]string{"sc.json": sc})
++	s := &SoundCloud{On: true, Binary: bin, FFmpeg: ff}
++	if !s.Supports(KindTrack) || s.Supports(KindAlbum) {
++		t.Error("SoundCloud handles tracks only")
++	}
++	res, err := s.Fetch(context.Background(), Request{Kind: KindTrack, MBID: "r", Artist: "Racionais MC's", Title: "Negro Drama"}, filepath.Join(dir, "m"))
++	if err != nil || len(res.Paths) != 1 {
++		t.Fatalf("soundcloud: %v %v", res, err)
++	}
++	// YouTube with every search blocked explains what happened on each site
++	y := &YouTube{On: true, Binary: bin, FFmpeg: ff}
++	_, err = y.Fetch(context.Background(), Request{Kind: KindTrack, MBID: "r", Artist: "A", Title: "B"}, filepath.Join(dir, "m"))
++	if err == nil || !strings.Contains(err.Error(), "YouTube Music: search failed") || !strings.Contains(err.Error(), "YouTube: search failed") {
++		t.Errorf("err = %v", err)
++	}
++}
++
++func TestScoreCandidateWholeWords(t *testing.T) {
++	req := Request{Artist: "Charlie Brown Jr.", Title: "Faixa 1", DurationMs: 187000}
++	if s := scoreCandidate(req, webCandidate{Title: "Faixa 10", Channel: "Charlie Brown Jr. - Topic", Duration: 187}); s != 0 {
++		t.Errorf("Faixa 10 matched Faixa 1 (%d)", s)
++	}
++	req.Title, req.DurationMs = "Faixa 6", 222000
++	good := scoreCandidate(req, webCandidate{Title: "Faixa 6", Channel: "Charlie Brown Jr. - Topic", Duration: 180})
++	live := scoreCandidate(req, webCandidate{Title: "Faixa 6 (Ao Vivo)", Channel: "fan", Duration: 220})
++	if live >= 40 || good <= live {
++		t.Errorf("good=%d live=%d", good, live)
++	}
++}
+diff --git a/core/acquire/source_youtube.go b/core/acquire/source_youtube.go
+index 167fb71..8b155d0 100644
+--- a/core/acquire/source_youtube.go
++++ b/core/acquire/source_youtube.go
+@@ -1,93 +1,31 @@
+ package acquire
+ 
+ import (
+-	"bytes"
+ 	"context"
+-	"errors"
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
+ 	"path/filepath"
+ 	"strings"
+-	"time"
+ )
+ 
+-// YouTube fetches single tracks with yt-dlp. Albums are not supported here
+-// (quality and track boundaries are unreliable); use Lidarr or Soulseek.
+-//
+-// The file is named and tagged from the MusicBrainz request (not from the video
+-// title), so the library scan can match it back to the request by recording MBID.
+-type YouTube struct {
+-	Binary string // default "yt-dlp"
+-	FFmpeg string // default "ffmpeg"; also required by yt-dlp for audio extraction
+-	Format string // audio format, default "opus" (lossless re-encode is impossible from YouTube)
+-	On     bool
+-}
+-
+-func (y *YouTube) Name() string         { return "youtube" }
+-func (y *YouTube) Enabled() bool        { return y.On }
+-func (y *YouTube) Supports(k Kind) bool { return k == KindTrack }
+-
+-func (y *YouTube) Fetch(ctx context.Context, req Request, destDir string) (Result, error) {
+-	bin := cmp(y.Binary, "yt-dlp")
+-	format := cmp(y.Format, "opus")
+-	dir := filepath.Join(destDir, sanitize(req.Artist), sanitize(req.Album))
+-	if err := ensureInside(destDir, dir); err != nil {
+-		return Result{}, err
+-	}
+-	// Passed as a single argv element prefixed with ytsearch1:, so user text can
+-	// never be interpreted as an option or run through a shell.
+-	query := "ytsearch1:" + strings.TrimSpace(req.Artist+" - "+req.Title+" official audio")
+-	outTpl := filepath.Join(dir, sanitize(req.Title)+".%(ext)s")
+-
+-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+-	defer cancel()
+-	args := []string{
+-		"-x", "--audio-format", format,
+-		"--embed-thumbnail",
+-		"--no-playlist",
+-		"--match-filter", "duration < 900", // skip mixes and full-album uploads
+-		"--print", "after_move:filepath",
+-		"-o", outTpl,
+-	}
+-	if y.FFmpeg != "" {
+-		args = append(args, "--ffmpeg-location", y.FFmpeg)
+-	}
+-	cmd := exec.CommandContext(ctx, bin, append(args, query)...)
+-	var stdout, stderr bytes.Buffer
+-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+-	if err := cmd.Run(); err != nil {
+-		return Result{}, fmt.Errorf("yt-dlp: %w: %s", err, strings.TrimSpace(stderr.String()))
+-	}
+-	var paths []string
+-	for _, line := range strings.Split(stdout.String(), "\n") {
+-		if p := strings.TrimSpace(line); p != "" {
+-			paths = append(paths, p)
+-		}
+-	}
+-	if len(paths) == 0 {
+-		return Result{}, errors.New("yt-dlp produced no file (filtered out or not found)")
+-	}
+-	for _, p := range paths {
+-		if err := tagFile(ctx, cmp(y.FFmpeg, "ffmpeg"), p, req); err != nil {
+-			_ = os.Remove(p)
+-			return Result{}, err
+-		}
+-	}
+-	return Result{Paths: paths}, nil
+-}
+-
+ // tagFile rewrites the file's tags with the MusicBrainz data of the request,
+ // so Navidrome's scanner fills artist/title/album and the recording MBID.
+ func tagFile(ctx context.Context, ffmpeg, path string, req Request) error {
+ 	tmp := strings.TrimSuffix(path, filepath.Ext(path)) + ".tagging" + filepath.Ext(path)
+-	tags := []string{"title=" + req.Title, "artist=" + req.Artist, "album_artist=" + req.Artist}
++	tags := []string{"title=" + req.Title, "artist=" + req.Artist, "album_artist=" + cmp(req.AlbumArtist, req.Artist)}
+ 	if req.Album != "" {
+ 		tags = append(tags, "album="+req.Album)
+ 	}
++	if req.TrackNumber > 0 {
++		tags = append(tags, fmt.Sprintf("track=%d", req.TrackNumber))
++	}
+ 	if req.Kind == KindTrack {
+ 		tags = append(tags, "MUSICBRAINZ_TRACKID="+req.MBID)
+ 	}
++	if req.ReleaseGroupID != "" {
++		tags = append(tags, "MUSICBRAINZ_RELEASEGROUPID="+req.ReleaseGroupID)
++	}
+ 	args := []string{"-y", "-v", "error", "-i", path, "-map", "0", "-c", "copy"}
+ 	for _, t := range tags {
+ 		// Ogg/Opus keep tags on the audio stream, MP4/MP3 on the container: set both,
+diff --git a/core/acquire/store_sql.go b/core/acquire/store_sql.go
+index 0e22b27..e694c5b 100644
+--- a/core/acquire/store_sql.go
++++ b/core/acquire/store_sql.go
+@@ -15,20 +15,20 @@ type SQLStore struct {
+ 
+ func NewSQLStore(db *sql.DB) *SQLStore { return &SQLStore{DB: db} }
+ 
+-const requestColumns = `id, user_id, kind, mbid, artist, album, title, status, source, error, created_at, updated_at, cover_id`
++const requestColumns = `id, user_id, kind, mbid, artist, album, title, status, source, error, created_at, updated_at, cover_id, duration_ms`
+ 
+ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
+ 	var r Request
+ 	err := row.Scan(&r.ID, &r.UserID, &r.Kind, &r.MBID, &r.Artist, &r.Album, &r.Title,
+-		&r.Status, &r.Source, &r.Error, &r.CreatedAt, &r.UpdatedAt, &r.CoverID)
++		&r.Status, &r.Source, &r.Error, &r.CreatedAt, &r.UpdatedAt, &r.CoverID, &r.DurationMs)
+ 	return r, err
+ }
+ 
+ func (s *SQLStore) Create(ctx context.Context, r *Request) error {
+ 	_, err := s.DB.ExecContext(ctx, `INSERT INTO acquire_request (`+requestColumns+`)
+-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+ 		r.ID, r.UserID, r.Kind, r.MBID, r.Artist, r.Album, r.Title,
+-		r.Status, r.Source, r.Error, r.CreatedAt, r.UpdatedAt, r.CoverID)
++		r.Status, r.Source, r.Error, r.CreatedAt, r.UpdatedAt, r.CoverID, r.DurationMs)
+ 	return err
+ }
+ 
+diff --git a/core/acquire/store_sql_test.go b/core/acquire/store_sql_test.go
+index 6566e99..5eb10ea 100644
+--- a/core/acquire/store_sql_test.go
++++ b/core/acquire/store_sql_test.go
+@@ -22,7 +22,7 @@ func newSQLStore(t *testing.T) *SQLStore {
+ 	if _, err := db.Exec(`CREATE TABLE user (id VARCHAR(255) PRIMARY KEY);`); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	for _, f := range []string{"20261010000000_create_acquire_request.sql", "20261010170000_add_acquire_request_cover.sql"} {
++	for _, f := range []string{"20261010000000_create_acquire_request.sql", "20261010170000_add_acquire_request_cover.sql", "20261011120000_add_acquire_request_duration.sql"} {
+ 		mig, err := os.ReadFile("../../db/migrations/" + f)
+ 		if err != nil {
+ 			t.Fatal(err)
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index a39b178..04f80bd 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -80,6 +80,11 @@ func sources() []acquire.Source {
+ 	all := map[string]acquire.Source{
+ 		"youtube": &acquire.YouTube{
+ 			On: opts.YouTube.Enabled, Binary: opts.YouTube.Path, Format: opts.YouTube.Format,
++			FFmpeg: conf.Server.FFmpegPath, Cookies: opts.YouTube.Cookies,
++		},
++		// SoundCloud also goes through yt-dlp, so it needs the same binary.
++		"soundcloud": &acquire.SoundCloud{
++			On: opts.SoundCloud.Enabled, Binary: opts.YouTube.Path, Format: opts.YouTube.Format,
+ 			FFmpeg: conf.Server.FFmpegPath,
+ 		},
+ 		"soulseek": &acquire.Soulseek{
+diff --git a/db/migrations/20261011120000_add_acquire_request_duration.sql b/db/migrations/20261011120000_add_acquire_request_duration.sql
+new file mode 100644
+index 0000000..d818563
+--- /dev/null
++++ b/db/migrations/20261011120000_add_acquire_request_duration.sql
+@@ -0,0 +1,5 @@
++-- +goose Up
++ALTER TABLE acquire_request ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;
++
++-- +goose Down
++ALTER TABLE acquire_request DROP COLUMN duration_ms;
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index f0fa4e6..6aa2041 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -589,6 +589,13 @@
+         "adminOnly": "Só um admin pode mudar o limite.",
+         "invalid": "Digite um tamanho em GB, ou deixe vazio para não ter limite",
+         "saved": "Limite de armazenamento salvo"
++      },
++      "sources": {
++        "tracks": "faixa a faixa"
++      },
++      "progress": {
++        "track": "Baixando faixa %{n} de %{total}",
++        "missing": "%{smart_count} de %{total} faixas faltando: %{list} |||| %{smart_count} de %{total} faixas faltando: %{list}"
+       }
+     }
+   },
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 003dda7..571db39 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -592,6 +592,13 @@
+         "adminOnly": "Only an admin can change the limit.",
+         "invalid": "Type a size in GB, or leave it empty for no limit",
+         "saved": "Storage limit saved"
++      },
++      "sources": {
++        "tracks": "track by track"
++      },
++      "progress": {
++        "track": "Downloading track %{n} of %{total}",
++        "missing": "%{smart_count} of %{total} tracks missing: %{list} |||| %{smart_count} of %{total} tracks missing: %{list}"
+       }
+     }
+   },
+diff --git a/ui/src/seer/RequestsList.jsx b/ui/src/seer/RequestsList.jsx
+index c7091f7..324b98d 100644
+--- a/ui/src/seer/RequestsList.jsx
++++ b/ui/src/seer/RequestsList.jsx
+@@ -5,6 +5,39 @@ import { Cover } from './artwork'
+ import { useNav } from './components'
+ import { StatusChip } from './StatusChip'
+ 
++const SOURCES = {
++  youtube: 'YouTube',
++  soundcloud: 'SoundCloud',
++  soulseek: 'Soulseek',
++  lidarr: 'Lidarr',
++}
++const PROGRESS = /^track (\d+) of (\d+)$/
++
++export const sourceLabel = (source, translate) =>
++  source === 'tracks'
++    ? translate('resources.seer.sources.tracks')
++    : SOURCES[source] || source
++
++// The server reports progress and partial results in English; show them in the UI language.
++export const describeError = (error, translate) => {
++  let m = error.match(PROGRESS)
++  if (m) {
++    return translate('resources.seer.progress.track', { n: m[1], total: m[2] })
++  }
++  m = error.match(/^(\d+) of (\d+) tracks could not be downloaded: (.*)$/)
++  if (m) {
++    return translate('resources.seer.progress.missing', {
++      smart_count: Number(m[1]),
++      total: m[2],
++      list: m[3],
++    })
++  }
++  if (error.startsWith('storage limit reached')) {
++    return translate('resources.seer.storage.fullShort')
++  }
++  return error
++}
++
+ const useStyles = makeStyles((theme) => {
+   const dark = theme.palette.type === 'dark'
+   return {
+@@ -144,7 +177,7 @@ export const RequestsList = ({ requests, onApprove }) => {
+                   translate(`resources.seer.kind.${r.kind}`),
+                   r.artist,
+                   r.kind === 'track' ? r.album : null,
+-                  r.source,
++                  sourceLabel(r.source, translate),
+                 ]
+                   .filter(Boolean)
+                   .join(' · ')}
+@@ -153,11 +186,15 @@ export const RequestsList = ({ requests, onApprove }) => {
+                 <div
+                   className={classes.error}
+                   style={
+-                    r.status === 'failed' ? undefined : { color: '#f5a524' }
++                    r.status === 'failed'
++                      ? undefined
++                      : {
++                          color: PROGRESS.test(r.error) ? undefined : '#f5a524',
++                        }
+                   }
+                   title={r.error}
+                 >
+-                  {r.error}
++                  {describeError(r.error, translate)}
+                 </div>
+               )}
+             </div>
+diff --git a/ui/src/seer/Seer.test.jsx b/ui/src/seer/Seer.test.jsx
+index b48f8d2..e68a52e 100644
+--- a/ui/src/seer/Seer.test.jsx
++++ b/ui/src/seer/Seer.test.jsx
+@@ -3,7 +3,7 @@ import { render, fireEvent } from '@testing-library/react'
+ import { describe, it, expect, vi, beforeEach } from 'vitest'
+ import * as RA from 'react-admin'
+ import { SeerContext } from './actions'
+-import { RequestsList } from './RequestsList'
++import { RequestsList, describeError, sourceLabel } from './RequestsList'
+ import { SearchView, pickTop } from './SearchView'
+ import { formatBytes, usage } from './StorageWidget'
+ 
+@@ -192,3 +192,21 @@ describe('storage widget helpers', () => {
+     expect(usage({ used: 5 })).toBe(0)
+   })
+ })
++
++describe('request messages', () => {
++  const t = (key, opts) => `${key}:${JSON.stringify(opts || {})}`
++  it('translates progress, partial albums and the storage limit', () => {
++    expect(describeError('track 3 of 12', t)).toBe(
++      'resources.seer.progress.track:{"n":"3","total":"12"}',
++    )
++    expect(
++      describeError('2 of 10 tracks could not be downloaded: 3. A, 7. B', t),
++    ).toContain('"smart_count":2,"total":"10","list":"3. A, 7. B"')
++    expect(describeError('storage limit reached: 9 GB of 5 GB used', t)).toBe(
++      'resources.seer.storage.fullShort:{}',
++    )
++    expect(describeError('youtube: blocked', t)).toBe('youtube: blocked')
++    expect(sourceLabel('tracks', t)).toBe('resources.seer.sources.tracks:{}')
++    expect(sourceLabel('soundcloud', t)).toBe('SoundCloud')
++  })
++})
+-- 
+2.43.0
+

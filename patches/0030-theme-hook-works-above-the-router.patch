@@ -1,0 +1,50 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] Seer: the theme hook works above the router (fixes blank page)
+
+The Seer look is applied from the URL when the theme hook runs above the router (App calls it there);
+it used useLocation, which threw on mount and left the page white.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+diff --git a/ui/src/themes/useCurrentTheme.js b/ui/src/themes/useCurrentTheme.js
+index 360a634..910a35d 100644
+--- a/ui/src/themes/useCurrentTheme.js
++++ b/ui/src/themes/useCurrentTheme.js
+@@ -1,10 +1,10 @@
+ import { useSelector } from 'react-redux'
+-import { useLocation } from 'react-router-dom'
++import { useHistory } from 'react-router-dom'
+ import useMediaQuery from '@material-ui/core/useMediaQuery'
+ import themes from './index'
+ import { AUTO_THEME_ID } from '../consts'
+ import config from '../config'
+-import { useEffect, useMemo } from 'react'
++import { useEffect, useMemo, useState } from 'react'
+ 
+ // The Seer screens keep their own look, whatever theme the user picked for the rest of Navidrome.
+ const SEER_PATHS = ['/seer', '/podcast']
+@@ -15,7 +15,14 @@ const useCurrentTheme = () => {
+   const prefersLightMode = useMediaQuery('(prefers-color-scheme: light)', {
+     noSsr: true,
+   })
+-  const location = useLocation()
++  // App calls this hook above the router, where there is no history: then the URL is used.
++  const history = useHistory()
++  const [pathname, setPathname] = useState(() => history?.location.pathname ?? window.location.pathname)
++  useEffect(() => {
++    if (!history) return undefined
++    setPathname(history.location.pathname)
++    return history.listen((location) => setPathname(location.pathname))
++  }, [history])
+   const selectedTheme = useSelector((state) => {
+     if (state.theme === AUTO_THEME_ID) {
+       return prefersLightMode ? themes.LightTheme : themes.DarkTheme
+@@ -29,7 +36,7 @@ const useCurrentTheme = () => {
+     return themes[themeName]
+   })
+   const onSeerScreen =
+-    config.seerEnabled && SEER_PATHS.some((p) => location.pathname.startsWith(p))
++    config.seerEnabled && SEER_PATHS.some((p) => pathname.startsWith(p))
+   const theme = onSeerScreen ? themes.SeerTheme : selectedTheme
+ 
+   useEffect(() => {

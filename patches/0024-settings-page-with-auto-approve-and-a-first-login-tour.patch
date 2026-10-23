@@ -1,0 +1,783 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] Seer: settings page with auto-approve, and a first-login tour
+
+Auto-approve becomes a switch in the Settings menu (admins), stored in the property table
+and read on every request. A first-login tour highlights each feature once per user; the
+done flag lives in the per-user client state, so it follows the user to every browser.
+It can be shown again from the Settings page.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index d5d0967..5db0199 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -75,6 +75,8 @@ type Config struct {
+ 	DestDir     string // where Sources should write files; must be inside the library root
+ 	Workers     int
+ 	AutoApprove bool // false = requests wait for an admin (Jellyseerr-style approval)
++	// AutoApproveFunc, when set, decides instead of AutoApprove (the UI can change it at runtime).
++	AutoApproveFunc func(context.Context) bool
+ 	// ImportTimeout is how long a request may stay "importing" before it fails.
+ 	ImportTimeout time.Duration
+ 	// PollInterval is how often importing requests are checked against the library.
+@@ -288,7 +290,7 @@ func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (
+ 		Artist: item.Artist, Album: item.Album, Title: item.Title, CoverID: item.CoverID, DurationMs: item.DurationMs,
+ 		Status: StatusPending, CreatedAt: now, UpdatedAt: now,
+ 	}
+-	if s.cfg.AutoApprove {
++	if s.autoApprove(ctx) {
+ 		req.Status = StatusQueued
+ 	}
+ 	if err := s.store.Create(ctx, req); err != nil {
+@@ -301,6 +303,14 @@ func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (
+ 	return req, nil
+ }
+ 
++// autoApprove reports whether new requests skip the admin approval.
++func (s *Service) autoApprove(ctx context.Context) bool {
++	if s.cfg.AutoApproveFunc != nil {
++		return s.cfg.AutoApproveFunc(ctx)
++	}
++	return s.cfg.AutoApprove
++}
++
+ // Approve queues a pending request (admin action when AutoApprove is false).
+ // Failed requests can be approved again to retry them.
+ func (s *Service) Approve(ctx context.Context, id string) (*Request, error) {
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index fc3d6c4..a6725da 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -28,6 +28,8 @@ type Seer struct {
+ 	Editor *Editor
+ 	// Podcasts manages podcast subscriptions, scheduled downloads, and retention.
+ 	Podcasts *PodcastService
++	// Settings holds the switches an admin changes in the UI.
++	Settings *Settings
+ }
+ 
+ // Enabled reports whether the feature is turned on in the configuration.
+@@ -44,13 +46,15 @@ func GetInstance(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker e
+ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Broker) *Seer {
+ 	opts := conf.Server.Seer
+ 	storage := NewStorage(ds)
++	settings := NewSettings(ds)
+ 	cfg := acquire.Config{
+-		DestDir:       destFolder(ds),
+-		Workers:       opts.Workers,
+-		AutoApprove:   opts.AutoApprove,
+-		ImportTimeout: opts.ImportTimeout,
+-		OnChange:      func(acquire.Request) { refreshUI(broker) },
+-		CheckSpace:    storage.Check,
++		DestDir:         destFolder(ds),
++		Workers:         opts.Workers,
++		AutoApprove:     opts.AutoApprove,
++		AutoApproveFunc: settings.AutoApprove,
++		ImportTimeout:   opts.ImportTimeout,
++		OnChange:        func(acquire.Request) { refreshUI(broker) },
++		CheckSpace:      storage.Check,
+ 	}
+ 	catalog := &acquire.MusicBrainz{UserAgent: opts.UserAgent, BaseURL: opts.MusicBrainzURL}
+ 	lib := &library{ds: ds, scanner: scanner}
+@@ -73,7 +77,7 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 	editor.SetCovers(&acquire.CoverFinder{UserAgent: opts.UserAgent}, catalog)
+ 	pStore := NewPodcastStore(db)
+ 	podcasts := NewPodcastService(pStore, func() string { return dest }, lib, broker, conf.Server.FFmpegPath, opts.YouTube.Path)
+-	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor, Podcasts: podcasts}
++	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor, Podcasts: podcasts, Settings: settings}
+ }
+ 
+ // refreshUI tells open pages to reload (useRefreshOnEvents(['seer'])).
+diff --git a/core/seer/settings.go b/core/seer/settings.go
+new file mode 100644
+index 0000000..7913621
+--- /dev/null
++++ b/core/seer/settings.go
+@@ -0,0 +1,36 @@
++package seer
++
++import (
++	"context"
++	"strconv"
++
++	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/model"
++)
++
++const autoApproveKey = "seer.autoapprove"
++
++// Settings are the switches an admin changes in the UI. They are kept in the property table, so a
++// change survives restarts; until one is saved, the configuration file decides.
++type Settings struct {
++	ds model.DataStore
++}
++
++func NewSettings(ds model.DataStore) *Settings {
++	return &Settings{ds: ds}
++}
++
++// AutoApprove reports whether new requests are queued without waiting for an admin.
++func (s *Settings) AutoApprove(ctx context.Context) bool {
++	def := strconv.FormatBool(conf.Server.Seer.AutoApprove)
++	v, err := s.ds.Property().DefaultGet(ctx, autoApproveKey, def)
++	if err != nil {
++		return conf.Server.Seer.AutoApprove
++	}
++	return v == "true"
++}
++
++// SetAutoApprove saves the switch.
++func (s *Settings) SetAutoApprove(ctx context.Context, on bool) error {
++	return s.ds.Property().Put(ctx, autoApproveKey, strconv.FormatBool(on))
++}
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index 6f4a45c..345ed98 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -618,6 +618,60 @@
+         "clean": "Limpar duplicadas",
+         "confirm": "Remover %{smart_count} cópia |||| Remover %{smart_count} cópias",
+         "cleaned": "%{smart_count} cópia movida para a lixeira |||| %{smart_count} cópias movidas para a lixeira"
++      },
++      "settings": {
++        "name": "Configurações do Seer",
++        "title": "Configurações do Seer",
++        "requests": "Pedidos",
++        "autoApprove": "Aprovar pedidos automaticamente",
++        "autoApproveHint": "Ligado: cada pedido entra direto na fila de download. Desligado: um admin precisa aprovar antes.",
++        "help": "Ajuda",
++        "restartTour": "Ver o tour de novo",
++        "loadError": "Não consegui carregar as configurações do Seer",
++        "saveError": "Não consegui salvar a configuração"
++      },
++      "tour": {
++        "progress": "Passo %{current} de %{total}",
++        "next": "Próximo",
++        "back": "Voltar",
++        "skip": "Pular",
++        "finish": "Concluir",
++        "welcome": {
++          "title": "Bem-vindo ao Navidrome Seer",
++          "text": "Peça músicas e podcasts que ainda não estão na sua biblioteca. Vou te mostrar as principais funções, rapidinho."
++        },
++        "search": {
++          "title": "Busca",
++          "text": "Procure artistas, álbuns e músicas. Abra um resultado para ver a página e pedir o que quiser."
++        },
++        "requests": {
++          "title": "Pedidos",
++          "text": "Cada pedido mostra o andamento: pendente, na fila, baixando, disponível ou falhou. Nos que falharam, use Tentar de novo."
++        },
++        "imports": {
++          "title": "Importar playlists",
++          "text": "Traga playlists do Spotify ou do YouTube Music por link ou arquivo. Dá para manter sincronizada."
++        },
++        "podcasts": {
++          "title": "Podcasts",
++          "text": "Assine podcasts do YouTube ou RSS e escolha quantos episódios manter na biblioteca."
++        },
++        "storage": {
++          "title": "Armazenamento",
++          "text": "Mostra quanto espaço a música ocupa e o limite definido. Ao atingir o limite, novos downloads param. Admins também veem as duplicatas aqui."
++        },
++        "album": {
++          "title": "Editar e apagar",
++          "text": "Dentro de um álbum da biblioteca, admins editam tags e capas, ou apagam faixas e álbuns."
++        },
++        "approval": {
++          "title": "Aprovação de pedidos",
++          "text": "Aqui você decide se os pedidos precisam da aprovação de um admin ou entram direto na fila."
++        },
++        "done": {
++          "title": "Pronto!",
++          "text": "Você pode rever este tour em Configurações, na parte do Seer, quando quiser."
++        }
+       }
+     },
+     "podcast": {
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 97aa4db..8003128 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -74,6 +74,7 @@ type Router struct {
+ 	dups     Duplicates
+ 	editor   Editor
+ 	podcasts Podcasts
++	settings Settings
+ }
+ 
+ func New(ds model.DataStore, s *seer.Seer) *Router {
+@@ -85,6 +86,7 @@ func New(ds model.DataStore, s *seer.Seer) *Router {
+ 		dups:     s.Duplicates,
+ 		editor:   s.Editor,
+ 		podcasts: s.Podcasts,
++		settings: s.Settings,
+ 	}
+ 	r.Handler = r.routes()
+ 	return r
+@@ -154,6 +156,8 @@ func (api *Router) routes() http.Handler {
+ 		if api.storage != nil {
+ 			r.Get("/storage", api.getStorage)
+ 			r.With(adminOnly).Put("/storage", api.setStorage)
++			r.Get("/settings", api.getSettings)
++			r.With(adminOnly).Put("/settings", api.setSettings)
+ 		}
+ 		if api.dups != nil {
+ 			r.With(adminOnly).Get("/duplicates", api.findDuplicates)
+diff --git a/server/seerapi/settings.go b/server/seerapi/settings.go
+new file mode 100644
+index 0000000..43c4234
+--- /dev/null
++++ b/server/seerapi/settings.go
+@@ -0,0 +1,35 @@
++package seerapi
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++
++	"github.com/navidrome/navidrome/log"
++)
++
++// Settings are the switches an admin changes from the UI.
++type Settings interface {
++	AutoApprove(ctx context.Context) bool
++	SetAutoApprove(ctx context.Context, on bool) error
++}
++
++func (api *Router) getSettings(w http.ResponseWriter, r *http.Request) {
++	writeJSON(w, http.StatusOK, map[string]bool{"autoApprove": api.settings.AutoApprove(r.Context())})
++}
++
++func (api *Router) setSettings(w http.ResponseWriter, r *http.Request) {
++	var body struct {
++		AutoApprove *bool `json:"autoApprove"`
++	}
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil || body.AutoApprove == nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	if err := api.settings.SetAutoApprove(r.Context(), *body.AutoApprove); err != nil {
++		log.Error(r.Context(), "Seer: saving settings failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	api.getSettings(w, r)
++}
+diff --git a/ui/src/App.jsx b/ui/src/App.jsx
+index a5f1b81..d55b072 100644
+--- a/ui/src/App.jsx
++++ b/ui/src/App.jsx
+@@ -52,6 +52,7 @@ import { HTML5Backend } from 'react-dnd-html5-backend'
+ import { DndProvider } from 'react-dnd'
+ import missing from './missing/index.js'
+ import seer from './seer'
++import seerSettings from './seer/SeerSettingsResource'
+ import podcast from './podcast'
+ import { useEffect } from 'react'
+ 
+@@ -145,6 +146,16 @@ const Admin = (props) => {
+           {...playlist}
+           options={{ subMenu: 'playlist' }}
+         />,
++        config.seerEnabled && permissions === 'admin' ? (
++          <Resource
++            name="seersettings"
++            {...seerSettings}
++            options={{
++              subMenu: 'settings',
++              label: 'resources.seer.settings.name',
++            }}
++          />
++        ) : null,
+         <Resource name="user" {...user} options={{ subMenu: 'settings' }} />,
+         <Resource
+           name="player"
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 6a38de7..fc6a0b9 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -621,6 +621,60 @@
+         "clean": "Clean up duplicates",
+         "confirm": "Remove %{smart_count} copy |||| Remove %{smart_count} copies",
+         "cleaned": "%{smart_count} copy moved to the trash |||| %{smart_count} copies moved to the trash"
++      },
++      "settings": {
++        "name": "Seer settings",
++        "title": "Seer settings",
++        "requests": "Requests",
++        "autoApprove": "Approve requests automatically",
++        "autoApproveHint": "On: each request goes straight to the download queue. Off: an admin has to approve it first.",
++        "help": "Help",
++        "restartTour": "Show the tour again",
++        "loadError": "Could not load the Seer settings",
++        "saveError": "Could not save the setting"
++      },
++      "tour": {
++        "progress": "Step %{current} of %{total}",
++        "next": "Next",
++        "back": "Back",
++        "skip": "Skip",
++        "finish": "Finish",
++        "welcome": {
++          "title": "Welcome to Navidrome Seer",
++          "text": "Request songs and podcasts that are not in your library yet. Here is a quick tour of the main features."
++        },
++        "search": {
++          "title": "Search",
++          "text": "Look up artists, albums and songs. Open a result to see its page and request what you want."
++        },
++        "requests": {
++          "title": "Requests",
++          "text": "Each request shows its progress: pending, queued, downloading, available or failed. For failed ones, use Retry."
++        },
++        "imports": {
++          "title": "Import playlists",
++          "text": "Bring in playlists from Spotify or YouTube Music by link or file. You can keep them in sync."
++        },
++        "podcasts": {
++          "title": "Podcasts",
++          "text": "Subscribe to podcasts from YouTube or RSS and choose how many episodes to keep."
++        },
++        "storage": {
++          "title": "Storage",
++          "text": "Shows how much space the music uses and the limit you set. When the limit is reached, new downloads pause. Admins also find duplicates here."
++        },
++        "album": {
++          "title": "Edit and delete",
++          "text": "Inside a library album, admins can edit tags and covers, or delete tracks and albums."
++        },
++        "approval": {
++          "title": "Request approval",
++          "text": "Decide here whether requests need an admin's approval or go straight to the queue."
++        },
++        "done": {
++          "title": "All set!",
++          "text": "You can see this tour again in Settings, under Seer, whenever you want."
++        }
+       }
+     },
+     "podcast": {
+diff --git a/ui/src/layout/Layout.jsx b/ui/src/layout/Layout.jsx
+index 44cf9b4..95d3d12 100644
+--- a/ui/src/layout/Layout.jsx
++++ b/ui/src/layout/Layout.jsx
+@@ -8,6 +8,8 @@ import AppBar from './AppBar'
+ import Notification from './Notification'
+ import useCurrentTheme from '../themes/useCurrentTheme'
+ import { useSearchRefocus } from '../common'
++import config from '../config'
++import { SeerTour } from '../seer/SeerTour'
+ 
+ const useStyles = makeStyles({
+   root: { paddingBottom: (props) => (props.addPadding ? '80px' : 0) },
+@@ -34,6 +36,7 @@ const Layout = (props) => {
+         theme={theme}
+         notification={Notification}
+       />
++      {config.seerEnabled && <SeerTour />}
+     </HotKeys>
+   )
+ }
+diff --git a/ui/src/layout/Menu.jsx b/ui/src/layout/Menu.jsx
+index e6ac84b..0a9b14d 100644
+--- a/ui/src/layout/Menu.jsx
++++ b/ui/src/layout/Menu.jsx
+@@ -147,7 +147,7 @@ const Menu = ({ dense = false }) => {
+         resources.filter(subItems('playlist')).map(renderResourceMenuItemLink)
+       )}
+       {config.seerEnabled && (
+-        <div className={classes.storage}>
++        <div className={classes.storage} data-tour="storage">
+           <StorageWidget open={open} />
+         </div>
+       )}
+diff --git a/ui/src/seer/SeerPage.jsx b/ui/src/seer/SeerPage.jsx
+index 4ae2851..b52c606 100644
+--- a/ui/src/seer/SeerPage.jsx
++++ b/ui/src/seer/SeerPage.jsx
+@@ -259,6 +259,7 @@ const SeerPage = () => {
+           <Button
+             variant="outlined"
+             startIcon={<MicIcon />}
++            data-tour="podcasts"
+             onClick={() => history.push('/podcast')}
+             style={{
+               marginTop: 18,
+@@ -272,16 +273,20 @@ const SeerPage = () => {
+             {translate('resources.podcast.name', { smart_count: 2, _: 'Podcasts' })} (YouTube / RSS)
+           </Button>
+         </div>
+-        <ImportsPanel
+-          imports={imports}
+-          onCreated={(job) => setImports((js) => [job, ...js])}
+-        />
+-        <Section
+-          title={translate('resources.seer.requests')}
+-          hint={requests.length > 0 ? String(requests.length) : null}
+-        >
+-          <RequestsList requests={requests} onApprove={approve} />
+-        </Section>
++        <div data-tour="imports">
++          <ImportsPanel
++            imports={imports}
++            onCreated={(job) => setImports((js) => [job, ...js])}
++          />
++        </div>
++        <div data-tour="requests">
++          <Section
++            title={translate('resources.seer.requests')}
++            hint={requests.length > 0 ? String(requests.length) : null}
++          >
++            <RequestsList requests={requests} onApprove={approve} />
++          </Section>
++        </div>
+       </>
+     )
+   }
+@@ -297,7 +302,7 @@ const SeerPage = () => {
+         />
+         {!detail && (
+           <div className={classes.bar}>
+-            <div className={classes.search}>
++            <div className={classes.search} data-tour="search">
+               <SearchIcon />
+               <InputBase
+                 inputRef={inputRef}
+diff --git a/ui/src/seer/SeerSettings.jsx b/ui/src/seer/SeerSettings.jsx
+new file mode 100644
+index 0000000..c5e0b5e
+--- /dev/null
++++ b/ui/src/seer/SeerSettings.jsx
+@@ -0,0 +1,56 @@
++import { useEffect, useState } from 'react'
++import { Button, FormControlLabel, Switch, Typography } from '@material-ui/core'
++import { Title, useNotify, useTranslate } from 'react-admin'
++import { getSeerSettings, setSeerSettings } from './api'
++import { Section } from './components'
++
++export const SeerSettings = () => {
++  const translate = useTranslate()
++  const notify = useNotify()
++  const [settings, setSettings] = useState(null)
++
++  useEffect(() => {
++    getSeerSettings()
++      .then(setSettings)
++      .catch(() => notify('resources.seer.settings.loadError', 'warning'))
++  }, [notify])
++
++  const toggleAutoApprove = (e) => {
++    setSeerSettings({ autoApprove: e.target.checked })
++      .then(setSettings)
++      .catch(() => notify('resources.seer.settings.saveError', 'warning'))
++  }
++
++  return (
++    <div style={{ padding: 24, maxWidth: 720 }}>
++      <Title title={translate('resources.seer.settings.title')} />
++      <Section title={translate('resources.seer.settings.requests')}>
++        <div data-tour="auto-approve" style={{ marginTop: 12 }}>
++          <FormControlLabel
++            control={
++              <Switch
++                color="primary"
++                checked={!!settings?.autoApprove}
++                disabled={!settings}
++                onChange={toggleAutoApprove}
++              />
++            }
++            label={translate('resources.seer.settings.autoApprove')}
++          />
++          <Typography variant="body2" color="textSecondary">
++            {translate('resources.seer.settings.autoApproveHint')}
++          </Typography>
++        </div>
++      </Section>
++      <Section title={translate('resources.seer.settings.help')}>
++        <Button
++          variant="outlined"
++          style={{ marginTop: 12 }}
++          onClick={() => window.dispatchEvent(new CustomEvent('seer:tour'))}
++        >
++          {translate('resources.seer.settings.restartTour')}
++        </Button>
++      </Section>
++    </div>
++  )
++}
+diff --git a/ui/src/seer/SeerSettingsResource.js b/ui/src/seer/SeerSettingsResource.js
+new file mode 100644
+index 0000000..5989b93
+--- /dev/null
++++ b/ui/src/seer/SeerSettingsResource.js
+@@ -0,0 +1,8 @@
++import React from 'react'
++import SettingsIcon from '@material-ui/icons/Settings'
++import { SeerSettings } from './SeerSettings'
++
++export default {
++  list: SeerSettings,
++  icon: React.createElement(SettingsIcon),
++}
+diff --git a/ui/src/seer/SeerTour.jsx b/ui/src/seer/SeerTour.jsx
+new file mode 100644
+index 0000000..5692f9c
+--- /dev/null
++++ b/ui/src/seer/SeerTour.jsx
+@@ -0,0 +1,227 @@
++import { useCallback, useEffect, useState } from 'react'
++import { Button, Paper, Typography } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import { useHistory, useLocation } from 'react-router-dom'
++import { usePermissions, useTranslate } from 'react-admin'
++import { getClientState, putClientState } from './api'
++
++// One step per feature. `target` is a data-tour attribute on the page; a step without one, or
++// whose target is not on screen, is shown in the middle of the page.
++const STEPS = [
++  { id: 'welcome' },
++  { id: 'search', path: '/seer', target: 'search' },
++  { id: 'requests', path: '/seer', target: 'requests' },
++  { id: 'imports', path: '/seer', target: 'imports' },
++  { id: 'podcasts', path: '/seer', target: 'podcasts' },
++  { id: 'storage', target: 'storage' },
++  { id: 'album', admin: true },
++  { id: 'approval', admin: true, path: '/seersettings', target: 'auto-approve' },
++  { id: 'done' },
++]
++
++const CARD_HEIGHT = 230
++const CARD_WIDTH = 360
++
++const useStyles = makeStyles((theme) => ({
++  dim: {
++    position: 'fixed',
++    top: 0,
++    right: 0,
++    bottom: 0,
++    left: 0,
++    zIndex: 1400,
++    background: 'rgba(0,0,0,0.72)',
++  },
++  spot: {
++    position: 'fixed',
++    zIndex: 1400,
++    borderRadius: 12,
++    boxShadow: '0 0 0 9999px rgba(0,0,0,0.72)',
++    transition: 'all 250ms ease',
++    pointerEvents: 'none',
++  },
++  card: {
++    position: 'fixed',
++    zIndex: 1401,
++    width: `min(${CARD_WIDTH}px, calc(100vw - 32px))`,
++    padding: theme.spacing(2.5),
++    borderRadius: 16,
++  },
++  actions: {
++    display: 'flex',
++    alignItems: 'center',
++    gap: theme.spacing(1),
++    marginTop: theme.spacing(2),
++  },
++  grow: { flex: 1 },
++}))
++
++// The card sits under the highlighted element, or above it when there is no room below.
++const cardPosition = (rect) => {
++  if (!rect) {
++    return { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' }
++  }
++  const left = Math.min(
++    Math.max(rect.left, 16),
++    window.innerWidth - CARD_WIDTH - 16,
++  )
++  const below = rect.bottom + CARD_HEIGHT < window.innerHeight
++  return below
++    ? { top: rect.bottom + 16, left }
++    : { top: Math.max(16, rect.top - CARD_HEIGHT), left }
++}
++
++const findTarget = (step) =>
++  step?.target
++    ? document.querySelector(`[data-tour="${step.target}"]`)
++    : null
++
++// The first-login tour. It runs once per user (the "done" flag lives in the server-side client
++// state, so it follows the user to every browser) and can be replayed from Settings.
++export const SeerTour = () => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const history = useHistory()
++  const location = useLocation()
++  const { permissions } = usePermissions()
++  const isAdmin = permissions === 'admin'
++  const [active, setActive] = useState(false)
++  const [index, setIndex] = useState(0)
++  const [rect, setRect] = useState(null)
++
++  const steps = STEPS.filter((s) => !s.admin || isAdmin)
++  const step = steps[index]
++  const last = index === steps.length - 1
++
++  const start = useCallback(() => {
++    setIndex(0)
++    setActive(true)
++  }, [])
++
++  const finish = useCallback(() => {
++    setActive(false)
++    putClientState({ tour: { done: true } }).catch(() => {})
++  }, [])
++
++  // First login: start unless this user already finished or skipped the tour.
++  useEffect(() => {
++    getClientState()
++      .then((st) => {
++        if (!st?.tour?.done) start()
++      })
++      .catch(() => {})
++  }, [start])
++
++  useEffect(() => {
++    window.addEventListener('seer:tour', start)
++    return () => window.removeEventListener('seer:tour', start)
++  }, [start])
++
++  useEffect(() => {
++    if (!active) return undefined
++    const onKey = (e) => {
++      if (e.key === 'Escape') finish()
++    }
++    window.addEventListener('keydown', onKey)
++    return () => window.removeEventListener('keydown', onKey)
++  }, [active, finish])
++
++  // Go to the step's page, then wait for its target to render and highlight it.
++  useEffect(() => {
++    if (!active || !step) return undefined
++    if (step.path && location.pathname !== step.path) {
++      history.push(step.path)
++      return undefined
++    }
++    let tries = 0
++    let timer
++    const locate = () => {
++      const el = findTarget(step)
++      if (el) {
++        el.scrollIntoView({ block: 'center', behavior: 'smooth' })
++        setRect(el.getBoundingClientRect())
++      } else if (step.target && tries < 15) {
++        tries += 1
++        timer = setTimeout(locate, 150)
++      } else {
++        setRect(null)
++      }
++    }
++    const remeasure = () => {
++      const el = findTarget(step)
++      setRect(el ? el.getBoundingClientRect() : null)
++    }
++    locate()
++    window.addEventListener('resize', remeasure)
++    window.addEventListener('scroll', remeasure, true)
++    return () => {
++      clearTimeout(timer)
++      window.removeEventListener('resize', remeasure)
++      window.removeEventListener('scroll', remeasure, true)
++    }
++  }, [active, step, location.pathname, history])
++
++  if (!active || !step) return null
++
++  const next = () => (last ? finish() : setIndex((i) => i + 1))
++  const back = () => setIndex((i) => Math.max(0, i - 1))
++
++  return (
++    <>
++      {rect ? (
++        <div
++          className={classes.spot}
++          style={{
++            top: rect.top - 8,
++            left: rect.left - 8,
++            width: rect.width + 16,
++            height: rect.height + 16,
++          }}
++        />
++      ) : (
++        <div className={classes.dim} />
++      )}
++      <Paper
++        className={classes.card}
++        style={cardPosition(rect)}
++        role="dialog"
++        aria-label={translate(`resources.seer.tour.${step.id}.title`)}
++        elevation={8}
++      >
++        <Typography variant="overline" color="textSecondary">
++          {translate('resources.seer.tour.progress', {
++            current: index + 1,
++            total: steps.length,
++          })}
++        </Typography>
++        <Typography variant="h6" component="h2" gutterBottom>
++          {translate(`resources.seer.tour.${step.id}.title`)}
++        </Typography>
++        <Typography variant="body2" color="textSecondary">
++          {translate(`resources.seer.tour.${step.id}.text`)}
++        </Typography>
++        <div className={classes.actions}>
++          <Button size="small" onClick={finish}>
++            {translate('resources.seer.tour.skip')}
++          </Button>
++          <span className={classes.grow} />
++          {index > 0 && (
++            <Button size="small" onClick={back}>
++              {translate('resources.seer.tour.back')}
++            </Button>
++          )}
++          <Button
++            size="small"
++            variant="contained"
++            color="primary"
++            onClick={next}
++          >
++            {translate(
++              last ? 'resources.seer.tour.finish' : 'resources.seer.tour.next',
++            )}
++          </Button>
++        </div>
++      </Paper>
++    </>
++  )
++}
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index 231f014..965675c 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -146,3 +146,21 @@ export const deleteEpisode = (id) =>
+   httpClient(`${SEER_URL}/podcasts/episodes/${id}`, { method: 'DELETE' })
+ 
+ 
++
++export const getSeerSettings = () =>
++  httpClient(`${SEER_URL}/settings`).then(({ json }) => json)
++
++export const setSeerSettings = (changes) =>
++  httpClient(`${SEER_URL}/settings`, {
++    method: 'PUT',
++    body: JSON.stringify(changes),
++  }).then(({ json }) => json)
++
++export const getClientState = () =>
++  httpClient(`${SEER_URL}/state`).then(({ json }) => json)
++
++export const putClientState = (patch) =>
++  httpClient(`${SEER_URL}/state`, {
++    method: 'PUT',
++    body: JSON.stringify(patch),
++  }).then(({ json }) => json)

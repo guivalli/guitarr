@@ -1,0 +1,27 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] Seer: keep Opus downloads tagging by dropping the cover stream
+
+yt-dlp embeds the cover as a PNG video stream, which the Opus/Ogg muxer rejects
+("Unsupported codec id in stream 1"), so tagging failed right after the download.
+For Opus/Ogg keep only the audio stream when rewriting the tags.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+diff --git a/core/acquire/source_youtube.go b/core/acquire/source_youtube.go
+index 24b8bdc..ee2297c 100644
+--- a/core/acquire/source_youtube.go
++++ b/core/acquire/source_youtube.go
+@@ -31,7 +31,12 @@ func tagFile(ctx context.Context, ffmpeg, path string, req Request) error {
+ // writeTags rewrites the file's tags with ffmpeg ("key=value" pairs), keeping the audio and cover art as they are.
+ func writeTags(ctx context.Context, ffmpeg, path string, tags []string) error {
+ 	tmp := strings.TrimSuffix(path, filepath.Ext(path)) + ".tagging" + filepath.Ext(path)
+-	args := []string{"-y", "-v", "error", "-i", path, "-map", "0", "-c", "copy"}
++	stream := "0"
++	if ext := strings.ToLower(filepath.Ext(path)); ext == ".opus" || ext == ".ogg" {
++		// Opus/Ogg can not hold the PNG cover yt-dlp embeds as a video stream: keep only the audio.
++		stream = "0:a"
++	}
++	args := []string{"-y", "-v", "error", "-i", path, "-map", stream, "-c", "copy"}
+ 	for _, t := range tags {
+ 		// Ogg/Opus keep tags on the audio stream, MP4/MP3 on the container: set both,
+ 		// so yt-dlp's video title never survives as the track title.

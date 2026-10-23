@@ -1,0 +1,15 @@
+{
+  "name": "guitarr-android",
+  "version": "1.0.0",
+  "private": true,
+  "description": "App Android (Capacitor) do Guitarr",
+  "dependencies": {
+    "@capacitor/android": "^8.5.3",
+    "@capacitor/app": "^8.1.2",
+    "@capacitor/core": "^8.5.3",
+    "@capacitor/filesystem": "^8.1.5"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.3"
+  }
+}

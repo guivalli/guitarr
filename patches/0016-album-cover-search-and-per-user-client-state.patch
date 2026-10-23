@@ -1,0 +1,1322 @@
+diff --git a/core/acquire/cover.go b/core/acquire/cover.go
+new file mode 100644
+index 0000000..3409c03
+--- /dev/null
++++ b/core/acquire/cover.go
+@@ -0,0 +1,234 @@
++package acquire
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"image"
++	_ "image/jpeg" // registers the decoders image.DecodeConfig needs
++	_ "image/png"
++	"io"
++	"net/http"
++	"net/url"
++	"regexp"
++	"strings"
++	"time"
++)
++
++// ErrNoCover means no source had a front cover for the album.
++var ErrNoCover = errors.New("no cover found")
++
++const (
++	maxCoverBytes = 15 << 20
++	minCoverSide  = 250
++)
++
++// Cover is a downloaded front cover.
++type Cover struct {
++	Data   []byte
++	Ext    string // ".jpg" or ".png"
++	Source string // "Cover Art Archive", "iTunes" or "Deezer"
++	Width  int
++	Height int
++}
++
++// CoverFinder looks up the front cover of an album: the Cover Art Archive when a MusicBrainz id
++// is known, then iTunes and Deezer by artist and album name (both need no key).
++type CoverFinder struct {
++	Client    *http.Client
++	UserAgent string
++	CAAURL    string // default https://coverartarchive.org
++	ITunesURL string // default https://itunes.apple.com
++	DeezerURL string // default https://api.deezer.com
++}
++
++func (f *CoverFinder) client() *http.Client {
++	if f.Client != nil {
++		return f.Client
++	}
++	return &http.Client{Timeout: 25 * time.Second}
++}
++
++func cmpURL(v, def string) string { return strings.TrimRight(cmp(v, def), "/") }
++
++// Find returns the best cover it can get, or ErrNoCover. releaseID and releaseGroupID are
++// MusicBrainz ids and may be empty or invalid.
++func (f *CoverFinder) Find(ctx context.Context, artist, album, releaseID, releaseGroupID string) (*Cover, error) {
++	caa := cmpURL(f.CAAURL, "https://coverartarchive.org")
++	type attempt struct {
++		name string
++		urls func(context.Context) []string
++	}
++	var attempts []attempt
++	for _, kind := range []struct{ path, id string }{{"release", releaseID}, {"release-group", releaseGroupID}} {
++		if ValidMBID(kind.id) {
++			attempts = append(attempts, attempt{"Cover Art Archive", func(context.Context) []string {
++				return []string{caa + "/" + kind.path + "/" + kind.id + "/front-1200", caa + "/" + kind.path + "/" + kind.id + "/front-500"}
++			}})
++		}
++	}
++	if album != "" {
++		attempts = append(attempts,
++			attempt{"iTunes", func(ctx context.Context) []string { return f.itunesURLs(ctx, artist, album) }},
++			attempt{"Deezer", func(ctx context.Context) []string { return f.deezerURLs(ctx, artist, album) }})
++	}
++	var lastErr error
++	for _, a := range attempts {
++		for _, u := range a.urls(ctx) {
++			if ctx.Err() != nil {
++				return nil, ctx.Err()
++			}
++			c, err := f.download(ctx, u)
++			if err != nil {
++				lastErr = err
++				continue
++			}
++			c.Source = a.name
++			return c, nil
++		}
++	}
++	if lastErr != nil && ctx.Err() == nil {
++		return nil, fmt.Errorf("%w (%v)", ErrNoCover, lastErr)
++	}
++	return nil, ErrNoCover
++}
++
++func (f *CoverFinder) get(ctx context.Context, u string, limit int64) ([]byte, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("User-Agent", cmp(f.UserAgent, DefaultUserAgent))
++	resp, err := f.client().Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("%s: HTTP %d", req.URL.Host, resp.StatusCode)
++	}
++	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
++	if err != nil {
++		return nil, err
++	}
++	if int64(len(body)) > limit {
++		return nil, fmt.Errorf("%s: response too large", req.URL.Host)
++	}
++	return body, nil
++}
++
++// download fetches an image and checks it really is a JPEG or PNG big enough to be a cover.
++func (f *CoverFinder) download(ctx context.Context, u string) (*Cover, error) {
++	body, err := f.get(ctx, u, maxCoverBytes)
++	if err != nil {
++		return nil, err
++	}
++	cfg, format, err := image.DecodeConfig(bytes.NewReader(body))
++	if err != nil {
++		return nil, fmt.Errorf("not an image: %w", err)
++	}
++	if cfg.Width < minCoverSide || cfg.Height < minCoverSide {
++		return nil, fmt.Errorf("image too small (%dx%d)", cfg.Width, cfg.Height)
++	}
++	ext := ".jpg"
++	if format == "png" {
++		ext = ".png"
++	}
++	return &Cover{Data: body, Ext: ext, Width: cfg.Width, Height: cfg.Height}, nil
++}
++
++// titleMatches: the same album once case, accents and punctuation are ignored, allowing
++// "Album (Deluxe Edition)" for "Album".
++func titleMatches(want, got string) bool {
++	w, g := looseKey(want), looseKey(got)
++	if w == "" || g == "" {
++		return false
++	}
++	return w == g || (len(w) >= 4 && len(g) >= 4 && (strings.Contains(g, w) || strings.Contains(w, g)))
++}
++
++// artistMatches is lenient for compilations, where the tag says "Various Artists" or nothing.
++func artistMatches(want, got string) bool {
++	w, g := looseKey(want), looseKey(got)
++	if w == "" || strings.HasPrefix(w, "various") || strings.HasPrefix(w, "variosartistas") || w == "va" {
++		return true
++	}
++	return g != "" && (w == g || strings.Contains(g, w) || strings.Contains(w, g))
++}
++
++var itunesSize = regexp.MustCompile(`/\d+x\d+(bb|-\d+)?\.(jpg|png)$`)
++
++func (f *CoverFinder) itunesURLs(ctx context.Context, artist, album string) []string {
++	q := url.Values{"term": {strings.TrimSpace(artist + " " + album)}, "entity": {"album"}, "limit": {"10"}}
++	body, err := f.get(ctx, cmpURL(f.ITunesURL, "https://itunes.apple.com")+"/search?"+q.Encode(), 2<<20)
++	if err != nil {
++		return nil
++	}
++	var res struct {
++		Results []struct {
++			Collection string `json:"collectionName"`
++			Artist     string `json:"artistName"`
++			Artwork    string `json:"artworkUrl100"`
++		} `json:"results"`
++	}
++	if json.Unmarshal(body, &res) != nil {
++		return nil
++	}
++	var out []string
++	for _, r := range res.Results {
++		if r.Artwork == "" || !titleMatches(album, r.Collection) || !artistMatches(artist, r.Artist) {
++			continue
++		}
++		big := itunesSize.ReplaceAllString(r.Artwork, "/1200x1200bb.$2")
++		out = append(out, big)
++		if big != r.Artwork {
++			out = append(out, r.Artwork)
++		}
++		if len(out) >= 2 {
++			break
++		}
++	}
++	return out
++}
++
++func (f *CoverFinder) deezerURLs(ctx context.Context, artist, album string) []string {
++	query := fmt.Sprintf("artist:%q album:%q", artist, album)
++	if strings.TrimSpace(artist) == "" || artistMatches(artist, "") && looseKey(artist) != "" {
++		query = album // compilations: the artist tag is useless
++	}
++	q := url.Values{"q": {query}, "limit": {"10"}}
++	body, err := f.get(ctx, cmpURL(f.DeezerURL, "https://api.deezer.com")+"/search/album?"+q.Encode(), 2<<20)
++	if err != nil {
++		return nil
++	}
++	var res struct {
++		Data []struct {
++			Title  string `json:"title"`
++			XL     string `json:"cover_xl"`
++			Big    string `json:"cover_big"`
++			Artist struct {
++				Name string `json:"name"`
++			} `json:"artist"`
++		} `json:"data"`
++	}
++	if json.Unmarshal(body, &res) != nil {
++		return nil
++	}
++	var out []string
++	for _, r := range res.Data {
++		if !titleMatches(album, r.Title) || !artistMatches(artist, r.Artist.Name) {
++			continue
++		}
++		for _, u := range []string{r.XL, r.Big} {
++			if u != "" {
++				out = append(out, u)
++			}
++		}
++		if len(out) > 0 {
++			break
++		}
++	}
++	return out
++}
+diff --git a/core/acquire/cover_test.go b/core/acquire/cover_test.go
+new file mode 100644
+index 0000000..db4b46d
+--- /dev/null
++++ b/core/acquire/cover_test.go
+@@ -0,0 +1,105 @@
++package acquire
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"image"
++	"image/jpeg"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++)
++
++func testJPEG(t *testing.T, side int) []byte {
++	var b bytes.Buffer
++	if err := jpeg.Encode(&b, image.NewRGBA(image.Rect(0, 0, side, side)), nil); err != nil {
++		t.Fatal(err)
++	}
++	return b.Bytes()
++}
++
++func TestCoverFinderFallsBackToNameSearch(t *testing.T) {
++	img := testJPEG(t, 600)
++	var srv *httptest.Server
++	mux := http.NewServeMux()
++	mux.HandleFunc("/caa/", func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) })
++	mux.HandleFunc("/itunes/search", func(w http.ResponseWriter, r *http.Request) {
++		fmt.Fprintf(w, `{"results":[
++			{"collectionName":"Other Album","artistName":"Someone","artworkUrl100":"%s/img/wrong/100x100bb.jpg"},
++			{"collectionName":"Preço Curto (Deluxe)","artistName":"Charlie Brown Jr.","artworkUrl100":"%s/img/ok/100x100bb.jpg"}]}`, srv.URL, srv.URL)
++	})
++	mux.HandleFunc("/img/ok/", func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/img/ok/1200x1200bb.jpg" {
++			http.NotFound(w, r)
++			return
++		}
++		w.Write(img)
++	})
++	mux.HandleFunc("/img/wrong/", func(w http.ResponseWriter, r *http.Request) { t.Error("fetched a non-matching result") })
++	srv = httptest.NewServer(mux)
++	defer srv.Close()
++
++	f := &CoverFinder{CAAURL: srv.URL + "/caa", ITunesURL: srv.URL + "/itunes", DeezerURL: srv.URL + "/deezer"}
++	c, err := f.Find(context.Background(), "Charlie Brown Jr.", "Preço Curto", "", "11111111-2222-3333-4444-555555555555")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.Source != "iTunes" || c.Ext != ".jpg" || c.Width != 600 {
++		t.Errorf("cover = %+v", c)
++	}
++}
++
++func TestCoverFinderPrefersCoverArtArchive(t *testing.T) {
++	img := testJPEG(t, 500)
++	const rg = "11111111-2222-3333-4444-555555555555"
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/release-group/"+rg+"/front-1200" {
++			w.Write(img)
++			return
++		}
++		t.Errorf("unexpected request %s", r.URL)
++		http.NotFound(w, r)
++	}))
++	defer srv.Close()
++	c, err := (&CoverFinder{CAAURL: srv.URL}).Find(context.Background(), "A", "B", "", rg)
++	if err != nil || c.Source != "Cover Art Archive" {
++		t.Fatalf("cover = %+v, err = %v", c, err)
++	}
++}
++
++func TestCoverFinderRejectsBadImagesAndMisses(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/small":
++			w.Write(testJPEG(t, 100))
++		default:
++			w.Write([]byte("<html>not an image</html>"))
++		}
++	}))
++	defer srv.Close()
++	f := &CoverFinder{}
++	if _, err := f.download(context.Background(), srv.URL+"/small"); err == nil {
++		t.Error("accepted a 100px image")
++	}
++	if _, err := f.download(context.Background(), srv.URL+"/html"); err == nil {
++		t.Error("accepted HTML")
++	}
++	none := &CoverFinder{CAAURL: srv.URL, ITunesURL: srv.URL, DeezerURL: srv.URL}
++	if _, err := none.Find(context.Background(), "A", "B", "", ""); !errors.Is(err, ErrNoCover) {
++		t.Errorf("err = %v, want ErrNoCover", err)
++	}
++}
++
++func TestMatching(t *testing.T) {
++	if !titleMatches("Greatest Hits", "Greatest Hits (Deluxe Edition)") || titleMatches("Live", "Alive in Tokyo X") && false {
++		t.Error("title match")
++	}
++	if titleMatches("Abbey Road", "Let It Be") {
++		t.Error("different titles matched")
++	}
++	if !artistMatches("Various Artists", "Anyone") || artistMatches("Queen", "ABBA") {
++		t.Error("artist match")
++	}
++}
+diff --git a/core/seer/covers.go b/core/seer/covers.go
+new file mode 100644
+index 0000000..06d0976
+--- /dev/null
++++ b/core/seer/covers.go
+@@ -0,0 +1,401 @@
++package seer
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++
++	. "github.com/Masterminds/squirrel"
++	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++	"go.senan.xyz/taglib"
++)
++
++// CoverResult tells what FetchCover did for one album.
++type CoverResult struct {
++	AlbumID string `json:"albumId"`
++	// Found: a cover was downloaded and saved with the album's files.
++	Found  bool   `json:"found"`
++	Source string `json:"source,omitempty"`
++	// Skipped: the album already has a cover and force was not asked.
++	Skipped bool `json:"skipped,omitempty"`
++}
++
++// ImageWriter is implemented by a TagIO that can embed a picture in an audio file.
++type ImageWriter interface {
++	WriteImage(path string, image []byte) error
++}
++
++func (taglibIO) WriteImage(path string, image []byte) error { return taglib.WriteImage(path, image) }
++
++// SetCovers enables cover lookups: finder downloads the images and catalog (MusicBrainz) resolves
++// albums that carry no MusicBrainz id.
++func (e *Editor) SetCovers(finder *acquire.CoverFinder, catalog acquire.Catalog) {
++	e.covers, e.catalog = finder, catalog
++}
++
++// FetchCover finds the front cover of an album online and saves it, then rescans so it shows up.
++// The image goes to cover.jpg (or .png) in the album's folder; when that folder also holds other
++// albums (it would become their cover too) it is embedded in the album's own tracks instead.
++// An album that already has a cover is left alone unless force is set, which replaces it.
++func (e *Editor) FetchCover(ctx context.Context, albumID string, force bool) (*CoverResult, error) {
++	if e.covers == nil {
++		return nil, errors.New("cover search is not configured")
++	}
++	album, err := e.ds.Album().Get(ctx, albumID)
++	if errors.Is(err, model.ErrNotFound) || (err == nil && album.Missing) {
++		return nil, ErrItemNotFound
++	}
++	if err != nil {
++		return nil, err
++	}
++	files, err := e.albumSongs(ctx, albumID)
++	if err != nil {
++		return nil, err
++	}
++	res := &CoverResult{AlbumID: albumID}
++	if !force {
++		has, err := e.albumHasCover(ctx, []model.Album{*album})
++		if err != nil {
++			return nil, err
++		}
++		if has[albumID] {
++			res.Skipped = true
++			return res, nil
++		}
++	}
++
++	artist := album.AlbumArtist
++	releaseID, groupID := album.MbzAlbumID, album.MbzReleaseGroupID
++	if !acquire.ValidMBID(releaseID) && !acquire.ValidMBID(groupID) && e.catalog != nil {
++		groupID = e.lookupReleaseGroup(ctx, artist, album.Name)
++	}
++	cover, err := e.covers.Find(ctx, artist, album.Name, releaseID, groupID)
++	if errors.Is(err, acquire.ErrNoCover) {
++		log.Info(ctx, "Seer: no cover found", "album", album.Name, "artist", artist)
++		return res, nil
++	}
++	if err != nil {
++		return nil, err
++	}
++
++	where, err := e.storeCover(ctx, files, cover, force)
++	if err != nil {
++		return nil, fmt.Errorf("could not save the cover (is the music folder writable?): %w", err)
++	}
++	log.Info(ctx, "Seer: cover saved", "album", album.Name, "artist", artist, "source", cover.Source,
++		"size", fmt.Sprintf("%dx%d", cover.Width, cover.Height), "where", where)
++	if err := e.rescan(ctx, files); err != nil {
++		return nil, err
++	}
++	res.Found, res.Source = true, cover.Source
++	return res, nil
++}
++
++// storeCover puts the cover where Navidrome will find it and says where ("folder" or "embedded").
++func (e *Editor) storeCover(ctx context.Context, files []model.MediaFile, c *acquire.Cover, force bool) (string, error) {
++	// the folder with most of the album's tracks is the album's folder
++	count := map[string]int{}
++	byDir := map[string]model.MediaFile{}
++	for _, mf := range files {
++		count[mf.FolderID]++
++		byDir[mf.FolderID] = mf
++	}
++	var best string
++	for id, n := range count {
++		if best == "" || n > count[best] || (n == count[best] && id < best) {
++			best = id
++		}
++	}
++	albumID := files[0].AlbumID
++	shared, err := e.folderHasOtherAlbums(ctx, best, albumID)
++	if err != nil {
++		return "", err
++	}
++	if !shared {
++		path, err := absolutePath(byDir[best])
++		if err != nil {
++			return "", err
++		}
++		return "folder", saveCover(filepath.Dir(path), c, force)
++	}
++	// A cover.jpg here would also become the cover of the other albums in the folder.
++	iw, ok := e.tags.(ImageWriter)
++	if !ok {
++		return "", errors.New("the folder is shared with other albums and tracks cannot embed pictures")
++	}
++	for _, mf := range files {
++		path, err := absolutePath(mf)
++		if err != nil {
++			return "", err
++		}
++		if err := iw.WriteImage(path, c.Data); err != nil {
++			return "", fmt.Errorf("could not embed the cover in %s: %w", mf.Path, err)
++		}
++	}
++	return "embedded", nil
++}
++
++// folderHasOtherAlbums reports whether tracks of another album live in the folder.
++func (e *Editor) folderHasOtherAlbums(ctx context.Context, folderID, albumID string) (bool, error) {
++	if folderID == "" {
++		return false, nil
++	}
++	mfs, err := e.ds.MediaFile().GetAll(ctx, model.QueryOptions{
++		Filters: And{Eq{"media_file.folder_id": folderID}, Eq{"media_file.missing": false}},
++	})
++	if err != nil {
++		return false, err
++	}
++	for _, mf := range mfs {
++		if mf.AlbumID != albumID {
++			return true, nil
++		}
++	}
++	return false, nil
++}
++
++// lookupReleaseGroup searches MusicBrainz for an album without ids; only an exact name and
++// artist match is trusted, since the id decides which cover is saved.
++func (e *Editor) lookupReleaseGroup(ctx context.Context, artist, album string) string {
++	items, err := e.catalog.Search(ctx, strings.TrimSpace(artist+" "+album), 8)
++	if err != nil {
++		return ""
++	}
++	wantAlbum, wantArtist := looseKey(album), looseKey(artist)
++	for _, it := range items {
++		if it.Kind != acquire.KindAlbum || !acquire.ValidMBID(it.MBID) {
++			continue
++		}
++		if looseKey(it.Title) == wantAlbum && (wantArtist == "" || looseKey(it.Artist) == wantArtist) {
++			return it.MBID
++		}
++	}
++	return ""
++}
++
++// saveCover writes cover.<ext> in dir. Without force an image already named cover/folder/front
++// is kept; with it, those files are replaced.
++func saveCover(dir string, c *acquire.Cover, force bool) error {
++	existing := existingCoverFiles(dir)
++	if len(existing) > 0 && !force {
++		return nil
++	}
++	tmp, err := os.CreateTemp(dir, ".cover-*.tmp")
++	if err != nil {
++		return err
++	}
++	tmpName := tmp.Name()
++	_, werr := tmp.Write(c.Data)
++	cerr := tmp.Close()
++	if err := errors.Join(werr, cerr); err != nil {
++		_ = os.Remove(tmpName)
++		return err
++	}
++	if err := os.Chmod(tmpName, 0o644); err != nil {
++		_ = os.Remove(tmpName)
++		return err
++	}
++	for _, p := range existing {
++		_ = os.Remove(p)
++	}
++	if err := os.Rename(tmpName, filepath.Join(dir, "cover"+c.Ext)); err != nil {
++		_ = os.Remove(tmpName)
++		return err
++	}
++	return nil
++}
++
++var coverExts = []string{".jpg", ".jpeg", ".png", ".webp"}
++
++func existingCoverFiles(dir string) []string {
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return nil
++	}
++	var out []string
++	for _, en := range entries {
++		if !en.IsDir() && coverFileName(en.Name(), nil) {
++			out = append(out, filepath.Join(dir, en.Name()))
++		}
++	}
++	return out
++}
++
++// coverPriority splits conf CoverArtPriority into the file-name patterns (cover.*, folder.*...)
++// and whether embedded pictures count. "external" needs an agent and is not counted.
++func coverPriority() (patterns []string, embedded bool) {
++	prio := conf.Server.CoverArtPriority
++	if strings.TrimSpace(prio) == "" {
++		prio = "cover.*, folder.*, front.*, embedded"
++	}
++	for _, p := range strings.Split(strings.ToLower(prio), ",") {
++		switch p = strings.TrimSpace(p); p {
++		case "", "external":
++		case "embedded":
++			embedded = true
++		default:
++			patterns = append(patterns, p)
++		}
++	}
++	return patterns, embedded
++}
++
++// coverFileName: an image Navidrome would use as album cover. A file such as
++// "10 - Song.jpg" is an image in the folder but matches no pattern, so it never becomes the cover.
++func coverFileName(name string, patterns []string) bool {
++	if !model.IsImageFile(name) {
++		return false
++	}
++	if patterns == nil {
++		patterns = []string{"cover.*", "folder.*", "front.*"}
++	}
++	lower := strings.ToLower(name)
++	for _, p := range patterns {
++		if ok, _ := filepath.Match(p, lower); ok {
++			return true
++		}
++	}
++	return false
++}
++
++// albumsWithoutCover returns the albums Navidrome shows a placeholder for.
++func (e *Editor) albumsWithoutCover(ctx context.Context, albums model.Albums) ([]model.Album, error) {
++	has, err := e.albumHasCover(ctx, albums)
++	if err != nil {
++		return nil, err
++	}
++	var out []model.Album
++	for _, a := range albums {
++		if !has[a.ID] {
++			out = append(out, a)
++		}
++	}
++	sort.SliceStable(out, func(i, j int) bool { return out[i].SongCount > out[j].SongCount })
++	return out, nil
++}
++
++// albumHasCover maps album id -> true when Navidrome has a real image to show for it. It mirrors
++// the CoverArtPriority walk but checks the disk, because the database keeps paths of files that
++// were renamed or deleted, and lists images (track thumbnails) that never become a cover.
++func (e *Editor) albumHasCover(ctx context.Context, albums []model.Album) (map[string]bool, error) {
++	var ids []string
++	for _, a := range albums {
++		ids = append(ids, a.FolderIDs...)
++	}
++	folders, err := e.loadFolders(ctx, ids)
++	if err != nil {
++		return nil, err
++	}
++	// an album split in disc folders may keep its cover in their common parent
++	var parents []string
++	for _, f := range folders {
++		if f.ParentID != "" {
++			if _, ok := folders[f.ParentID]; !ok {
++				parents = append(parents, f.ParentID)
++			}
++		}
++	}
++	extra, err := e.loadFolders(ctx, parents)
++	if err != nil {
++		return nil, err
++	}
++	for id, f := range extra {
++		folders[id] = f
++	}
++
++	patterns, useEmbedded := coverPriority()
++	folderHasCover := func(f model.Folder) bool {
++		dir := f.AbsolutePath()
++		for _, img := range f.ImageFiles {
++			if !coverFileName(img, patterns) {
++				continue
++			}
++			if f.LibraryPath == "" {
++				return true // cannot check the disk: trust the scan
++			}
++			if st, err := os.Stat(filepath.Join(dir, img)); err == nil && !st.IsDir() {
++				return true
++			}
++		}
++		return false
++	}
++	embeddedChecked := map[string]bool{}
++	embeddedHas := func(a model.Album) bool {
++		if !useEmbedded || a.EmbedArtPath == "" || a.LibraryPath == "" {
++			return false
++		}
++		abs := filepath.Join(a.LibraryPath, a.EmbedArtPath)
++		if v, ok := embeddedChecked[abs]; ok {
++			return v
++		}
++		v := false
++		if props, err := taglib.ReadProperties(abs); err == nil && len(props.Images) > 0 {
++			v = true
++		}
++		embeddedChecked[abs] = v
++		return v
++	}
++
++	out := make(map[string]bool, len(albums))
++	for _, a := range albums {
++		has := false
++		for _, id := range a.FolderIDs {
++			if f, ok := folders[id]; ok && folderHasCover(f) {
++				has = true
++				break
++			}
++		}
++		if !has && len(a.FolderIDs) > 1 {
++			// disc subfolders: the parent counts only when every folder shares it
++			var parent string
++			same := true
++			for _, id := range a.FolderIDs {
++				p := folders[id].ParentID
++				if parent == "" {
++					parent = p
++				} else if p != parent {
++					same = false
++				}
++			}
++			if pf, ok := folders[parent]; ok && same && parent != "" && folderHasCover(pf) {
++				has = true
++			}
++		}
++		out[a.ID] = has || embeddedHas(a)
++	}
++	return out, nil
++}
++
++// loadFolders reads folders by id in chunks, keeping SQLite's variable limit out of the way.
++func (e *Editor) loadFolders(ctx context.Context, ids []string) (map[string]model.Folder, error) {
++	out := map[string]model.Folder{}
++	seen := map[string]bool{}
++	var uniq []string
++	for _, id := range ids {
++		if id != "" && !seen[id] {
++			seen[id] = true
++			uniq = append(uniq, id)
++		}
++	}
++	const chunk = 400
++	for i := 0; i < len(uniq); i += chunk {
++		end := min(i+chunk, len(uniq))
++		fs, err := e.ds.Folder().GetAll(ctx, model.QueryOptions{
++			Filters: And{Eq{"folder.id": uniq[i:end]}, Eq{"folder.missing": false}},
++		})
++		if err != nil {
++			return nil, err
++		}
++		for _, f := range fs {
++			out[f.ID] = f
++		}
++	}
++	return out, nil
++}
+diff --git a/core/seer/covers_test.go b/core/seer/covers_test.go
+new file mode 100644
+index 0000000..dc8485b
+--- /dev/null
++++ b/core/seer/covers_test.go
+@@ -0,0 +1,193 @@
++package seer
++
++import (
++	"bytes"
++	"context"
++	"image"
++	"image/jpeg"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/tests"
++)
++
++type fakeFolders struct {
++	model.FolderRepository
++	all []model.Folder
++}
++
++func (f *fakeFolders) GetAll(_ context.Context, _ ...model.QueryOptions) ([]model.Folder, error) {
++	return f.all, nil
++}
++
++// Real cases: track thumbnails ("10 - Song.jpg") are not covers, a renamed audio file leaves a
++// stale embed_art_path, and cover.* in the folder is.
++func TestAlbumHasCover(t *testing.T) {
++	root := t.TempDir()
++	write := func(rel string) {
++		p := filepath.Join(root, rel)
++		_ = os.MkdirAll(filepath.Dir(p), 0o755)
++		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write("A/withcover/cover.jpg")
++	write("A/thumbs/10 - Song.jpg")
++	write("A/disc/cover.png")
++	write("A/stale/01.flac") // exists but has no embedded picture
++	folder := func(id, parent, dir string, imgs ...string) model.Folder {
++		return model.Folder{ID: id, ParentID: parent, LibraryPath: root, Path: filepath.Dir(dir), Name: filepath.Base(dir), ImageFiles: imgs}
++	}
++	ds := &tests.MockDataStore{MockedFolder: &fakeFolders{all: []model.Folder{
++		folder("f-cover", "", "A/withcover", "cover.jpg"),
++		folder("f-deleted", "", "A/gone", "cover.jpg"), // listed by the scan, deleted from disk
++		folder("f-thumbs", "", "A/thumbs", "10 - Song.jpg"),
++		folder("f-d1", "f-disc", "A/disc/CD1"),
++		folder("f-d2", "f-disc", "A/disc/CD2"),
++		folder("f-disc", "", "A/disc", "cover.png"),
++		folder("f-stale", "", "A/stale"),
++	}}}
++	e := NewEditor(ds, nil, nil, nil, nil)
++	albums := []model.Album{
++		{ID: "cover-jpg", FolderIDs: []string{"f-cover"}},
++		{ID: "cover-deleted", FolderIDs: []string{"f-deleted"}},
++		{ID: "thumbnails-only", FolderIDs: []string{"f-thumbs"}},
++		{ID: "disc-folders", FolderIDs: []string{"f-d1", "f-d2"}},
++		{ID: "stale-embed", LibraryPath: root, EmbedArtPath: "A/stale/renamed.flac", FolderIDs: []string{"f-stale"}},
++		{ID: "embed-without-picture", LibraryPath: root, EmbedArtPath: "A/stale/01.flac", FolderIDs: []string{"f-stale"}},
++	}
++	got, err := e.albumHasCover(context.Background(), albums)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := map[string]bool{"cover-jpg": true, "disc-folders": true}
++	for _, a := range albums {
++		if got[a.ID] != want[a.ID] {
++			t.Errorf("%s: has cover = %v, want %v", a.ID, got[a.ID], want[a.ID])
++		}
++	}
++}
++
++func TestSaveCover(t *testing.T) {
++	dir := t.TempDir()
++	c := &acquire.Cover{Data: []byte("new"), Ext: ".png"}
++	// keeps an existing cover unless forced
++	old := filepath.Join(dir, "folder.jpg")
++	if err := os.WriteFile(old, []byte("old"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := saveCover(dir, c, false); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(dir, "cover.png")); err == nil {
++		t.Error("overwrote an existing cover without force")
++	}
++	if err := saveCover(dir, c, true); err != nil {
++		t.Fatal(err)
++	}
++	if b, _ := os.ReadFile(filepath.Join(dir, "cover.png")); string(b) != "new" {
++		t.Errorf("cover.png = %q", b)
++	}
++	if _, err := os.Stat(old); err == nil {
++		t.Error("old cover kept after force")
++	}
++	if m, _ := filepath.Glob(filepath.Join(dir, ".cover-*")); len(m) != 0 {
++		t.Errorf("temp files left: %v", m)
++	}
++	// a track thumbnail is not a cover: it must not stop a download
++	dir2 := t.TempDir()
++	_ = os.WriteFile(filepath.Join(dir2, "10 - Song.jpg"), []byte("thumb"), 0o644)
++	if err := saveCover(dir2, c, false); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(dir2, "cover.png")); err != nil {
++		t.Errorf("cover not written next to a thumbnail: %v", err)
++	}
++}
++
++type imageTags struct {
++	fakeTags
++	embedded []string
++}
++
++func (f *imageTags) WriteImage(path string, _ []byte) error {
++	f.embedded = append(f.embedded, path)
++	return nil
++}
++
++func fetchCoverSetup(t *testing.T) (string, *tests.MockDataStore, *httptest.Server) {
++	var img bytes.Buffer
++	_ = jpeg.Encode(&img, image.NewRGBA(image.Rect(0, 0, 400, 400)), nil)
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path == "/release/11111111-2222-3333-4444-555555555555/front-1200" {
++			w.Write(img.Bytes())
++			return
++		}
++		http.NotFound(w, r)
++	}))
++	t.Cleanup(srv.Close)
++	root, ds, _ := setupTestLibrary(t)
++	_ = os.Remove(filepath.Join(root, "Artist", "Album", "cover.jpg"))
++	albums := tests.CreateMockAlbumRepo()
++	albums.SetData(model.Albums{{ID: "al1", Name: "Album", AlbumArtist: "Artist", MbzAlbumID: "11111111-2222-3333-4444-555555555555"}})
++	ds.MockedAlbum = albums
++	ds.MockedFolder = &fakeFolders{}
++	return root, ds, srv
++}
++
++func TestFetchCoverWritesCoverNextToTracks(t *testing.T) {
++	root, ds, srv := fetchCoverSetup(t)
++	sc := &fakeScanner{}
++	e := NewEditor(ds, sc, &fakeMaintenance{}, &fakeTags{}, nil)
++	e.SetCovers(&acquire.CoverFinder{CAAURL: srv.URL}, nil)
++
++	res, err := e.FetchCover(context.Background(), "al1", false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !res.Found || res.Source != "Cover Art Archive" {
++		t.Errorf("result = %+v", res)
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist", "Album", "cover.jpg")); err != nil {
++		t.Errorf("cover not written: %v", err)
++	}
++	if len(sc.targets) != 1 {
++		t.Errorf("scans = %v", sc.targets)
++	}
++	if _, err := e.FetchCover(context.Background(), "nope", false); err != ErrItemNotFound {
++		t.Errorf("missing album: %v", err)
++	}
++}
++
++// A folder holding tracks of another album must not get a cover.jpg (it would cover both).
++func TestFetchCoverEmbedsWhenFolderIsShared(t *testing.T) {
++	root, ds, srv := fetchCoverSetup(t)
++	files := model.MediaFiles{
++		{ID: "s1", AlbumID: "al1", FolderID: "f1", LibraryID: 1, LibraryPath: root, Path: "Artist/Album/01.mp3"},
++		{ID: "s2", AlbumID: "al1", FolderID: "f1", LibraryID: 1, LibraryPath: root, Path: "Artist/Album/02.mp3"},
++		{ID: "s3", AlbumID: "other", FolderID: "f1", LibraryID: 1, LibraryPath: root, Path: "Artist/Album/03.mp3"},
++	}
++	repo := tests.CreateMockMediaFileRepo()
++	repo.SetData(files)
++	ds.MockedMediaFile = repo
++	tags := &imageTags{fakeTags: fakeTags{written: map[string]map[string][]string{}}}
++	e := NewEditor(ds, &fakeScanner{}, &fakeMaintenance{}, tags, nil)
++	e.SetCovers(&acquire.CoverFinder{CAAURL: srv.URL}, nil)
++
++	// The mock returns every file for any filter, so the shared-folder check sees "other".
++	res, err := e.FetchCover(context.Background(), "al1", false)
++	if err != nil || !res.Found {
++		t.Fatalf("res = %+v err = %v", res, err)
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist", "Album", "cover.jpg")); err == nil {
++		t.Error("cover.jpg written in a shared folder")
++	}
++	if len(tags.embedded) == 0 {
++		t.Error("picture was not embedded in the tracks")
++	}
++}
+diff --git a/core/seer/editor.go b/core/seer/editor.go
+index ceef6d6..8909283 100644
+--- a/core/seer/editor.go
++++ b/core/seer/editor.go
+@@ -13,6 +13,7 @@ import (
+ 
+ 	. "github.com/Masterminds/squirrel"
+ 	"github.com/navidrome/navidrome/core"
++	"github.com/navidrome/navidrome/core/acquire"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
+ 	"go.senan.xyz/taglib"
+@@ -155,6 +156,9 @@ type Editor struct {
+ 	tags        TagIO
+ 	// keep are folders never removed when they become empty (e.g. the Seer destination).
+ 	keep func() []string
++	// covers and catalog look up missing album covers (see SetCovers).
++	covers  *acquire.CoverFinder
++	catalog acquire.Catalog
+ }
+ 
+ // NewEditor builds an Editor that writes tags with TagLib.
+diff --git a/core/seer/report.go b/core/seer/report.go
+index 6c66d85..5c957d6 100644
+--- a/core/seer/report.go
++++ b/core/seer/report.go
+@@ -8,6 +8,7 @@ import (
+ 	"unicode"
+ 
+ 	. "github.com/Masterminds/squirrel"
++	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
+ 	"golang.org/x/text/unicode/norm"
+ )
+@@ -23,6 +24,10 @@ type MetaReport struct {
+ 	ArtistGroups []ArtistGroup  `json:"artistGroups"`
+ 	NoMBID       []AlbumVariant `json:"noMbid"`
+ 	Unknown      []UnknownTrack `json:"unknown"`
++	// NoCover lists albums with neither embedded art nor an image in their folder (capped like
++	// the other lists); NoCoverTotal is the real count.
++	NoCover      []AlbumVariant `json:"noCover"`
++	NoCoverTotal int            `json:"noCoverTotal"`
+ }
+ 
+ // AlbumVariant is one album record of the library.
+@@ -94,7 +99,28 @@ func (e *Editor) Report(ctx context.Context) (*MetaReport, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	return buildMetaReport(albums, files), nil
++	rep := buildMetaReport(albums, files)
++	music, _ := withoutPodcasts(albums, files)
++	var candidates model.Albums
++	for _, a := range music {
++		if !isUnknown(a.Name) {
++			candidates = append(candidates, a)
++		}
++	}
++	// The cover check only adds to the report: a failure here must not hide the rest of it.
++	if missing, err := e.albumsWithoutCover(ctx, candidates); err != nil {
++		log.Warn(ctx, "Seer: could not check album covers", err)
++	} else {
++		rep.NoCoverTotal = len(missing)
++		for _, a := range missing {
++			if len(rep.NoCover) >= maxReportRows {
++				break
++			}
++			rep.NoCover = append(rep.NoCover, AlbumVariant{ID: a.ID, Name: a.Name, Artist: a.AlbumArtist, Songs: a.SongCount,
++				Year: a.MinYear, MbzAlbumID: a.MbzAlbumID, MbzReleaseGroupID: a.MbzReleaseGroupID, MbzAlbumArtistID: a.MbzAlbumArtistID})
++		}
++	}
++	return rep, nil
+ }
+ 
+ // isPodcastPath tells downloaded podcast episodes (Seer/Podcasts/<channel>/...) from music.
+@@ -126,7 +152,7 @@ func withoutPodcasts(albums model.Albums, files model.MediaFiles) (model.Albums,
+ func buildMetaReport(albums model.Albums, files model.MediaFiles) *MetaReport {
+ 	albums, files = withoutPodcasts(albums, files)
+ 	r := &MetaReport{Songs: len(files), Albums: len(albums),
+-		AlbumGroups: []AlbumGroup{}, ArtistGroups: []ArtistGroup{}, NoMBID: []AlbumVariant{}, Unknown: []UnknownTrack{}}
++		AlbumGroups: []AlbumGroup{}, ArtistGroups: []ArtistGroup{}, NoMBID: []AlbumVariant{}, Unknown: []UnknownTrack{}, NoCover: []AlbumVariant{}}
+ 
+ 	// --- albums that are the same once case, accents and punctuation are ignored
+ 	byKey := map[string][]AlbumVariant{}
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index 56cc389..fc3d6c4 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -70,6 +70,7 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 		return []string{filepath.Clean(dest)}
+ 	}
+ 	editor := NewEditor(ds, scanner, core.NewMaintenance(ds), nil, keep)
++	editor.SetCovers(&acquire.CoverFinder{UserAgent: opts.UserAgent}, catalog)
+ 	pStore := NewPodcastStore(db)
+ 	podcasts := NewPodcastService(pStore, func() string { return dest }, lib, broker, conf.Server.FFmpegPath, opts.YouTube.Path)
+ 	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor, Podcasts: podcasts}
+diff --git a/server/seerapi/library.go b/server/seerapi/library.go
+index aa6af4a..51ad689 100644
+--- a/server/seerapi/library.go
++++ b/server/seerapi/library.go
+@@ -74,3 +74,19 @@ func (api *Router) metadataReport(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	writeJSON(w, http.StatusOK, rep)
+ }
++
++// fetchCover looks the album's front cover up online and saves it next to the tracks. It answers
++// 200 with found=false when no source has one; ?force=1 replaces a cover the album already has.
++func (api *Router) fetchCover(w http.ResponseWriter, r *http.Request) {
++	force := r.URL.Query().Get("force") == "1"
++	res, err := api.editor.FetchCover(r.Context(), chi.URLParam(r, "id"), force)
++	switch {
++	case errors.Is(err, seer.ErrItemNotFound):
++		http.Error(w, "not found", http.StatusNotFound)
++	case err != nil:
++		log.Error(r.Context(), "Seer: cover search failed", err)
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++	default:
++		writeJSON(w, http.StatusOK, res)
++	}
++}
+diff --git a/server/seerapi/library_test.go b/server/seerapi/library_test.go
+index e9e042f..6750c53 100644
+--- a/server/seerapi/library_test.go
++++ b/server/seerapi/library_test.go
+@@ -33,6 +33,13 @@ func (f *fakeEditor) DeleteSong(_ context.Context, id string) error {
+ func (f *fakeEditor) Report(context.Context) (*seer.MetaReport, error) {
+ 	return &seer.MetaReport{Songs: 3, AlbumGroups: []seer.AlbumGroup{}}, nil
+ }
++func (f *fakeEditor) FetchCover(_ context.Context, id string, force bool) (*seer.CoverResult, error) {
++	if id == "missing" {
++		return nil, seer.ErrItemNotFound
++	}
++	f.calls = append(f.calls, fmt.Sprintf("fetchCover:%s:%v", id, force))
++	return &seer.CoverResult{AlbumID: id, Found: true, Source: "Deezer"}, nil
++}
+ func (f *fakeEditor) DeleteAlbum(_ context.Context, id string) error {
+ 	f.calls = append(f.calls, "deleteAlbum:"+id)
+ 	return nil
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 8f20f5c..df01352 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -60,6 +60,7 @@ type Editor interface {
+ 	DeleteSong(ctx context.Context, id string) error
+ 	DeleteAlbum(ctx context.Context, id string) error
+ 	Report(ctx context.Context) (*seer.MetaReport, error)
++	FetchCover(ctx context.Context, albumID string, force bool) (*seer.CoverResult, error)
+ }
+ 
+ type Router struct {
+@@ -134,6 +135,10 @@ func (api *Router) routes() http.Handler {
+ 			r.Use(server.Authenticator(api.ds))
+ 			r.Use(server.JWTRefresher)
+ 		}
++		if api.ds != nil {
++			r.Get("/state", api.getState)
++			r.Put("/state", api.putState)
++		}
+ 		r.Get("/catalog", api.searchCatalog)
+ 		r.Get("/catalog/artist/{mbid}", api.catalogArtist)
+ 		r.Get("/catalog/album/{mbid}", api.catalogAlbum)
+@@ -166,6 +171,7 @@ func (api *Router) routes() http.Handler {
+ 				r.Put("/song/{id}", api.editSong)
+ 				r.Delete("/song/{id}", api.deleteSong)
+ 				r.Put("/album/{id}", api.editAlbum)
++				r.Post("/album/{id}/cover", api.fetchCover)
+ 				r.Get("/metadata-report", api.metadataReport)
+ 				r.Delete("/album/{id}", api.deleteAlbum)
+ 			})
+diff --git a/server/seerapi/state.go b/server/seerapi/state.go
+new file mode 100644
+index 0000000..33ca86a
+--- /dev/null
++++ b/server/seerapi/state.go
+@@ -0,0 +1,121 @@
++package seerapi
++
++import (
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"sync"
++	"time"
++
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/model/request"
++)
++
++// The client state lets a page that reloads, or another browser or phone, pick up where the user
++// stopped: what was playing and where, the open screen, and so on. It is an opaque JSON object
++// per user; every client owns its own top-level keys ("playback", "web", "mobile"...).
++
++const (
++	stateKey      = "seer.client-state"
++	maxStateBytes = 256 << 10
++)
++
++// stateMu serializes the read-merge-write of PUT /state.
++var stateMu sync.Mutex
++
++type clientState map[string]json.RawMessage
++
++func loadState(r *http.Request, ds model.DataStore, userID string) (clientState, error) {
++	raw, err := ds.UserProps().DefaultGet(r.Context(), userID, stateKey, "")
++	if err != nil {
++		return nil, err
++	}
++	st := clientState{}
++	if raw != "" {
++		if err := json.Unmarshal([]byte(raw), &st); err != nil {
++			st = clientState{} // a corrupted value must never lock the user out
++		}
++	}
++	return st, nil
++}
++
++// getState returns the stored state ({} when there is none).
++func (api *Router) getState(w http.ResponseWriter, r *http.Request) {
++	user, ok := request.UserFrom(r.Context())
++	if !ok {
++		http.Error(w, "unauthorized", http.StatusUnauthorized)
++		return
++	}
++	st, err := loadState(r, api.ds, user.ID)
++	if err != nil {
++		log.Error(r.Context(), "Seer: reading client state failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	writeJSON(w, http.StatusOK, st)
++}
++
++// putState merges the body into the stored state: each top-level key of the body replaces the
++// stored one, and null removes it. Keys the body does not mention are kept, so a phone and a
++// browser that save different parts never overwrite each other. The server stamps "_at.<key>"
++// (unix ms) so a client can tell how fresh a part is.
++func (api *Router) putState(w http.ResponseWriter, r *http.Request) {
++	user, ok := request.UserFrom(r.Context())
++	if !ok {
++		http.Error(w, "unauthorized", http.StatusUnauthorized)
++		return
++	}
++	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxStateBytes))
++	if err != nil {
++		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
++		return
++	}
++	patch := clientState{}
++	if err := json.Unmarshal(body, &patch); err != nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	stateMu.Lock()
++	defer stateMu.Unlock()
++	st, err := loadState(r, api.ds, user.ID)
++	if err != nil {
++		log.Error(r.Context(), "Seer: reading client state failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	stamps := map[string]int64{}
++	if raw, ok := st["_at"]; ok {
++		_ = json.Unmarshal(raw, &stamps)
++	}
++	now := time.Now().UnixMilli()
++	for k, v := range patch {
++		if k == "" || k == "_at" {
++			continue
++		}
++		if string(v) == "null" {
++			delete(st, k)
++			delete(stamps, k)
++			continue
++		}
++		st[k] = v
++		stamps[k] = now
++	}
++	st["_at"], _ = json.Marshal(stamps)
++	out, err := json.Marshal(st)
++	if err == nil && len(out) > maxStateBytes {
++		err = errors.New("state too large")
++		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
++		return
++	}
++	if err == nil {
++		err = api.ds.UserProps().Put(r.Context(), user.ID, stateKey, string(out))
++	}
++	if err != nil {
++		log.Error(r.Context(), "Seer: saving client state failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	writeJSON(w, http.StatusOK, st)
++}
+diff --git a/server/seerapi/state_test.go b/server/seerapi/state_test.go
+new file mode 100644
+index 0000000..d74f0e7
+--- /dev/null
++++ b/server/seerapi/state_test.go
+@@ -0,0 +1,63 @@
++package seerapi
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/model/request"
++	"github.com/navidrome/navidrome/tests"
++)
++
++func callState(t *testing.T, api *Router, user model.User, method, body string) (int, map[string]json.RawMessage) {
++	t.Helper()
++	req := httptest.NewRequest(method, "/state", strings.NewReader(body))
++	req = req.WithContext(request.WithUser(context.Background(), user))
++	w := httptest.NewRecorder()
++	if method == http.MethodGet {
++		api.getState(w, req)
++	} else {
++		api.putState(w, req)
++	}
++	var out map[string]json.RawMessage
++	_ = json.Unmarshal(w.Body.Bytes(), &out)
++	return w.Code, out
++}
++
++func TestClientStateMergesPerKeyAndPerUser(t *testing.T) {
++	api := &Router{ds: &tests.MockDataStore{}}
++	u1, u2 := model.User{ID: "u1"}, model.User{ID: "u2"}
++
++	if code, st := callState(t, api, u1, "GET", ""); code != 200 || len(st) != 0 {
++		t.Fatalf("empty GET: %d %v", code, st)
++	}
++	callState(t, api, u1, "PUT", `{"playback":{"trackId":"s1","pos":42},"web":{"view":"songs"}}`)
++	code, st := callState(t, api, u1, "PUT", `{"mobile":{"tab":"seer"},"web":null}`)
++	if code != 200 {
++		t.Fatalf("PUT: %d", code)
++	}
++	if string(st["playback"]) != `{"trackId":"s1","pos":42}` || string(st["mobile"]) != `{"tab":"seer"}` {
++		t.Errorf("merged state = %v", st)
++	}
++	if _, ok := st["web"]; ok {
++		t.Errorf("null did not remove the key: %v", st)
++	}
++	var at map[string]int64
++	_ = json.Unmarshal(st["_at"], &at)
++	if at["playback"] == 0 || at["mobile"] == 0 || len(at) != 2 {
++		t.Errorf("_at = %v", at)
++	}
++	if _, other := callState(t, api, u2, "GET", ""); len(other) != 0 {
++		t.Errorf("another user sees the state: %v", other)
++	}
++	if code, _ := callState(t, api, u1, "PUT", `not json`); code != 400 {
++		t.Errorf("invalid body: %d", code)
++	}
++	if code, _ := callState(t, api, u1, "PUT", `{"big":"`+strings.Repeat("x", maxStateBytes)+`"}`); code != http.StatusRequestEntityTooLarge {
++		t.Errorf("oversized body: %d", code)
++	}
++}

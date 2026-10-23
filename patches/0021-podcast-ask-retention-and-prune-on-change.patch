@@ -1,0 +1,226 @@
+diff --git a/core/seer/podcast_prune.go b/core/seer/podcast_prune.go
+new file mode 100644
+index 0000000..7f5b5c6
+--- /dev/null
++++ b/core/seer/podcast_prune.go
+@@ -0,0 +1,46 @@
++package seer
++
++import (
++	"context"
++	"os"
++)
++
++// PrunePlan lists the downloaded episodes that a keep policy would remove, newest first.
++// Keep 0 removes nothing. KeepManual removes every download, because no episode enters
++// that mode by itself. Keep 1 or 3 removes the downloads beyond the newest N.
++func (s *PodcastService) PrunePlan(ctx context.Context, channelID string, keepPolicy int) ([]PodcastEpisode, error) {
++	downloaded, err := s.store.ListDownloadedEpisodes(ctx, channelID)
++	if err != nil {
++		return nil, err
++	}
++	switch {
++	case keepPolicy == KeepManual:
++		return downloaded, nil
++	case keepPolicy > 0 && len(downloaded) > keepPolicy:
++		return downloaded[keepPolicy:], nil
++	}
++	return nil, nil
++}
++
++// ApplyPrune deletes the files the keep policy no longer allows and returns how many went.
++func (s *PodcastService) ApplyPrune(ctx context.Context, channelID string, keepPolicy int) (int, error) {
++	plan, err := s.PrunePlan(ctx, channelID, keepPolicy)
++	if err != nil {
++		return 0, err
++	}
++	for i := range plan {
++		ep := plan[i]
++		if ep.FilePath != "" {
++			_ = os.Remove(ep.FilePath)
++		}
++		ep.Status = "deleted"
++		ep.FilePath = ""
++		ep.FileSize = 0
++		_ = s.store.UpdateEpisode(ctx, &ep)
++	}
++	if len(plan) > 0 && s.lib != nil {
++		_ = s.lib.Rescan(ctx)
++	}
++	s.notifyUI()
++	return len(plan), nil
++}
+diff --git a/core/seer/podcast_prune_test.go b/core/seer/podcast_prune_test.go
+new file mode 100644
+index 0000000..26af3a7
+--- /dev/null
++++ b/core/seer/podcast_prune_test.go
+@@ -0,0 +1,37 @@
++package seer
++
++import (
++	"context"
++	"testing"
++	"time"
++)
++
++func TestPrunePlanPerRetentionMode(t *testing.T) {
++	db := setupTestDB(t)
++	defer db.Close()
++	store := NewPodcastStore(db)
++	ctx := context.Background()
++	if err := store.CreateChannel(ctx, &PodcastChannel{ID: "k1", UserID: "u1", Title: "K", FeedURL: "https://example.com/k.xml", KeepPolicy: 0}); err != nil {
++		t.Fatal(err)
++	}
++	now := time.Now().UTC()
++	for i := 0; i < 4; i++ {
++		pub := now.Add(-time.Duration(i) * time.Hour)
++		ep := &PodcastEpisode{ID: "d" + string(rune('0'+i)), ChannelID: "k1", GUID: "g" + string(rune('0'+i)), Title: "Ep", PublishedAt: &pub, Status: "downloaded"}
++		if err := store.CreateEpisode(ctx, ep); err != nil {
++			t.Fatal(err)
++		}
++	}
++	svc := NewPodcastService(store, func() string { return t.TempDir() }, nil, nil, "ffmpeg", "yt-dlp")
++	cases := map[int]int{0: 0, 1: 3, 3: 1, KeepManual: 4}
++	for keep, want := range cases {
++		plan, err := svc.PrunePlan(ctx, "k1", keep)
++		if err != nil || len(plan) != want {
++			t.Errorf("keep %d: plan has %d episodes (err %v), want %d", keep, len(plan), err, want)
++		}
++	}
++	plan, _ := svc.PrunePlan(ctx, "k1", 1)
++	if len(plan) == 3 && plan[0].ID != "d1" {
++		t.Errorf("keep 1 must spare the newest download, first to go is %s", plan[0].ID)
++	}
++}
+diff --git a/server/seerapi/podcast.go b/server/seerapi/podcast.go
+index b2e2998..2885bc9 100644
+--- a/server/seerapi/podcast.go
++++ b/server/seerapi/podcast.go
+@@ -22,6 +22,8 @@ type Podcasts interface {
+ 	Get(ctx context.Context, id string) (*seer.PodcastChannel, []seer.PodcastEpisode, error)
+ 	Subscribe(ctx context.Context, userID, rawURL, sourceType string, keepPolicy int, autoDownload bool) (*seer.PodcastChannel, error)
+ 	Update(ctx context.Context, id string, keepPolicy int, autoDownload bool) (*seer.PodcastChannel, error)
++	PrunePlan(ctx context.Context, id string, keepPolicy int) ([]seer.PodcastEpisode, error)
++	ApplyPrune(ctx context.Context, id string, keepPolicy int) (int, error)
+ 	DeleteChannel(ctx context.Context, id string, deleteFiles bool) error
+ 	SyncChannel(ctx context.Context, id string) error
+ 	RefreshAll(ctx context.Context) error
+@@ -71,16 +73,20 @@ func (api *Router) listPodcasts(w http.ResponseWriter, r *http.Request) {
+ func (api *Router) createPodcast(w http.ResponseWriter, r *http.Request) {
+ 	user, _ := request.UserFrom(r.Context())
+ 	var body struct {
+-		URL          string `json:"url"`
+-		SourceType   string `json:"sourceType"`
+-		KeepPolicy   int    `json:"keepPolicy"`
+-		AutoDownload bool   `json:"autoDownload"`
++		URL        string `json:"url"`
++		SourceType string `json:"sourceType"`
++		KeepPolicy *int   `json:"keepPolicy"`
+ 	}
+ 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
+ 		http.Error(w, "invalid body", http.StatusBadRequest)
+ 		return
+ 	}
+-	ch, err := api.podcasts.Subscribe(r.Context(), user.ID, body.URL, body.SourceType, body.KeepPolicy, body.AutoDownload)
++	if body.KeepPolicy == nil || !validKeepPolicy(*body.KeepPolicy) {
++		http.Error(w, "escolha a retenção antes de adicionar", http.StatusBadRequest)
++		return
++	}
++	keep := *body.KeepPolicy
++	ch, err := api.podcasts.Subscribe(r.Context(), user.ID, body.URL, body.SourceType, keep, keep != seer.KeepManual)
+ 	if err != nil {
+ 		log.Error(r.Context(), "Seer: subscribing to podcast failed", err)
+ 		http.Error(w, err.Error(), http.StatusBadRequest)
+@@ -128,12 +134,13 @@ func (api *Router) updatePodcast(w http.ResponseWriter, r *http.Request) {
+ 	var body struct {
+ 		KeepPolicy   int  `json:"keepPolicy"`
+ 		AutoDownload bool `json:"autoDownload"`
++		Prune        bool `json:"prune"`
+ 	}
+ 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
+ 		http.Error(w, "invalid body", http.StatusBadRequest)
+ 		return
+ 	}
+-	if body.KeepPolicy != seer.KeepManual && body.KeepPolicy != 0 && body.KeepPolicy != 1 && body.KeepPolicy != 3 {
++	if !validKeepPolicy(body.KeepPolicy) {
+ 		http.Error(w, "keepPolicy must be -1 (manual), 0 (all), 1 or 3", http.StatusBadRequest)
+ 		return
+ 	}
+@@ -142,6 +149,13 @@ func (api *Router) updatePodcast(w http.ResponseWriter, r *http.Request) {
+ 		http.Error(w, err.Error(), http.StatusInternalServerError)
+ 		return
+ 	}
++	if body.Prune {
++		if _, err := api.podcasts.ApplyPrune(r.Context(), id, body.KeepPolicy); err != nil {
++			log.Error(r.Context(), "Seer: pruning podcast episodes failed", err)
++			http.Error(w, "internal error", http.StatusInternalServerError)
++			return
++		}
++	}
+ 	writeJSON(w, http.StatusOK, updated)
+ }
+ 
+@@ -216,3 +230,33 @@ func (api *Router) streamEpisode(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	http.ServeFile(w, r, ep.FilePath)
+ }
++
++// validKeepPolicy accepts the retention modes: manual, keep all, keep the last 1 or 3.
++func validKeepPolicy(v int) bool {
++	return v == seer.KeepManual || v == 0 || v == 1 || v == 3
++}
++
++// prunePreview lists the downloads a new retention would delete, so the user can confirm first.
++func (api *Router) prunePreview(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	id := chi.URLParam(r, "id")
++	ch, _, err := api.podcasts.Get(r.Context(), id)
++	if err != nil || (!user.IsAdmin && ch.UserID != user.ID) {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	keep, err := strconv.Atoi(r.URL.Query().Get("keepPolicy"))
++	if err != nil || !validKeepPolicy(keep) {
++		http.Error(w, "keepPolicy must be -1, 0, 1 or 3", http.StatusBadRequest)
++		return
++	}
++	plan, err := api.podcasts.PrunePlan(r.Context(), id, keep)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	if plan == nil {
++		plan = []seer.PodcastEpisode{}
++	}
++	writeJSON(w, http.StatusOK, plan)
++}
+diff --git a/server/seerapi/podcast_test.go b/server/seerapi/podcast_test.go
+index 09167d0..2aa46c7 100644
+--- a/server/seerapi/podcast_test.go
++++ b/server/seerapi/podcast_test.go
+@@ -81,6 +81,12 @@ func (f *fakePodcasts) Subscribe(ctx context.Context, userID, rawURL, sourceType
+ 	return c, nil
+ }
+ 
++func (f *fakePodcasts) PrunePlan(ctx context.Context, id string, keepPolicy int) ([]seer.PodcastEpisode, error) {
++	return []seer.PodcastEpisode{{ID: "old", Title: "Antigo"}}, nil
++}
++func (f *fakePodcasts) ApplyPrune(ctx context.Context, id string, keepPolicy int) (int, error) {
++	return 1, nil
++}
+ func (f *fakePodcasts) Update(ctx context.Context, id string, keepPolicy int, autoDownload bool) (*seer.PodcastChannel, error) {
+ 	c, ok := f.channels[id]
+ 	if !ok {
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 130eae9..97aa4db 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -191,6 +191,7 @@ func (api *Router) routes() http.Handler {
+ 				r.Delete("/episodes/{epId}", api.deleteEpisode)
+ 				r.Route("/{id}", func(r chi.Router) {
+ 					r.Get("/", api.getPodcast)
++					r.Get("/prune-preview", api.prunePreview)
+ 					r.Put("/", api.updatePodcast)
+ 					r.Delete("/", api.deletePodcast)
+ 					r.Post("/refresh", api.refreshPodcast)

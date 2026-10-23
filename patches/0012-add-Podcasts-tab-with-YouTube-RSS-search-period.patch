@@ -1,0 +1,4247 @@
+From 0819f3476a06102b11f3d8421be70adc1d653484 Mon Sep 17 00:00:00 2001
+From: Guitarr <noreply@example.com>
+Date: Sun, 11 Oct 2026 11:41:27 -0300
+Subject: [PATCH] Seer: add Podcasts tab with YouTube/RSS search, periodic
+ downloads and retention policy
+
+---
+ core/seer/podcast.go                          | 667 ++++++++++++++++++
+ core/seer/podcast_feed.go                     | 460 ++++++++++++
+ core/seer/podcast_store.go                    | 331 +++++++++
+ core/seer/podcast_test.go                     | 218 ++++++
+ core/seer/seer.go                             |   9 +-
+ .../20261011180000_create_podcast_tables.sql  |  45 ++
+ resources/i18n/pt-br.json                     |  33 +
+ server/seerapi/podcast.go                     | 214 ++++++
+ server/seerapi/podcast_test.go                | 169 +++++
+ server/seerapi/seerapi.go                     |  50 +-
+ ui/src/App.jsx                                |   2 +
+ ui/src/i18n/en.json                           |  33 +
+ ui/src/podcast/AddPodcastDialog.jsx           | 467 ++++++++++++
+ ui/src/podcast/PodcastList.jsx                | 365 ++++++++++
+ ui/src/podcast/PodcastShow.jsx                | 636 +++++++++++++++++
+ ui/src/podcast/index.jsx                      |  16 +
+ ui/src/reducers/playerReducer.js              |  10 +-
+ ui/src/seer/SearchView.jsx                    | 171 ++++-
+ ui/src/seer/SeerPage.jsx                      |  18 +-
+ ui/src/seer/api.js                            |  41 ++
+ 20 files changed, 3917 insertions(+), 38 deletions(-)
+ create mode 100644 core/seer/podcast.go
+ create mode 100644 core/seer/podcast_feed.go
+ create mode 100644 core/seer/podcast_store.go
+ create mode 100644 core/seer/podcast_test.go
+ create mode 100644 db/migrations/20261011180000_create_podcast_tables.sql
+ create mode 100644 server/seerapi/podcast.go
+ create mode 100644 server/seerapi/podcast_test.go
+ create mode 100644 ui/src/podcast/AddPodcastDialog.jsx
+ create mode 100644 ui/src/podcast/PodcastList.jsx
+ create mode 100644 ui/src/podcast/PodcastShow.jsx
+ create mode 100644 ui/src/podcast/index.jsx
+
+diff --git a/core/seer/podcast.go b/core/seer/podcast.go
+new file mode 100644
+index 00000000..d7eca9b5
+--- /dev/null
++++ b/core/seer/podcast.go
+@@ -0,0 +1,667 @@
++package seer
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/server/events"
++)
++
++type PodcastService struct {
++	store      *PodcastStore
++	destFolder func() string
++	lib        *library
++	broker     events.Broker
++	ffmpeg     string
++	ytdlp      string
++
++	mu      sync.Mutex
++	syncing map[string]bool
++}
++
++func NewPodcastService(store *PodcastStore, destFolder func() string, lib *library, broker events.Broker, ffmpeg, ytdlp string) *PodcastService {
++	if ffmpeg == "" {
++		ffmpeg = "ffmpeg"
++	}
++	if ytdlp == "" {
++		ytdlp = "yt-dlp"
++	}
++	return &PodcastService{
++		store:      store,
++		destFolder: destFolder,
++		lib:        lib,
++		broker:     broker,
++		ffmpeg:     ffmpeg,
++		ytdlp:      ytdlp,
++		syncing:    make(map[string]bool),
++	}
++}
++
++func (s *PodcastService) notifyUI() {
++	if s.broker != nil {
++		s.broker.SendBroadcastMessage(context.Background(), (&events.RefreshResource{}).With("podcast"))
++		s.broker.SendBroadcastMessage(context.Background(), (&events.RefreshResource{}).With("seer"))
++	}
++}
++
++func (s *PodcastService) randomID(prefix string) string {
++	b := make([]byte, 8)
++	_, _ = rand.Read(b)
++	return prefix + "_" + hex.EncodeToString(b)
++}
++
++func (s *PodcastService) podcastsDir() (string, error) {
++	root := s.destFolder()
++	if root == "" {
++		return "", errors.New("destination folder is not configured")
++	}
++	dir := filepath.Join(root, "Podcasts")
++	if err := os.MkdirAll(dir, 0755); err != nil {
++		return "", fmt.Errorf("creating podcasts directory: %w", err)
++	}
++	return dir, nil
++}
++
++// Subscribe subscribes to a podcast feed and triggers the initial sync.
++func (s *PodcastService) Subscribe(ctx context.Context, userID, rawURL, sourceType string, keepPolicy int, autoDownload bool) (*PodcastChannel, error) {
++	rawURL = strings.TrimSpace(rawURL)
++	if rawURL == "" {
++		return nil, errors.New("podcast URL is required")
++	}
++	if sourceType == "" {
++		if IsYouTubeURL(rawURL) {
++			sourceType = "youtube"
++		} else {
++			sourceType = "rss"
++		}
++	}
++
++	feed, err := FetchFeed(ctx, rawURL, s.ytdlp)
++	if err != nil {
++		return nil, fmt.Errorf("failed to fetch podcast feed: %w", err)
++	}
++
++	title := cmpStr(feed.Title, "Podcast")
++	ch := &PodcastChannel{
++		ID:           s.randomID("pchan"),
++		UserID:       userID,
++		Title:        title,
++		Author:       cmpStr(feed.Author, "Unknown"),
++		Description:  feed.Description,
++		SourceType:   cmpStr(feed.SourceType, sourceType),
++		URL:          cmpStr(feed.URL, rawURL),
++		FeedURL:      rawURL,
++		ImageURL:     feed.ImageURL,
++		KeepPolicy:   keepPolicy,
++		AutoDownload: autoDownload,
++	}
++
++	if err := s.store.CreateChannel(ctx, ch); err != nil {
++		return nil, fmt.Errorf("saving podcast channel: %w", err)
++	}
++
++	for _, ep := range feed.Episodes {
++		episode := &PodcastEpisode{
++			ID:          s.randomID("pep"),
++			ChannelID:   ch.ID,
++			GUID:        ep.GUID,
++			Title:       cmpStr(ep.Title, "Untitled Episode"),
++			Description: ep.Description,
++			AudioURL:    ep.AudioURL,
++			ImageURL:    cmpStr(ep.ImageURL, ch.ImageURL),
++			PublishedAt: ep.PublishedAt,
++			Duration:    ep.Duration,
++			Status:      "pending",
++		}
++		_ = s.store.CreateEpisode(ctx, episode)
++	}
++
++	s.notifyUI()
++
++	// Asynchronously run initial sync/download
++	go func() {
++		bgCtx := context.Background()
++		if err := s.SyncChannel(bgCtx, ch.ID); err != nil {
++			log.Error(bgCtx, "Podcast initial sync failed", "channelId", ch.ID, err)
++		}
++	}()
++
++	return s.store.GetChannel(ctx, ch.ID)
++}
++
++// SyncChannel refreshes a channel's feed and enforces download & retention policies.
++func (s *PodcastService) SyncChannel(ctx context.Context, channelID string) error {
++	s.mu.Lock()
++	if s.syncing[channelID] {
++		s.mu.Unlock()
++		return nil // already syncing
++	}
++	s.syncing[channelID] = true
++	s.mu.Unlock()
++
++	defer func() {
++		s.mu.Lock()
++		delete(s.syncing, channelID)
++		s.mu.Unlock()
++		s.notifyUI()
++	}()
++
++	ch, err := s.store.GetChannel(ctx, channelID)
++	if err != nil {
++		return err
++	}
++
++	feed, err := FetchFeed(ctx, ch.FeedURL, s.ytdlp)
++	now := time.Now().UTC()
++	ch.LastCheckedAt = &now
++	if err != nil {
++		ch.LastError = err.Error()
++		_ = s.store.UpdateChannel(ctx, ch)
++		return err
++	}
++
++	ch.LastError = ""
++	if feed.Title != "" {
++		ch.Title = feed.Title
++	}
++	if feed.Author != "" {
++		ch.Author = feed.Author
++	}
++	if feed.ImageURL != "" {
++		ch.ImageURL = feed.ImageURL
++	}
++	if feed.Description != "" {
++		ch.Description = feed.Description
++	}
++	_ = s.store.UpdateChannel(ctx, ch)
++
++	// Insert any new episodes from the feed
++	for _, ep := range feed.Episodes {
++		existing, err := s.store.GetEpisodeByGUID(ctx, ch.ID, ep.GUID)
++		if errors.Is(err, ErrEpisodeNotFound) || existing == nil {
++			newEp := &PodcastEpisode{
++				ID:          s.randomID("pep"),
++				ChannelID:   ch.ID,
++				GUID:        ep.GUID,
++				Title:       cmpStr(ep.Title, "Untitled Episode"),
++				Description: ep.Description,
++				AudioURL:    ep.AudioURL,
++				ImageURL:    cmpStr(ep.ImageURL, ch.ImageURL),
++				PublishedAt: ep.PublishedAt,
++				Duration:    ep.Duration,
++				Status:      "pending",
++			}
++			_ = s.store.CreateEpisode(ctx, newEp)
++		}
++	}
++
++	// Now enforce retention & download according to KeepPolicy
++	return s.processChannelEpisodes(ctx, ch)
++}
++
++// processChannelEpisodes downloads episodes matching keep policy and deletes older ones.
++func (s *PodcastService) processChannelEpisodes(ctx context.Context, ch *PodcastChannel) error {
++	allEps, err := s.store.ListEpisodes(ctx, ch.ID)
++	if err != nil {
++		return err
++	}
++	if len(allEps) == 0 {
++		return nil
++	}
++
++	// Sort newest first
++	sort.SliceStable(allEps, func(i, j int) bool {
++		ti, tj := allEps[i].PublishedAt, allEps[j].PublishedAt
++		if ti == nil {
++			return false
++		}
++		if tj == nil {
++			return true
++		}
++		return ti.After(*tj)
++	})
++
++	var toDownload []*PodcastEpisode
++
++	switch ch.KeepPolicy {
++	case 1:
++		// Keep only the latest 1 episode
++		if len(allEps) > 0 {
++			toDownload = append(toDownload, &allEps[0])
++		}
++	case 3:
++		// Keep latest 3 episodes
++		limit := 3
++		if len(allEps) < limit {
++			limit = len(allEps)
++		}
++		for i := 0; i < limit; i++ {
++			toDownload = append(toDownload, &allEps[i])
++		}
++	default:
++		// 0 = keep all / download all pending
++		for i := range allEps {
++			toDownload = append(toDownload, &allEps[i])
++		}
++	}
++
++	// Download target episodes if not yet downloaded
++	var downloadedAny bool
++	for _, ep := range toDownload {
++		if ep.Status != "downloaded" {
++			if err := s.downloadEpisode(ctx, ch, ep); err != nil {
++				log.Warn(ctx, "Failed downloading episode", "channel", ch.Title, "episode", ep.Title, err)
++			} else {
++				downloadedAny = true
++			}
++		}
++	}
++
++	// Prune older downloaded episodes if keepPolicy > 0
++	if ch.KeepPolicy > 0 {
++		downloaded, err := s.store.ListDownloadedEpisodes(ctx, ch.ID)
++		if err == nil && len(downloaded) > ch.KeepPolicy {
++			// downloaded is sorted newest first
++			for i := ch.KeepPolicy; i < len(downloaded); i++ {
++				ep := downloaded[i]
++				if ep.FilePath != "" {
++					_ = os.Remove(ep.FilePath)
++				}
++				ep.Status = "deleted"
++				ep.FilePath = ""
++				ep.FileSize = 0
++				_ = s.store.UpdateEpisode(ctx, &ep)
++			}
++		}
++	}
++
++	if downloadedAny && s.lib != nil {
++		_ = s.lib.Rescan(ctx)
++	}
++
++	return nil
++}
++
++// DownloadEpisode downloads a single episode manually.
++func (s *PodcastService) DownloadEpisode(ctx context.Context, episodeID string) error {
++	ep, err := s.store.GetEpisode(ctx, episodeID)
++	if err != nil {
++		return err
++	}
++	ch, err := s.store.GetChannel(ctx, ep.ChannelID)
++	if err != nil {
++		return err
++	}
++	if err := s.downloadEpisode(ctx, ch, ep); err != nil {
++		return err
++	}
++	if s.lib != nil {
++		_ = s.lib.Rescan(ctx)
++	}
++	s.notifyUI()
++	return nil
++}
++
++func (s *PodcastService) downloadEpisode(ctx context.Context, ch *PodcastChannel, ep *PodcastEpisode) error {
++	podDir, err := s.podcastsDir()
++	if err != nil {
++		return err
++	}
++
++	channelFolder := filepath.Join(podDir, sanitizeFilename(ch.Title))
++	if err := os.MkdirAll(channelFolder, 0755); err != nil {
++		return fmt.Errorf("creating show directory: %w", err)
++	}
++
++	datePrefix := ""
++	if ep.PublishedAt != nil {
++		datePrefix = ep.PublishedAt.Format("2006-01-02") + " - "
++	}
++	baseName := datePrefix + sanitizeFilename(ep.Title)
++
++	ep.Status = "downloading"
++	_ = s.store.UpdateEpisode(ctx, ep)
++	s.notifyUI()
++
++	var destPath string
++	if ch.SourceType == "youtube" || IsYouTubeURL(ep.AudioURL) {
++		destPath, err = s.downloadYouTubeAudio(ctx, ch, ep, channelFolder, baseName)
++	} else {
++		destPath, err = s.downloadRSSAudio(ctx, ch, ep, channelFolder, baseName)
++	}
++
++	if err != nil {
++		ep.Status = "error"
++		ep.Error = err.Error()
++		_ = s.store.UpdateEpisode(ctx, ep)
++		return err
++	}
++
++	fi, statErr := os.Stat(destPath)
++	var size int64
++	if statErr == nil {
++		size = fi.Size()
++	}
++
++	ep.Status = "downloaded"
++	ep.FilePath = destPath
++	ep.FileSize = size
++	ep.Error = ""
++	_ = s.store.UpdateEpisode(ctx, ep)
++	return nil
++}
++
++func (s *PodcastService) downloadRSSAudio(ctx context.Context, ch *PodcastChannel, ep *PodcastEpisode, dir, baseName string) (string, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep.AudioURL, nil)
++	if err != nil {
++		return "", err
++	}
++	req.Header.Set("User-Agent", "Navidrome-Seer/1.0 (+https://www.navidrome.org)")
++
++	client := &http.Client{Timeout: 10 * time.Minute}
++	resp, err := client.Do(req)
++	if err != nil {
++		return "", fmt.Errorf("downloading audio stream: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return "", fmt.Errorf("audio server returned HTTP %d", resp.StatusCode)
++	}
++
++	ext := ".mp3"
++	if ct := resp.Header.Get("Content-Type"); ct != "" {
++		switch {
++		case strings.Contains(ct, "m4a") || strings.Contains(ct, "mp4"):
++			ext = ".m4a"
++		case strings.Contains(ct, "ogg") || strings.Contains(ct, "opus"):
++			ext = ".opus"
++		case strings.Contains(ct, "aac"):
++			ext = ".aac"
++		}
++	} else if u, err := url.Parse(ep.AudioURL); err == nil {
++		if pathExt := filepath.Ext(u.Path); pathExt != "" && len(pathExt) <= 5 {
++			ext = pathExt
++		}
++	}
++
++	partPath := filepath.Join(dir, baseName+".downloading"+ext)
++	finalPath := filepath.Join(dir, baseName+ext)
++
++	f, err := os.Create(partPath)
++	if err != nil {
++		return "", fmt.Errorf("creating temp audio file: %w", err)
++	}
++
++	_, copyErr := io.Copy(f, resp.Body)
++	_ = f.Close()
++	if copyErr != nil {
++		_ = os.Remove(partPath)
++		return "", fmt.Errorf("writing audio file: %w", copyErr)
++	}
++
++	// Tag the file using ffmpeg if available
++	_ = s.tagAudioFile(ctx, partPath, ch.Title, ch.Author, ep.Title, ep.PublishedAt)
++
++	if err := os.Rename(partPath, finalPath); err != nil {
++		_ = os.Remove(partPath)
++		return "", fmt.Errorf("finalizing audio file: %w", err)
++	}
++
++	return finalPath, nil
++}
++
++func (s *PodcastService) downloadYouTubeAudio(ctx context.Context, ch *PodcastChannel, ep *PodcastEpisode, dir, baseName string) (string, error) {
++	outTpl := filepath.Join(dir, baseName+".%(ext)s")
++	args := []string{
++		"-x", "--audio-format", "mp3",
++		"--embed-thumbnail",
++		"--no-playlist",
++		"--no-warnings",
++		"--socket-timeout", "20",
++		"--print", "after_move:filepath",
++		"-o", outTpl,
++		"--", ep.AudioURL,
++	}
++
++	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
++	defer cancel()
++
++	cmd := exec.CommandContext(ctx, s.ytdlp, args...)
++	out, err := cmd.CombinedOutput()
++	if err != nil {
++		return "", fmt.Errorf("yt-dlp download failed: %w: %s", err, strings.TrimSpace(string(out)))
++	}
++
++	var producedPath string
++	for _, line := range strings.Split(string(out), "\n") {
++		p := strings.TrimSpace(line)
++		if p != "" && !strings.HasPrefix(p, "[") {
++			producedPath = p
++			break
++		}
++	}
++	if producedPath == "" {
++		// Fallback to checking expected file
++		expected := filepath.Join(dir, baseName+".mp3")
++		if _, err := os.Stat(expected); err == nil {
++			producedPath = expected
++		} else {
++			return "", fmt.Errorf("yt-dlp produced no output file: %s", strings.TrimSpace(string(out)))
++		}
++	}
++
++	// Tag metadata
++	_ = s.tagAudioFile(ctx, producedPath, ch.Title, ch.Author, ep.Title, ep.PublishedAt)
++
++	return producedPath, nil
++}
++
++func (s *PodcastService) tagAudioFile(ctx context.Context, path, showTitle, author, epTitle string, pubDate *time.Time) error {
++	tmp := strings.TrimSuffix(path, filepath.Ext(path)) + ".tagging" + filepath.Ext(path)
++	tags := []string{
++		"title=" + epTitle,
++		"artist=" + author,
++		"album=" + showTitle,
++		"album_artist=" + author,
++		"genre=Podcast",
++	}
++	if pubDate != nil {
++		tags = append(tags, fmt.Sprintf("date=%d", pubDate.Year()))
++	}
++
++	args := []string{"-y", "-v", "error", "-i", path, "-map", "0", "-c", "copy"}
++	for _, t := range tags {
++		args = append(args, "-metadata", t, "-metadata:s:a:0", t)
++	}
++	args = append(args, tmp)
++
++	cmd := exec.CommandContext(ctx, s.ffmpeg, args...)
++	if err := cmd.Run(); err != nil {
++		_ = os.Remove(tmp)
++		return err
++	}
++	return os.Rename(tmp, path)
++}
++
++// DeleteEpisodeFile removes the episode audio file from disk.
++func (s *PodcastService) DeleteEpisodeFile(ctx context.Context, episodeID string) error {
++	ep, err := s.store.GetEpisode(ctx, episodeID)
++	if err != nil {
++		return err
++	}
++	if ep.FilePath != "" {
++		_ = os.Remove(ep.FilePath)
++	}
++	ep.Status = "deleted"
++	ep.FilePath = ""
++	ep.FileSize = 0
++	if err := s.store.UpdateEpisode(ctx, ep); err != nil {
++		return err
++	}
++	if s.lib != nil {
++		_ = s.lib.Rescan(ctx)
++	}
++	s.notifyUI()
++	return nil
++}
++
++// DeleteChannel unsubscribes from a channel and optionally removes downloaded files.
++func (s *PodcastService) DeleteChannel(ctx context.Context, channelID string, deleteFiles bool) error {
++	ch, err := s.store.GetChannel(ctx, channelID)
++	if err != nil {
++		return err
++	}
++
++	if deleteFiles {
++		podDir, err := s.podcastsDir()
++		if err == nil {
++			channelFolder := filepath.Join(podDir, sanitizeFilename(ch.Title))
++			_ = os.RemoveAll(channelFolder)
++		}
++	}
++
++	if err := s.store.DeleteChannel(ctx, channelID); err != nil {
++		return err
++	}
++
++	if deleteFiles && s.lib != nil {
++		_ = s.lib.Rescan(ctx)
++	}
++	s.notifyUI()
++	return nil
++}
++
++// RefreshAll refreshes all channels with auto_download enabled.
++func (s *PodcastService) RefreshAll(ctx context.Context) error {
++	channels, err := s.store.ListChannels(ctx, "")
++	if err != nil {
++		return err
++	}
++	for _, ch := range channels {
++		if ch.AutoDownload {
++			_ = s.SyncChannel(ctx, ch.ID)
++		}
++	}
++	return nil
++}
++
++// Start launches the periodic background worker for automatic weekly / periodic checks.
++func (s *PodcastService) Start(ctx context.Context) {
++	log.Info(ctx, "Starting Seer podcast scheduler")
++	go func() {
++		// Run initial check after 2 minutes
++		select {
++		case <-ctx.Done():
++			return
++		case <-time.After(2 * time.Minute):
++			_ = s.RefreshAll(ctx)
++		}
++
++		// Periodic ticker every 6 hours
++		ticker := time.NewTicker(6 * time.Hour)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-ctx.Done():
++				return
++			case <-ticker.C:
++				channels, err := s.store.ListChannels(ctx, "")
++				if err != nil {
++					continue
++				}
++				for _, ch := range channels {
++					if !ch.AutoDownload {
++						continue
++					}
++					// If not checked in the last 24h, refresh
++					if ch.LastCheckedAt == nil || time.Since(*ch.LastCheckedAt) > 24*time.Hour {
++						_ = s.SyncChannel(ctx, ch.ID)
++					}
++				}
++			}
++		}
++	}()
++}
++
++// Search searches podcast directories (Apple Podcasts and/or YouTube).
++func (s *PodcastService) Search(ctx context.Context, query, source string, limit int) ([]PodcastSearchResult, error) {
++	query = strings.TrimSpace(query)
++	if query == "" {
++		return []PodcastSearchResult{}, nil
++	}
++	var results []PodcastSearchResult
++	switch strings.ToLower(source) {
++	case "youtube":
++		return SearchYouTubePodcasts(ctx, query, limit, s.ytdlp)
++	case "rss", "itunes":
++		return SearchITunes(ctx, query, limit)
++	default:
++		// Search both
++		itunesRes, err1 := SearchITunes(ctx, query, limit)
++		if err1 == nil {
++			results = append(results, itunesRes...)
++		}
++		ytRes, err2 := SearchYouTubePodcasts(ctx, query, 5, s.ytdlp)
++		if err2 == nil {
++			results = append(results, ytRes...)
++		}
++		if err1 != nil && err2 != nil && len(results) == 0 {
++			return nil, fmt.Errorf("search failed: %v / %v", err1, err2)
++		}
++		return results, nil
++	}
++}
++
++// List returns channels for a user, or all channels if userID is empty.
++func (s *PodcastService) List(ctx context.Context, userID string) ([]PodcastChannel, error) {
++	return s.store.ListChannels(ctx, userID)
++}
++
++// Get returns the channel and its episodes.
++func (s *PodcastService) Get(ctx context.Context, id string) (*PodcastChannel, []PodcastEpisode, error) {
++	ch, err := s.store.GetChannel(ctx, id)
++	if err != nil {
++		return nil, nil, err
++	}
++	eps, err := s.store.ListEpisodes(ctx, id)
++	if err != nil {
++		return nil, nil, err
++	}
++	return ch, eps, nil
++}
++
++// Update updates channel settings.
++func (s *PodcastService) Update(ctx context.Context, id string, keepPolicy int, autoDownload bool) (*PodcastChannel, error) {
++	ch, err := s.store.GetChannel(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	ch.KeepPolicy = keepPolicy
++	ch.AutoDownload = autoDownload
++	if err := s.store.UpdateChannel(ctx, ch); err != nil {
++		return nil, err
++	}
++	s.notifyUI()
++	return ch, nil
++}
++
++// GetEpisode returns an episode by its ID.
++func (s *PodcastService) GetEpisode(ctx context.Context, id string) (*PodcastEpisode, error) {
++	return s.store.GetEpisode(ctx, id)
++}
++
+diff --git a/core/seer/podcast_feed.go b/core/seer/podcast_feed.go
+new file mode 100644
+index 00000000..b6c1b474
+--- /dev/null
++++ b/core/seer/podcast_feed.go
+@@ -0,0 +1,460 @@
++package seer
++
++import (
++	"context"
++	"encoding/json"
++	"encoding/xml"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os/exec"
++	"strconv"
++	"strings"
++	"time"
++)
++
++type PodcastSearchResult struct {
++	Title       string `json:"title"`
++	Author      string `json:"author"`
++	FeedURL     string `json:"feedUrl"`
++	URL         string `json:"url"`
++	ImageURL    string `json:"imageUrl"`
++	SourceType  string `json:"sourceType"` // "rss" or "youtube"
++	Description string `json:"description"`
++}
++
++type ParsedFeed struct {
++	Title       string
++	Author      string
++	Description string
++	URL         string
++	FeedURL     string
++	ImageURL    string
++	SourceType  string
++	Episodes    []ParsedEpisode
++}
++
++type ParsedEpisode struct {
++	GUID        string
++	Title       string
++	Description string
++	AudioURL    string
++	ImageURL    string
++	PublishedAt *time.Time
++	Duration    int // seconds
++}
++
++// RSS XML structs
++type rssFeed struct {
++	XMLName xml.Name   `xml:"rss"`
++	Channel rssChannel `xml:"channel"`
++}
++
++type rssChannel struct {
++	Title        string         `xml:"title"`
++	Link         string         `xml:"link"`
++	Description  string         `xml:"description"`
++	Author       string         `xml:"author"`
++	ItunesAuthor string         `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd author"`
++	Image        rssImage       `xml:"image"`
++	ItunesImage  rssItunesImage `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd image"`
++	Items        []rssItem      `xml:"item"`
++}
++
++type rssImage struct {
++	URL string `xml:"url"`
++}
++
++type rssItunesImage struct {
++	Href string `xml:"href,attr"`
++}
++
++type rssItem struct {
++	Title          string         `xml:"title"`
++	Link           string         `xml:"link"`
++	Description    string         `xml:"description"`
++	ItunesSummary  string         `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd summary"`
++	GUID           string         `xml:"guid"`
++	PubDate        string         `xml:"pubDate"`
++	Enclosure      rssEnclosure   `xml:"enclosure"`
++	ItunesDuration string         `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd duration"`
++	ItunesImage    rssItunesImage `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd image"`
++}
++
++type rssEnclosure struct {
++	URL    string `xml:"url,attr"`
++	Length string `xml:"length,attr"`
++	Type   string `xml:"type,attr"`
++}
++
++// FetchFeed parses an RSS feed URL or YouTube channel/playlist URL.
++func FetchFeed(ctx context.Context, feedURL, ytdlpBin string) (*ParsedFeed, error) {
++	if IsYouTubeURL(feedURL) {
++		return fetchYouTubeFeed(ctx, feedURL, ytdlpBin)
++	}
++	return fetchRSSFeed(ctx, feedURL)
++}
++
++func IsYouTubeURL(rawURL string) bool {
++	lower := strings.ToLower(rawURL)
++	return strings.Contains(lower, "youtube.com") || strings.Contains(lower, "youtu.be")
++}
++
++func fetchRSSFeed(ctx context.Context, feedURL string) (*ParsedFeed, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
++	if err != nil {
++		return nil, fmt.Errorf("invalid feed URL: %w", err)
++	}
++	req.Header.Set("User-Agent", "Navidrome-Seer/1.0 (+https://www.navidrome.org)")
++	req.Header.Set("Accept", "application/rss+xml, application/xml, text/xml, */*")
++
++	client := &http.Client{Timeout: 30 * time.Second}
++	resp, err := client.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("fetching feed failed: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		return nil, fmt.Errorf("feed server returned HTTP %d", resp.StatusCode)
++	}
++
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10MB limit
++	if err != nil {
++		return nil, fmt.Errorf("reading feed body failed: %w", err)
++	}
++
++	var rss rssFeed
++	if err := xml.Unmarshal(body, &rss); err != nil {
++		return nil, fmt.Errorf("parsing RSS XML: %w", err)
++	}
++
++	ch := rss.Channel
++	author := cmpStr(ch.ItunesAuthor, ch.Author)
++	imageURL := cmpStr(ch.ItunesImage.Href, ch.Image.URL)
++
++	feed := &ParsedFeed{
++		Title:       strings.TrimSpace(ch.Title),
++		Author:      strings.TrimSpace(author),
++		Description: strings.TrimSpace(ch.Description),
++		URL:         strings.TrimSpace(ch.Link),
++		FeedURL:     feedURL,
++		ImageURL:    strings.TrimSpace(imageURL),
++		SourceType:  "rss",
++	}
++
++	for _, it := range ch.Items {
++		audioURL := strings.TrimSpace(it.Enclosure.URL)
++		if audioURL == "" {
++			continue // skip items with no media enclosure
++		}
++		guid := strings.TrimSpace(it.GUID)
++		if guid == "" {
++			guid = audioURL
++		}
++		desc := cmpStr(strings.TrimSpace(it.Description), strings.TrimSpace(it.ItunesSummary))
++		pubDate := parseFeedDate(it.PubDate)
++		dur := parseFeedDuration(it.ItunesDuration)
++		epImg := strings.TrimSpace(it.ItunesImage.Href)
++		if epImg == "" {
++			epImg = feed.ImageURL
++		}
++
++		feed.Episodes = append(feed.Episodes, ParsedEpisode{
++			GUID:        guid,
++			Title:       strings.TrimSpace(it.Title),
++			Description: desc,
++			AudioURL:    audioURL,
++			ImageURL:    epImg,
++			PublishedAt: pubDate,
++			Duration:    dur,
++		})
++	}
++
++	return feed, nil
++}
++
++func fetchYouTubeFeed(ctx context.Context, ytURL, ytdlpBin string) (*ParsedFeed, error) {
++	if ytdlpBin == "" {
++		ytdlpBin = "yt-dlp"
++	}
++	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
++	defer cancel()
++
++	args := []string{"--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "20", "--", ytURL}
++	cmd := exec.CommandContext(ctx, ytdlpBin, args...)
++	out, err := cmd.Output()
++	if err != nil {
++		return nil, fmt.Errorf("yt-dlp failed to inspect URL: %w", err)
++	}
++
++	var ytInfo struct {
++		Title       string `json:"title"`
++		Uploader    string `json:"uploader"`
++		Channel     string `json:"channel"`
++		Description string `json:"description"`
++		WebpageURL  string `json:"webpage_url"`
++		Thumbnails  []struct {
++			URL string `json:"url"`
++		} `json:"thumbnails"`
++		Entries []struct {
++			ID          string   `json:"id"`
++			Title       string   `json:"title"`
++			Description string   `json:"description"`
++			URL         string   `json:"url"`
++			WebpageURL  string   `json:"webpage_url"`
++			Duration    float64  `json:"duration"`
++			UploadDate  string   `json:"upload_date"` // YYYYMMDD
++			Thumbnails  []struct {
++				URL string `json:"url"`
++			} `json:"thumbnails"`
++		} `json:"entries"`
++	}
++
++	if err := json.Unmarshal(out, &ytInfo); err != nil {
++		return nil, fmt.Errorf("unmarshaling yt-dlp json: %w", err)
++	}
++
++	author := cmpStr(ytInfo.Channel, ytInfo.Uploader)
++	var img string
++	if len(ytInfo.Thumbnails) > 0 {
++		img = ytInfo.Thumbnails[len(ytInfo.Thumbnails)-1].URL
++	}
++
++	feed := &ParsedFeed{
++		Title:       strings.TrimSpace(ytInfo.Title),
++		Author:      strings.TrimSpace(author),
++		Description: strings.TrimSpace(ytInfo.Description),
++		URL:         cmpStr(ytInfo.WebpageURL, ytURL),
++		FeedURL:     ytURL,
++		ImageURL:    img,
++		SourceType:  "youtube",
++	}
++
++	for _, e := range ytInfo.Entries {
++		epURL := cmpStr(e.WebpageURL, e.URL)
++		if epURL == "" && e.ID != "" {
++			epURL = "https://www.youtube.com/watch?v=" + e.ID
++		}
++		if epURL == "" {
++			continue
++		}
++		guid := cmpStr(e.ID, epURL)
++		pubDate := parseYouTubeDate(e.UploadDate)
++		var epImg string
++		if len(e.Thumbnails) > 0 {
++			epImg = e.Thumbnails[len(e.Thumbnails)-1].URL
++		} else {
++			epImg = feed.ImageURL
++		}
++
++		feed.Episodes = append(feed.Episodes, ParsedEpisode{
++			GUID:        guid,
++			Title:       strings.TrimSpace(e.Title),
++			Description: strings.TrimSpace(e.Description),
++			AudioURL:    epURL,
++			ImageURL:    epImg,
++			PublishedAt: pubDate,
++			Duration:    int(e.Duration),
++		})
++	}
++
++	return feed, nil
++}
++
++// SearchITunes queries Apple's public podcast directory.
++func SearchITunes(ctx context.Context, term string, limit int) ([]PodcastSearchResult, error) {
++	if limit <= 0 || limit > 50 {
++		limit = 15
++	}
++	endpoint := fmt.Sprintf("https://itunes.apple.com/search?term=%s&media=podcast&limit=%d",
++		url.QueryEscape(strings.TrimSpace(term)), limit)
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
++	if err != nil {
++		return nil, err
++	}
++	client := &http.Client{Timeout: 10 * time.Second}
++	resp, err := client.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("iTunes search request failed: %w", err)
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("iTunes returned HTTP %d", resp.StatusCode)
++	}
++
++	var res struct {
++		Results []struct {
++			ArtistName       string `json:"artistName"`
++			CollectionName   string `json:"collectionName"`
++			FeedURL          string `json:"feedUrl"`
++			CollectionViewURL string `json:"collectionViewUrl"`
++			ArtworkURL600    string `json:"artworkUrl600"`
++			PrimaryGenreName string `json:"primaryGenreName"`
++		} `json:"results"`
++	}
++
++	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
++		return nil, fmt.Errorf("decoding iTunes response: %w", err)
++	}
++
++	var results []PodcastSearchResult
++	for _, it := range res.Results {
++		if it.FeedURL == "" {
++			continue
++		}
++		results = append(results, PodcastSearchResult{
++			Title:       strings.TrimSpace(it.CollectionName),
++			Author:      strings.TrimSpace(it.ArtistName),
++			FeedURL:     strings.TrimSpace(it.FeedURL),
++			URL:         strings.TrimSpace(it.CollectionViewURL),
++			ImageURL:    strings.TrimSpace(it.ArtworkURL600),
++			SourceType:  "rss",
++			Description: strings.TrimSpace(it.PrimaryGenreName),
++		})
++	}
++	return results, nil
++}
++
++// SearchYouTubePodcasts searches YouTube via yt-dlp.
++func SearchYouTubePodcasts(ctx context.Context, term string, limit int, ytdlpBin string) ([]PodcastSearchResult, error) {
++	if ytdlpBin == "" {
++		ytdlpBin = "yt-dlp"
++	}
++	if limit <= 0 || limit > 20 {
++		limit = 6
++	}
++	query := fmt.Sprintf("ytsearch%d:%s podcast", limit, strings.TrimSpace(term))
++	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
++	defer cancel()
++
++	cmd := exec.CommandContext(ctx, ytdlpBin, "--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "20", "--", query)
++	out, err := cmd.Output()
++	if err != nil {
++		return nil, fmt.Errorf("yt-dlp search failed: %w", err)
++	}
++
++	var res struct {
++		Entries []struct {
++			ID         string `json:"id"`
++			Title      string `json:"title"`
++			Channel    string `json:"channel"`
++			Uploader   string `json:"uploader"`
++			WebpageURL string `json:"webpage_url"`
++			Thumbnails []struct {
++				URL string `json:"url"`
++			} `json:"thumbnails"`
++		} `json:"entries"`
++	}
++	if err := json.Unmarshal(out, &res); err != nil {
++		return nil, fmt.Errorf("parsing yt search output: %w", err)
++	}
++
++	var results []PodcastSearchResult
++	for _, e := range res.Entries {
++		u := cmpStr(e.WebpageURL, "https://www.youtube.com/watch?v="+e.ID)
++		var img string
++		if len(e.Thumbnails) > 0 {
++			img = e.Thumbnails[len(e.Thumbnails)-1].URL
++		}
++		results = append(results, PodcastSearchResult{
++			Title:       strings.TrimSpace(e.Title),
++			Author:      cmpStr(e.Channel, e.Uploader),
++			FeedURL:     u,
++			URL:         u,
++			ImageURL:    img,
++			SourceType:  "youtube",
++			Description: "YouTube Video / Playlist",
++		})
++	}
++	return results, nil
++}
++
++func parseFeedDate(s string) *time.Time {
++	s = strings.TrimSpace(s)
++	if s == "" {
++		return nil
++	}
++	layouts := []string{
++		time.RFC1123Z,
++		time.RFC1123,
++		time.RFC822Z,
++		time.RFC822,
++		time.RFC3339,
++		"Mon, 2 Jan 2006 15:04:05 -0700",
++		"Mon, 2 Jan 2006 15:04:05 MST",
++		"2 Jan 2006 15:04:05 -0700",
++		"2 Jan 2006 15:04:05 MST",
++		"2006-01-02 15:04:05",
++		"2006-01-02",
++	}
++	for _, l := range layouts {
++		if t, err := time.Parse(l, s); err == nil {
++			utc := t.UTC()
++			return &utc
++		}
++	}
++	return nil
++}
++
++func parseYouTubeDate(s string) *time.Time {
++	s = strings.TrimSpace(s)
++	if len(s) == 8 {
++		if t, err := time.Parse("20060102", s); err == nil {
++			utc := t.UTC()
++			return &utc
++		}
++	}
++	return nil
++}
++
++func parseFeedDuration(s string) int {
++	s = strings.TrimSpace(s)
++	if s == "" {
++		return 0
++	}
++	if n, err := strconv.Atoi(s); err == nil {
++		return n
++	}
++	parts := strings.Split(s, ":")
++	switch len(parts) {
++	case 2:
++		m, _ := strconv.Atoi(parts[0])
++		sec, _ := strconv.Atoi(parts[1])
++		return m*60 + sec
++	case 3:
++		h, _ := strconv.Atoi(parts[0])
++		m, _ := strconv.Atoi(parts[1])
++		sec, _ := strconv.Atoi(parts[2])
++		return h*3600 + m*60 + sec
++	}
++	return 0
++}
++
++func cmpStr(a, b string) string {
++	if a != "" {
++		return a
++	}
++	return b
++}
++
++func sanitizeFilename(s string) string {
++	r := strings.NewReplacer(
++		"/", "_", "\\", "_", ":", "_", "*", "_", "?", "_",
++		"\"", "_", "<", "_", ">", "_", "|", "_", "\x00", "",
++	)
++	s = strings.TrimSpace(r.Replace(s))
++	s = strings.TrimLeft(s, ".")
++	s = strings.TrimRight(s, ". ")
++	runes := []rune(s)
++	if len(runes) > 100 {
++		s = strings.TrimSpace(string(runes[:100]))
++	}
++	if s == "" {
++		return "Episode"
++	}
++	return s
++}
+diff --git a/core/seer/podcast_store.go b/core/seer/podcast_store.go
+new file mode 100644
+index 00000000..72b98b50
+--- /dev/null
++++ b/core/seer/podcast_store.go
+@@ -0,0 +1,331 @@
++package seer
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"strings"
++	"time"
++)
++
++var (
++	ErrPodcastNotFound = errors.New("podcast not found")
++	ErrEpisodeNotFound = errors.New("episode not found")
++)
++
++type PodcastChannel struct {
++	ID              string     `json:"id"`
++	UserID          string     `json:"userId"`
++	Title           string     `json:"title"`
++	Author          string     `json:"author"`
++	Description     string     `json:"description"`
++	SourceType      string     `json:"sourceType"` // "rss" or "youtube"
++	URL             string     `json:"url"`
++	FeedURL         string     `json:"feedUrl"`
++	ImageURL        string     `json:"imageUrl"`
++	KeepPolicy      int        `json:"keepPolicy"` // 0 = all, 1 = keep 1, 3 = keep 3
++	AutoDownload    bool       `json:"autoDownload"`
++	LastError       string     `json:"lastError"`
++	LastCheckedAt   *time.Time `json:"lastCheckedAt"`
++	CreatedAt       time.Time  `json:"createdAt"`
++	UpdatedAt       time.Time  `json:"updatedAt"`
++	EpisodeCount    int        `json:"episodeCount"`
++	DownloadedCount int        `json:"downloadedCount"`
++}
++
++type PodcastEpisode struct {
++	ID           string     `json:"id"`
++	ChannelID    string     `json:"channelId"`
++	GUID         string     `json:"guid"`
++	Title        string     `json:"title"`
++	Description  string     `json:"description"`
++	AudioURL     string     `json:"audioUrl"`
++	ImageURL     string     `json:"imageUrl"`
++	PublishedAt  *time.Time `json:"publishedAt"`
++	Duration     int        `json:"duration"` // seconds
++	Status       string     `json:"status"`   // "pending", "downloading", "downloaded", "deleted", "error"
++	FilePath     string     `json:"filePath,omitempty"`
++	FileSize     int64      `json:"fileSize,omitempty"`
++	MediaFileID  string     `json:"mediaFileId,omitempty"`
++	Error        string     `json:"error,omitempty"`
++	CreatedAt    time.Time  `json:"createdAt"`
++	UpdatedAt    time.Time  `json:"updatedAt"`
++	ChannelTitle string     `json:"channelTitle,omitempty"`
++}
++
++type PodcastStore struct {
++	db *sql.DB
++}
++
++func NewPodcastStore(db *sql.DB) *PodcastStore {
++	return &PodcastStore{db: db}
++}
++
++const (
++	channelColumns = `id, user_id, title, author, description, source_type, url, feed_url, image_url, keep_policy, auto_download, last_error, last_checked_at, created_at, updated_at`
++	episodeColumns = `id, channel_id, guid, title, description, audio_url, image_url, published_at, duration, status, file_path, file_size, media_file_id, error, created_at, updated_at`
++)
++
++func (s *PodcastStore) CreateChannel(ctx context.Context, c *PodcastChannel) error {
++	now := time.Now().UTC()
++	if c.CreatedAt.IsZero() {
++		c.CreatedAt = now
++	}
++	c.UpdatedAt = now
++	_, err := s.db.ExecContext(ctx, `INSERT INTO podcast_channel (`+channelColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++		c.ID, c.UserID, c.Title, c.Author, c.Description, c.SourceType, c.URL, c.FeedURL, c.ImageURL,
++		c.KeepPolicy, c.AutoDownload, c.LastError, c.LastCheckedAt, c.CreatedAt, c.UpdatedAt,
++	)
++	return err
++}
++
++func (s *PodcastStore) UpdateChannel(ctx context.Context, c *PodcastChannel) error {
++	c.UpdatedAt = time.Now().UTC()
++	res, err := s.db.ExecContext(ctx, `UPDATE podcast_channel SET
++		title = ?, author = ?, description = ?, source_type = ?, url = ?, feed_url = ?, image_url = ?,
++		keep_policy = ?, auto_download = ?, last_error = ?, last_checked_at = ?, updated_at = ?
++		WHERE id = ?`,
++		c.Title, c.Author, c.Description, c.SourceType, c.URL, c.FeedURL, c.ImageURL,
++		c.KeepPolicy, c.AutoDownload, c.LastError, c.LastCheckedAt, c.UpdatedAt, c.ID,
++	)
++	if err != nil {
++		return err
++	}
++	if n, _ := res.RowsAffected(); n == 0 {
++		return ErrPodcastNotFound
++	}
++	return nil
++}
++
++func (s *PodcastStore) GetChannel(ctx context.Context, id string) (*PodcastChannel, error) {
++	row := s.db.QueryRowContext(ctx, `
++		SELECT c.`+strings.ReplaceAll(channelColumns, ", ", ", c.")+`,
++			(SELECT COUNT(*) FROM podcast_episode e WHERE e.channel_id = c.id) as ep_count,
++			(SELECT COUNT(*) FROM podcast_episode e WHERE e.channel_id = c.id AND e.status = 'downloaded') as dl_count
++		FROM podcast_channel c WHERE c.id = ?`, id)
++
++	var c PodcastChannel
++	var lastChecked sql.NullTime
++	err := row.Scan(
++		&c.ID, &c.UserID, &c.Title, &c.Author, &c.Description, &c.SourceType, &c.URL, &c.FeedURL, &c.ImageURL,
++		&c.KeepPolicy, &c.AutoDownload, &c.LastError, &lastChecked, &c.CreatedAt, &c.UpdatedAt,
++		&c.EpisodeCount, &c.DownloadedCount,
++	)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, ErrPodcastNotFound
++	}
++	if err != nil {
++		return nil, err
++	}
++	if lastChecked.Valid {
++		t := lastChecked.Time.UTC()
++		c.LastCheckedAt = &t
++	}
++	return &c, nil
++}
++
++func (s *PodcastStore) ListChannels(ctx context.Context, userID string) ([]PodcastChannel, error) {
++	query := `
++		SELECT c.` + strings.ReplaceAll(channelColumns, ", ", ", c.") + `,
++			(SELECT COUNT(*) FROM podcast_episode e WHERE e.channel_id = c.id) as ep_count,
++			(SELECT COUNT(*) FROM podcast_episode e WHERE e.channel_id = c.id AND e.status = 'downloaded') as dl_count
++		FROM podcast_channel c`
++	var args []any
++	if userID != "" {
++		query += ` WHERE c.user_id = ?`
++		args = append(args, userID)
++	}
++	query += ` ORDER BY c.title COLLATE NOCASE ASC`
++
++	rows, err := s.db.QueryContext(ctx, query, args...)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++
++	var out []PodcastChannel
++	for rows.Next() {
++		var c PodcastChannel
++		var lastChecked sql.NullTime
++		err := rows.Scan(
++			&c.ID, &c.UserID, &c.Title, &c.Author, &c.Description, &c.SourceType, &c.URL, &c.FeedURL, &c.ImageURL,
++			&c.KeepPolicy, &c.AutoDownload, &c.LastError, &lastChecked, &c.CreatedAt, &c.UpdatedAt,
++			&c.EpisodeCount, &c.DownloadedCount,
++		)
++		if err != nil {
++			return nil, err
++		}
++		if lastChecked.Valid {
++			t := lastChecked.Time.UTC()
++			c.LastCheckedAt = &t
++		}
++		out = append(out, c)
++	}
++	return out, rows.Err()
++}
++
++func (s *PodcastStore) DeleteChannel(ctx context.Context, id string) error {
++	res, err := s.db.ExecContext(ctx, `DELETE FROM podcast_channel WHERE id = ?`, id)
++	if err != nil {
++		return err
++	}
++	if n, _ := res.RowsAffected(); n == 0 {
++		return ErrPodcastNotFound
++	}
++	return nil
++}
++
++func (s *PodcastStore) CreateEpisode(ctx context.Context, e *PodcastEpisode) error {
++	now := time.Now().UTC()
++	if e.CreatedAt.IsZero() {
++		e.CreatedAt = now
++	}
++	e.UpdatedAt = now
++	_, err := s.db.ExecContext(ctx, `INSERT INTO podcast_episode (`+episodeColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++		e.ID, e.ChannelID, e.GUID, e.Title, e.Description, e.AudioURL, e.ImageURL,
++		e.PublishedAt, e.Duration, e.Status, e.FilePath, e.FileSize, e.MediaFileID, e.Error, e.CreatedAt, e.UpdatedAt,
++	)
++	return err
++}
++
++func (s *PodcastStore) UpdateEpisode(ctx context.Context, e *PodcastEpisode) error {
++	e.UpdatedAt = time.Now().UTC()
++	res, err := s.db.ExecContext(ctx, `UPDATE podcast_episode SET
++		title = ?, description = ?, audio_url = ?, image_url = ?, published_at = ?, duration = ?,
++		status = ?, file_path = ?, file_size = ?, media_file_id = ?, error = ?, updated_at = ?
++		WHERE id = ?`,
++		e.Title, e.Description, e.AudioURL, e.ImageURL, e.PublishedAt, e.Duration,
++		e.Status, e.FilePath, e.FileSize, e.MediaFileID, e.Error, e.UpdatedAt, e.ID,
++	)
++	if err != nil {
++		return err
++	}
++	if n, _ := res.RowsAffected(); n == 0 {
++		return ErrEpisodeNotFound
++	}
++	return nil
++}
++
++func (s *PodcastStore) GetEpisode(ctx context.Context, id string) (*PodcastEpisode, error) {
++	row := s.db.QueryRowContext(ctx, `
++		SELECT e.`+strings.ReplaceAll(episodeColumns, ", ", ", e.")+`, c.title
++		FROM podcast_episode e
++		JOIN podcast_channel c ON c.id = e.channel_id
++		WHERE e.id = ?`, id)
++
++	var e PodcastEpisode
++	var pubTime sql.NullTime
++	err := row.Scan(
++		&e.ID, &e.ChannelID, &e.GUID, &e.Title, &e.Description, &e.AudioURL, &e.ImageURL,
++		&pubTime, &e.Duration, &e.Status, &e.FilePath, &e.FileSize, &e.MediaFileID, &e.Error, &e.CreatedAt, &e.UpdatedAt,
++		&e.ChannelTitle,
++	)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, ErrEpisodeNotFound
++	}
++	if err != nil {
++		return nil, err
++	}
++	if pubTime.Valid {
++		t := pubTime.Time.UTC()
++		e.PublishedAt = &t
++	}
++	return &e, nil
++}
++
++func (s *PodcastStore) GetEpisodeByGUID(ctx context.Context, channelID, guid string) (*PodcastEpisode, error) {
++	row := s.db.QueryRowContext(ctx, `
++		SELECT `+episodeColumns+` FROM podcast_episode WHERE channel_id = ? AND guid = ?`, channelID, guid)
++
++	var e PodcastEpisode
++	var pubTime sql.NullTime
++	err := row.Scan(
++		&e.ID, &e.ChannelID, &e.GUID, &e.Title, &e.Description, &e.AudioURL, &e.ImageURL,
++		&pubTime, &e.Duration, &e.Status, &e.FilePath, &e.FileSize, &e.MediaFileID, &e.Error, &e.CreatedAt, &e.UpdatedAt,
++	)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, ErrEpisodeNotFound
++	}
++	if err != nil {
++		return nil, err
++	}
++	if pubTime.Valid {
++		t := pubTime.Time.UTC()
++		e.PublishedAt = &t
++	}
++	return &e, nil
++}
++
++func (s *PodcastStore) ListEpisodes(ctx context.Context, channelID string) ([]PodcastEpisode, error) {
++	rows, err := s.db.QueryContext(ctx, `
++		SELECT e.`+strings.ReplaceAll(episodeColumns, ", ", ", e.")+`, c.title
++		FROM podcast_episode e
++		JOIN podcast_channel c ON c.id = e.channel_id
++		WHERE e.channel_id = ?
++		ORDER BY CASE WHEN e.published_at IS NULL THEN 1 ELSE 0 END, e.published_at DESC, e.created_at DESC`, channelID)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++
++	var out []PodcastEpisode
++	for rows.Next() {
++		var e PodcastEpisode
++		var pubTime sql.NullTime
++		err := rows.Scan(
++			&e.ID, &e.ChannelID, &e.GUID, &e.Title, &e.Description, &e.AudioURL, &e.ImageURL,
++			&pubTime, &e.Duration, &e.Status, &e.FilePath, &e.FileSize, &e.MediaFileID, &e.Error, &e.CreatedAt, &e.UpdatedAt,
++			&e.ChannelTitle,
++		)
++		if err != nil {
++			return nil, err
++		}
++		if pubTime.Valid {
++			t := pubTime.Time.UTC()
++			e.PublishedAt = &t
++		}
++		out = append(out, e)
++	}
++	return out, rows.Err()
++}
++
++func (s *PodcastStore) ListDownloadedEpisodes(ctx context.Context, channelID string) ([]PodcastEpisode, error) {
++	rows, err := s.db.QueryContext(ctx, `
++		SELECT `+episodeColumns+` FROM podcast_episode
++		WHERE channel_id = ? AND status = 'downloaded'
++		ORDER BY CASE WHEN published_at IS NULL THEN 1 ELSE 0 END, published_at DESC, created_at DESC`, channelID)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++
++	var out []PodcastEpisode
++	for rows.Next() {
++		var e PodcastEpisode
++		var pubTime sql.NullTime
++		err := rows.Scan(
++			&e.ID, &e.ChannelID, &e.GUID, &e.Title, &e.Description, &e.AudioURL, &e.ImageURL,
++			&pubTime, &e.Duration, &e.Status, &e.FilePath, &e.FileSize, &e.MediaFileID, &e.Error, &e.CreatedAt, &e.UpdatedAt,
++		)
++		if err != nil {
++			return nil, err
++		}
++		if pubTime.Valid {
++			t := pubTime.Time.UTC()
++			e.PublishedAt = &t
++		}
++		out = append(out, e)
++	}
++	return out, rows.Err()
++}
++
++func (s *PodcastStore) DeleteEpisode(ctx context.Context, id string) error {
++	res, err := s.db.ExecContext(ctx, `DELETE FROM podcast_episode WHERE id = ?`, id)
++	if err != nil {
++		return err
++	}
++	if n, _ := res.RowsAffected(); n == 0 {
++		return ErrEpisodeNotFound
++	}
++	return nil
++}
+diff --git a/core/seer/podcast_test.go b/core/seer/podcast_test.go
+new file mode 100644
+index 00000000..8df0229e
+--- /dev/null
++++ b/core/seer/podcast_test.go
+@@ -0,0 +1,218 @@
++package seer
++
++import (
++	"context"
++	"database/sql"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	_ "github.com/mattn/go-sqlite3"
++)
++
++func TestParseFeedDate(t *testing.T) {
++	tests := []struct {
++		input    string
++		expected int // year
++	}{
++		{"Fri, 10 Oct 2026 12:00:00 +0000", 2026},
++		{"Mon, 02 Jan 2006 15:04:05 MST", 2006},
++		{"2026-10-11T10:00:00Z", 2026},
++		{"2026-10-11", 2026},
++		{"11 Oct 2026 12:00:00 -0300", 2026},
++		{"", 0},
++	}
++
++	for _, tt := range tests {
++		parsed := parseFeedDate(tt.input)
++		if tt.expected == 0 {
++			if parsed != nil {
++				t.Errorf("parseFeedDate(%q) = %v; want nil", tt.input, parsed)
++			}
++		} else {
++			if parsed == nil || parsed.Year() != tt.expected {
++				t.Errorf("parseFeedDate(%q) = %v; want year %d", tt.input, parsed, tt.expected)
++			}
++		}
++	}
++}
++
++func TestParseFeedDuration(t *testing.T) {
++	tests := []struct {
++		input    string
++		expected int
++	}{
++		{"", 0},
++		{"3600", 3600},
++		{"01:00:00", 3600},
++		{"01:23:45", 3600 + 23*60 + 45},
++		{"45:10", 45*60 + 10},
++		{"05:00", 300},
++	}
++
++	for _, tt := range tests {
++		got := parseFeedDuration(tt.input)
++		if got != tt.expected {
++			t.Errorf("parseFeedDuration(%q) = %d; want %d", tt.input, got, tt.expected)
++		}
++	}
++}
++
++func TestIsYouTubeURL(t *testing.T) {
++	if !IsYouTubeURL("https://www.youtube.com/watch?v=dQw4w9WgXcQ") {
++		t.Error("expected true for youtube.com")
++	}
++	if !IsYouTubeURL("https://youtu.be/dQw4w9WgXcQ") {
++		t.Error("expected true for youtu.be")
++	}
++	if !IsYouTubeURL("https://www.youtube.com/@flowpodcast") {
++		t.Error("expected true for youtube channel")
++	}
++	if IsYouTubeURL("https://jovemnerd.com.br/feed-nerdcast/") {
++		t.Error("expected false for rss feed")
++	}
++}
++
++func setupTestDB(t *testing.T) *sql.DB {
++	db, err := sql.Open("sqlite3", ":memory:")
++	if err != nil {
++		t.Fatalf("opening sqlite in memory: %v", err)
++	}
++
++	schema := `
++	CREATE TABLE user (
++		id VARCHAR(255) PRIMARY KEY
++	);
++	INSERT INTO user (id) VALUES ('u1');
++
++	CREATE TABLE podcast_channel (
++		id              VARCHAR(255) NOT NULL PRIMARY KEY,
++		user_id         VARCHAR(255) NOT NULL REFERENCES user(id) ON DELETE CASCADE,
++		title           VARCHAR(255) NOT NULL DEFAULT '',
++		author          VARCHAR(255) NOT NULL DEFAULT '',
++		description     TEXT         NOT NULL DEFAULT '',
++		source_type     VARCHAR(32)  NOT NULL DEFAULT 'rss',
++		url             TEXT         NOT NULL DEFAULT '',
++		feed_url        TEXT         NOT NULL DEFAULT '',
++		image_url       TEXT         NOT NULL DEFAULT '',
++		keep_policy     INTEGER      NOT NULL DEFAULT 0,
++		auto_download   BOOL         NOT NULL DEFAULT true,
++		last_error      TEXT         NOT NULL DEFAULT '',
++		last_checked_at DATETIME,
++		created_at      DATETIME     NOT NULL,
++		updated_at      DATETIME     NOT NULL
++	);
++
++	CREATE TABLE podcast_episode (
++		id              VARCHAR(255) NOT NULL PRIMARY KEY,
++		channel_id      VARCHAR(255) NOT NULL REFERENCES podcast_channel(id) ON DELETE CASCADE,
++		guid            VARCHAR(500) NOT NULL DEFAULT '',
++		title           VARCHAR(255) NOT NULL DEFAULT '',
++		description     TEXT         NOT NULL DEFAULT '',
++		audio_url       TEXT         NOT NULL DEFAULT '',
++		image_url       TEXT         NOT NULL DEFAULT '',
++		published_at    DATETIME,
++		duration        INTEGER      NOT NULL DEFAULT 0,
++		status          VARCHAR(32)  NOT NULL DEFAULT 'pending',
++		file_path       TEXT         NOT NULL DEFAULT '',
++		file_size       BIGINT       NOT NULL DEFAULT 0,
++		media_file_id   VARCHAR(255) NOT NULL DEFAULT '',
++		error           TEXT         NOT NULL DEFAULT '',
++		created_at      DATETIME     NOT NULL,
++		updated_at      DATETIME     NOT NULL
++	);
++	`
++	if _, err := db.Exec(schema); err != nil {
++		t.Fatalf("setting up schema: %v", err)
++	}
++	return db
++}
++
++func TestPodcastStoreAndRetention(t *testing.T) {
++	db := setupTestDB(t)
++	defer db.Close()
++	store := NewPodcastStore(db)
++	ctx := context.Background()
++
++	ch := &PodcastChannel{
++		ID:           "p1",
++		UserID:       "u1",
++		Title:        "Tech Talk",
++		Author:       "Host",
++		FeedURL:      "https://example.com/feed.xml",
++		KeepPolicy:   3,
++		AutoDownload: true,
++	}
++
++	if err := store.CreateChannel(ctx, ch); err != nil {
++		t.Fatalf("CreateChannel failed: %v", err)
++	}
++
++	loaded, err := store.GetChannel(ctx, "p1")
++	if err != nil || loaded.Title != "Tech Talk" {
++		t.Fatalf("GetChannel failed: %v, got %+v", err, loaded)
++	}
++
++	// Create 5 episodes with descending dates
++	tmpDir := t.TempDir()
++	now := time.Now().UTC()
++	var files []string
++	for i := 0; i < 5; i++ {
++		pub := now.Add(-time.Duration(i) * 24 * time.Hour)
++		filePath := filepath.Join(tmpDir, pub.Format("2006-01-02")+".mp3")
++		_ = os.WriteFile(filePath, []byte("fake audio"), 0644)
++		files = append(files, filePath)
++
++		ep := &PodcastEpisode{
++			ID:          string(rune('e' + i)),
++			ChannelID:   "p1",
++			GUID:        string(rune('g' + i)),
++			Title:       "Episode " + string(rune('1'+i)),
++			PublishedAt: &pub,
++			Status:      "downloaded",
++			FilePath:    filePath,
++			FileSize:    10,
++		}
++		if err := store.CreateEpisode(ctx, ep); err != nil {
++			t.Fatalf("CreateEpisode %d failed: %v", i, err)
++		}
++	}
++
++	eps, err := store.ListEpisodes(ctx, "p1")
++	if err != nil || len(eps) != 5 {
++		t.Fatalf("ListEpisodes failed: %v (count=%d)", err, len(eps))
++	}
++
++	// Service process retention for keepPolicy = 3
++	svc := NewPodcastService(store, func() string { return tmpDir }, nil, nil, "ffmpeg", "yt-dlp")
++	if err := svc.processChannelEpisodes(ctx, loaded); err != nil {
++		t.Fatalf("processChannelEpisodes failed: %v", err)
++	}
++
++	// Check downloaded episodes count: should be 3
++	downloaded, err := store.ListDownloadedEpisodes(ctx, "p1")
++	if err != nil {
++		t.Fatalf("ListDownloadedEpisodes failed: %v", err)
++	}
++	if len(downloaded) != 3 {
++		t.Fatalf("expected 3 downloaded episodes, got %d", len(downloaded))
++	}
++
++	// First 3 files should exist, 4th and 5th files should have been removed
++	if _, err := os.Stat(files[0]); err != nil {
++		t.Errorf("expected latest file %s to exist", files[0])
++	}
++	if _, err := os.Stat(files[1]); err != nil {
++		t.Errorf("expected 2nd latest file %s to exist", files[1])
++	}
++	if _, err := os.Stat(files[2]); err != nil {
++		t.Errorf("expected 3rd latest file %s to exist", files[2])
++	}
++	if _, err := os.Stat(files[3]); !os.IsNotExist(err) {
++		t.Errorf("expected 4th file %s to be deleted, got err: %v", files[3], err)
++	}
++	if _, err := os.Stat(files[4]); !os.IsNotExist(err) {
++		t.Errorf("expected 5th file %s to be deleted, got err: %v", files[4], err)
++	}
++}
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index 768dbd62..56cc389a 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -26,6 +26,8 @@ type Seer struct {
+ 	Duplicates *Duplicates
+ 	// Editor lets admins edit tags and delete albums or tracks (served under /api/seer/library).
+ 	Editor *Editor
++	// Podcasts manages podcast subscriptions, scheduled downloads, and retention.
++	Podcasts *PodcastService
+ }
+ 
+ // Enabled reports whether the feature is turned on in the configuration.
+@@ -68,7 +70,9 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 		return []string{filepath.Clean(dest)}
+ 	}
+ 	editor := NewEditor(ds, scanner, core.NewMaintenance(ds), nil, keep)
+-	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor}
++	pStore := NewPodcastStore(db)
++	podcasts := NewPodcastService(pStore, func() string { return dest }, lib, broker, conf.Server.FFmpegPath, opts.YouTube.Path)
++	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor, Podcasts: podcasts}
+ }
+ 
+ // refreshUI tells open pages to reload (useRefreshOnEvents(['seer'])).
+@@ -86,6 +90,9 @@ func (s *Seer) Start(ctx context.Context) {
+ 	log.Info(ctx, "Starting Seer acquisition workers", "sources", conf.Server.Seer.Sources)
+ 	s.Service.Start(ctx)
+ 	s.Importer.Start(ctx)
++	if s.Podcasts != nil {
++		s.Podcasts.Start(ctx)
++	}
+ }
+ 
+ // sources builds the enabled sources in the configured priority order.
+diff --git a/db/migrations/20261011180000_create_podcast_tables.sql b/db/migrations/20261011180000_create_podcast_tables.sql
+new file mode 100644
+index 00000000..d42234e3
+--- /dev/null
++++ b/db/migrations/20261011180000_create_podcast_tables.sql
+@@ -0,0 +1,45 @@
++-- +goose Up
++CREATE TABLE podcast_channel (
++    id              VARCHAR(255) NOT NULL PRIMARY KEY,
++    user_id         VARCHAR(255) NOT NULL REFERENCES user(id) ON DELETE CASCADE,
++    title           VARCHAR(255) NOT NULL DEFAULT '',
++    author          VARCHAR(255) NOT NULL DEFAULT '',
++    description     TEXT         NOT NULL DEFAULT '',
++    source_type     VARCHAR(32)  NOT NULL DEFAULT 'rss',
++    url             TEXT         NOT NULL DEFAULT '',
++    feed_url        TEXT         NOT NULL DEFAULT '',
++    image_url       TEXT         NOT NULL DEFAULT '',
++    keep_policy     INTEGER      NOT NULL DEFAULT 0,
++    auto_download   BOOL         NOT NULL DEFAULT true,
++    last_error      TEXT         NOT NULL DEFAULT '',
++    last_checked_at DATETIME,
++    created_at      DATETIME     NOT NULL,
++    updated_at      DATETIME     NOT NULL
++);
++CREATE INDEX podcast_channel_user ON podcast_channel(user_id);
++
++CREATE TABLE podcast_episode (
++    id              VARCHAR(255) NOT NULL PRIMARY KEY,
++    channel_id      VARCHAR(255) NOT NULL REFERENCES podcast_channel(id) ON DELETE CASCADE,
++    guid            VARCHAR(500) NOT NULL DEFAULT '',
++    title           VARCHAR(255) NOT NULL DEFAULT '',
++    description     TEXT         NOT NULL DEFAULT '',
++    audio_url       TEXT         NOT NULL DEFAULT '',
++    image_url       TEXT         NOT NULL DEFAULT '',
++    published_at    DATETIME,
++    duration        INTEGER      NOT NULL DEFAULT 0,
++    status          VARCHAR(32)  NOT NULL DEFAULT 'pending',
++    file_path       TEXT         NOT NULL DEFAULT '',
++    file_size       BIGINT       NOT NULL DEFAULT 0,
++    media_file_id   VARCHAR(255) NOT NULL DEFAULT '',
++    error           TEXT         NOT NULL DEFAULT '',
++    created_at      DATETIME     NOT NULL,
++    updated_at      DATETIME     NOT NULL
++);
++CREATE INDEX podcast_episode_channel ON podcast_episode(channel_id);
++CREATE INDEX podcast_episode_guid ON podcast_episode(channel_id, guid);
++CREATE INDEX podcast_episode_pub ON podcast_episode(channel_id, published_at DESC);
++
++-- +goose Down
++DROP TABLE podcast_episode;
++DROP TABLE podcast_channel;
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index 88fbb917..6f4a45cc 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -619,6 +619,39 @@
+         "confirm": "Remover %{smart_count} cópia |||| Remover %{smart_count} cópias",
+         "cleaned": "%{smart_count} cópia movida para a lixeira |||| %{smart_count} cópias movidas para a lixeira"
+       }
++    },
++    "podcast": {
++      "name": "Podcast |||| Podcasts",
++      "episodes": "Episódios",
++      "add": "Adicionar Podcast",
++      "searchPlaceholder": "Buscar podcasts no Apple Podcasts ou YouTube...",
++      "searchBtn": "Buscar",
++      "searchTab": "Buscar Podcasts",
++      "directUrlTab": "URL Direta (YouTube / RSS)",
++      "urlLabel": "Link do RSS ou YouTube",
++      "urlHelper": "Suporta canais, playlists ou vídeos do YouTube e feeds RSS de podcasts.",
++      "keepPolicyTitle": "Política de download e retenção:",
++      "keepAll": "Baixar todos e manter todos",
++      "keep1": "Manter apenas o último episódio (apaga anteriores ao baixar o novo)",
++      "keep3": "Manter os 3 últimos episódios",
++      "autoDownloadWeekly": "Verificar e baixar novos episódios periodicamente (semanalmente)",
++      "subscribe": "Inscrever-se",
++      "unsubscribe": "Excluir podcast",
++      "refresh": "Verificar agora",
++      "refreshAll": "Verificar todos",
++      "settings": "Configurações de retenção",
++      "backToList": "Todos os Podcasts",
++      "noResults": "Nenhum podcast encontrado",
++      "selectOne": "Selecione um podcast da lista",
++      "enterUrl": "Insira a URL do podcast",
++      "subscribedSuccess": "Podcast inscrito com sucesso! Os episódios serão baixados.",
++      "refreshStarted": "Verificando novos episódios...",
++      "refreshAllStarted": "Verificando todos os podcasts inscritos...",
++      "settingsSaved": "Configurações salvas com sucesso!",
++      "deletedSuccess": "Podcast excluído",
++      "playing": "Reproduzindo episódio: %{title}",
++      "downloadingEp": "Download iniciado!",
++      "deletedEp": "Arquivo do episódio excluído."
+     }
+   },
+   "ra": {
+diff --git a/server/seerapi/podcast.go b/server/seerapi/podcast.go
+new file mode 100644
+index 00000000..617f31f2
+--- /dev/null
++++ b/server/seerapi/podcast.go
+@@ -0,0 +1,214 @@
++package seerapi
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"os"
++	"strconv"
++	"strings"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/navidrome/navidrome/core/seer"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model/request"
++)
++
++// Podcasts is the interface for podcast operations used by the API.
++type Podcasts interface {
++	Search(ctx context.Context, query, source string, limit int) ([]seer.PodcastSearchResult, error)
++	List(ctx context.Context, userID string) ([]seer.PodcastChannel, error)
++	Get(ctx context.Context, id string) (*seer.PodcastChannel, []seer.PodcastEpisode, error)
++	Subscribe(ctx context.Context, userID, rawURL, sourceType string, keepPolicy int, autoDownload bool) (*seer.PodcastChannel, error)
++	Update(ctx context.Context, id string, keepPolicy int, autoDownload bool) (*seer.PodcastChannel, error)
++	DeleteChannel(ctx context.Context, id string, deleteFiles bool) error
++	SyncChannel(ctx context.Context, id string) error
++	RefreshAll(ctx context.Context) error
++	GetEpisode(ctx context.Context, id string) (*seer.PodcastEpisode, error)
++	DownloadEpisode(ctx context.Context, id string) error
++	DeleteEpisodeFile(ctx context.Context, id string) error
++}
++
++func (api *Router) searchPodcasts(w http.ResponseWriter, r *http.Request) {
++	q := r.URL.Query().Get("q")
++	src := r.URL.Query().Get("source")
++	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
++	if limit <= 0 || limit > 50 {
++		limit = 15
++	}
++	results, err := api.podcasts.Search(r.Context(), q, src, limit)
++	if err != nil {
++		log.Error(r.Context(), "Seer: searching podcasts failed", err)
++		http.Error(w, "search failed: "+err.Error(), http.StatusInternalServerError)
++		return
++	}
++	if results == nil {
++		results = []seer.PodcastSearchResult{}
++	}
++	writeJSON(w, http.StatusOK, results)
++}
++
++func (api *Router) listPodcasts(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	userID := user.ID
++	if user.IsAdmin && r.URL.Query().Get("mine") != "true" {
++		userID = ""
++	}
++	channels, err := api.podcasts.List(r.Context(), userID)
++	if err != nil {
++		log.Error(r.Context(), "Seer: listing podcasts failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	if channels == nil {
++		channels = []seer.PodcastChannel{}
++	}
++	w.Header().Set("X-Total-Count", strconv.Itoa(len(channels)))
++	writeJSON(w, http.StatusOK, channels)
++}
++
++func (api *Router) createPodcast(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	var body struct {
++		URL          string `json:"url"`
++		SourceType   string `json:"sourceType"`
++		KeepPolicy   int    `json:"keepPolicy"`
++		AutoDownload bool   `json:"autoDownload"`
++	}
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	ch, err := api.podcasts.Subscribe(r.Context(), user.ID, body.URL, body.SourceType, body.KeepPolicy, body.AutoDownload)
++	if err != nil {
++		log.Error(r.Context(), "Seer: subscribing to podcast failed", err)
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
++	writeJSON(w, http.StatusCreated, ch)
++}
++
++func (api *Router) refreshAllPodcasts(w http.ResponseWriter, r *http.Request) {
++	go func() {
++		_ = api.podcasts.RefreshAll(context.Background())
++	}()
++	w.WriteHeader(http.StatusAccepted)
++}
++
++func (api *Router) getPodcast(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	id := chi.URLParam(r, "id")
++	ch, eps, err := api.podcasts.Get(r.Context(), id)
++	if err != nil || (!user.IsAdmin && ch.UserID != user.ID) {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	if eps == nil {
++		eps = []seer.PodcastEpisode{}
++	}
++	out := struct {
++		*seer.PodcastChannel
++		Episodes []seer.PodcastEpisode `json:"episodes"`
++	}{
++		PodcastChannel: ch,
++		Episodes:       eps,
++	}
++	writeJSON(w, http.StatusOK, out)
++}
++
++func (api *Router) updatePodcast(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	id := chi.URLParam(r, "id")
++	ch, _, err := api.podcasts.Get(r.Context(), id)
++	if err != nil || (!user.IsAdmin && ch.UserID != user.ID) {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	var body struct {
++		KeepPolicy   int  `json:"keepPolicy"`
++		AutoDownload bool `json:"autoDownload"`
++	}
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&body); err != nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	updated, err := api.podcasts.Update(r.Context(), id, body.KeepPolicy, body.AutoDownload)
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	writeJSON(w, http.StatusOK, updated)
++}
++
++func (api *Router) deletePodcast(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	id := chi.URLParam(r, "id")
++	ch, _, err := api.podcasts.Get(r.Context(), id)
++	if err != nil || (!user.IsAdmin && ch.UserID != user.ID) {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	deleteFiles := r.URL.Query().Get("deleteFiles") == "true"
++	if err := api.podcasts.DeleteChannel(r.Context(), id, deleteFiles); err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	w.WriteHeader(http.StatusNoContent)
++}
++
++func (api *Router) refreshPodcast(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	id := chi.URLParam(r, "id")
++	ch, _, err := api.podcasts.Get(r.Context(), id)
++	if err != nil || (!user.IsAdmin && ch.UserID != user.ID) {
++		http.Error(w, "not found", http.StatusNotFound)
++		return
++	}
++	go func() {
++		_ = api.podcasts.SyncChannel(context.Background(), id)
++	}()
++	w.WriteHeader(http.StatusAccepted)
++}
++
++func (api *Router) downloadEpisode(w http.ResponseWriter, r *http.Request) {
++	epId := chi.URLParam(r, "epId")
++	go func() {
++		_ = api.podcasts.DownloadEpisode(context.Background(), epId)
++	}()
++	w.WriteHeader(http.StatusAccepted)
++}
++
++func (api *Router) deleteEpisode(w http.ResponseWriter, r *http.Request) {
++	epId := chi.URLParam(r, "epId")
++	if err := api.podcasts.DeleteEpisodeFile(r.Context(), epId); err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	w.WriteHeader(http.StatusNoContent)
++}
++
++func (api *Router) streamEpisode(w http.ResponseWriter, r *http.Request) {
++	epId := chi.URLParam(r, "epId")
++	ep, err := api.podcasts.GetEpisode(r.Context(), epId)
++	if err != nil || ep == nil {
++		http.Error(w, "episode not found", http.StatusNotFound)
++		return
++	}
++	if ep.FilePath == "" {
++		http.Error(w, "episode file not downloaded", http.StatusNotFound)
++		return
++	}
++	if _, err := os.Stat(ep.FilePath); errors.Is(err, os.ErrNotExist) {
++		http.Error(w, "file does not exist on disk", http.StatusNotFound)
++		return
++	}
++
++	w.Header().Set("Content-Type", "audio/mpeg")
++	if strings.HasSuffix(ep.FilePath, ".m4a") {
++		w.Header().Set("Content-Type", "audio/mp4")
++	} else if strings.HasSuffix(ep.FilePath, ".opus") || strings.HasSuffix(ep.FilePath, ".ogg") {
++		w.Header().Set("Content-Type", "audio/ogg")
++	}
++	http.ServeFile(w, r, ep.FilePath)
++}
+diff --git a/server/seerapi/podcast_test.go b/server/seerapi/podcast_test.go
+new file mode 100644
+index 00000000..09167d00
+--- /dev/null
++++ b/server/seerapi/podcast_test.go
+@@ -0,0 +1,169 @@
++package seerapi
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/navidrome/navidrome/core/seer"
++	"github.com/navidrome/navidrome/model"
++)
++
++type fakePodcasts struct {
++	channels map[string]*seer.PodcastChannel
++	episodes map[string]*seer.PodcastEpisode
++	refreshed string
++}
++
++func newFakePodcasts() *fakePodcasts {
++	return &fakePodcasts{
++		channels: map[string]*seer.PodcastChannel{
++			"p1": {
++				ID:           "p1",
++				UserID:       "u1",
++				Title:        "NerdCast",
++				KeepPolicy:   3,
++				AutoDownload: true,
++			},
++		},
++		episodes: map[string]*seer.PodcastEpisode{
++			"e1": {
++				ID:        "e1",
++				ChannelID: "p1",
++				Title:     "Episode 1",
++				Status:    "downloaded",
++			},
++		},
++	}
++}
++
++func (f *fakePodcasts) Search(ctx context.Context, query, source string, limit int) ([]seer.PodcastSearchResult, error) {
++	return []seer.PodcastSearchResult{
++		{Title: "NerdCast", FeedURL: "https://example.com/rss", SourceType: "rss"},
++	}, nil
++}
++
++func (f *fakePodcasts) List(ctx context.Context, userID string) ([]seer.PodcastChannel, error) {
++	var out []seer.PodcastChannel
++	for _, c := range f.channels {
++		if userID == "" || c.UserID == userID {
++			out = append(out, *c)
++		}
++	}
++	return out, nil
++}
++
++func (f *fakePodcasts) Get(ctx context.Context, id string) (*seer.PodcastChannel, []seer.PodcastEpisode, error) {
++	c, ok := f.channels[id]
++	if !ok {
++		return nil, nil, seer.ErrPodcastNotFound
++	}
++	var eps []seer.PodcastEpisode
++	for _, e := range f.episodes {
++		if e.ChannelID == id {
++			eps = append(eps, *e)
++		}
++	}
++	return c, eps, nil
++}
++
++func (f *fakePodcasts) Subscribe(ctx context.Context, userID, rawURL, sourceType string, keepPolicy int, autoDownload bool) (*seer.PodcastChannel, error) {
++	c := &seer.PodcastChannel{
++		ID:           "p_new",
++		UserID:       userID,
++		Title:        "New Show",
++		FeedURL:      rawURL,
++		SourceType:   sourceType,
++		KeepPolicy:   keepPolicy,
++		AutoDownload: autoDownload,
++	}
++	f.channels[c.ID] = c
++	return c, nil
++}
++
++func (f *fakePodcasts) Update(ctx context.Context, id string, keepPolicy int, autoDownload bool) (*seer.PodcastChannel, error) {
++	c, ok := f.channels[id]
++	if !ok {
++		return nil, seer.ErrPodcastNotFound
++	}
++	c.KeepPolicy = keepPolicy
++	c.AutoDownload = autoDownload
++	return c, nil
++}
++
++func (f *fakePodcasts) DeleteChannel(ctx context.Context, id string, deleteFiles bool) error {
++	delete(f.channels, id)
++	return nil
++}
++
++func (f *fakePodcasts) SyncChannel(ctx context.Context, id string) error {
++	f.refreshed = id
++	return nil
++}
++
++func (f *fakePodcasts) RefreshAll(ctx context.Context) error {
++	f.refreshed = "all"
++	return nil
++}
++
++func (f *fakePodcasts) GetEpisode(ctx context.Context, id string) (*seer.PodcastEpisode, error) {
++	e, ok := f.episodes[id]
++	if !ok {
++		return nil, seer.ErrEpisodeNotFound
++	}
++	return e, nil
++}
++
++func (f *fakePodcasts) DownloadEpisode(ctx context.Context, id string) error {
++	return nil
++}
++
++func (f *fakePodcasts) DeleteEpisodeFile(ctx context.Context, id string) error {
++	if e, ok := f.episodes[id]; ok {
++		e.Status = "deleted"
++	}
++	return nil
++}
++
++func TestPodcastsAPI(t *testing.T) {
++	fp := newFakePodcasts()
++	api := NewWithPodcasts(nil, &fakeService{}, fp)
++	user := model.User{ID: "u1"}
++	admin := model.User{ID: "adm", IsAdmin: true}
++
++	// 1. Search
++	w := do(t, api, user, "GET", "/podcasts/search?q=nerd", "")
++	if w.Code != 200 || !strings.Contains(w.Body.String(), "NerdCast") {
++		t.Errorf("search failed: %d %s", w.Code, w.Body)
++	}
++
++	// 2. List
++	w = do(t, api, user, "GET", "/podcasts", "")
++	if w.Code != 200 || !strings.Contains(w.Body.String(), "NerdCast") {
++		t.Errorf("list failed: %d %s", w.Code, w.Body)
++	}
++
++	// 3. Get Show
++	w = do(t, api, user, "GET", "/podcasts/p1", "")
++	if w.Code != 200 || !strings.Contains(w.Body.String(), "Episode 1") {
++		t.Errorf("get show failed: %d %s", w.Code, w.Body)
++	}
++
++	// 4. Update Show
++	w = do(t, api, user, "PUT", "/podcasts/p1", `{"keepPolicy":1,"autoDownload":false}`)
++	if w.Code != 200 || !strings.Contains(w.Body.String(), `"keepPolicy":1`) {
++		t.Errorf("update show failed: %d %s", w.Code, w.Body)
++	}
++
++	// 5. Subscribe
++	w = do(t, api, user, "POST", "/podcasts", `{"url":"https://feed.test","keepPolicy":3,"autoDownload":true}`)
++	if w.Code != 201 || !strings.Contains(w.Body.String(), "New Show") {
++		t.Errorf("subscribe failed: %d %s", w.Code, w.Body)
++	}
++
++	// 6. Delete
++	w = do(t, api, admin, "DELETE", "/podcasts/p1?deleteFiles=true", "")
++	if w.Code != 204 {
++		t.Errorf("delete failed: %d", w.Code)
++	}
++}
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index ef1768f6..f06a8019 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -63,22 +63,24 @@ type Editor interface {
+ 
+ type Router struct {
+ 	http.Handler
+-	ds      model.DataStore
+-	svc     Service
+-	imp     Imports
+-	storage Storage
+-	dups    Duplicates
+-	editor  Editor
++	ds       model.DataStore
++	svc      Service
++	imp      Imports
++	storage  Storage
++	dups     Duplicates
++	editor   Editor
++	podcasts Podcasts
+ }
+ 
+ func New(ds model.DataStore, s *seer.Seer) *Router {
+ 	r := &Router{
+-		ds:      ds,
+-		svc:     s,
+-		imp:     s.Importer,
+-		storage: s.Storage,
+-		dups:    s.Duplicates,
+-		editor:  s.Editor,
++		ds:       ds,
++		svc:      s,
++		imp:      s.Importer,
++		storage:  s.Storage,
++		dups:     s.Duplicates,
++		editor:   s.Editor,
++		podcasts: s.Podcasts,
+ 	}
+ 	r.Handler = r.routes()
+ 	return r
+@@ -117,6 +119,13 @@ func NewWithServices(ds model.DataStore, svc Service, editor Editor) *Router {
+ 	return r
+ }
+ 
++// NewWithPodcasts builds the router around any Service and Podcasts (used by tests).
++func NewWithPodcasts(ds model.DataStore, svc Service, p Podcasts) *Router {
++	r := &Router{ds: ds, svc: svc, podcasts: p}
++	r.Handler = r.routes()
++	return r
++}
++
+ func (api *Router) routes() http.Handler {
+ 	r := chi.NewRouter()
+ 	r.Group(func(r chi.Router) {
+@@ -159,6 +168,23 @@ func (api *Router) routes() http.Handler {
+ 				r.Delete("/album/{id}", api.deleteAlbum)
+ 			})
+ 		}
++		if api.podcasts != nil {
++			r.Route("/podcasts", func(r chi.Router) {
++				r.Get("/search", api.searchPodcasts)
++				r.Get("/", api.listPodcasts)
++				r.Post("/", api.createPodcast)
++				r.Post("/refresh-all", api.refreshAllPodcasts)
++				r.Get("/episodes/{epId}/stream", api.streamEpisode)
++				r.Post("/episodes/{epId}/download", api.downloadEpisode)
++				r.Delete("/episodes/{epId}", api.deleteEpisode)
++				r.Route("/{id}", func(r chi.Router) {
++					r.Get("/", api.getPodcast)
++					r.Put("/", api.updatePodcast)
++					r.Delete("/", api.deletePodcast)
++					r.Post("/refresh", api.refreshPodcast)
++				})
++			})
++		}
+ 	})
+ 	return r
+ }
+diff --git a/ui/src/App.jsx b/ui/src/App.jsx
+index 0969937c..a5f1b812 100644
+--- a/ui/src/App.jsx
++++ b/ui/src/App.jsx
+@@ -52,6 +52,7 @@ import { HTML5Backend } from 'react-dnd-html5-backend'
+ import { DndProvider } from 'react-dnd'
+ import missing from './missing/index.js'
+ import seer from './seer'
++import podcast from './podcast'
+ import { useEffect } from 'react'
+ 
+ const history = createHashHistory()
+@@ -138,6 +139,7 @@ const Admin = (props) => {
+         />,
+         config.enableSharing && <Resource name="share" {...share} />,
+         config.seerEnabled && <Resource name="seer" {...seer} />,
++        config.seerEnabled && <Resource name="podcast" {...podcast} />,
+         <Resource
+           name="playlist"
+           {...playlist}
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 62453533..6a38de7b 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -622,6 +622,39 @@
+         "confirm": "Remove %{smart_count} copy |||| Remove %{smart_count} copies",
+         "cleaned": "%{smart_count} copy moved to the trash |||| %{smart_count} copies moved to the trash"
+       }
++    },
++    "podcast": {
++      "name": "Podcast |||| Podcasts",
++      "episodes": "Episodes",
++      "add": "Add Podcast",
++      "searchPlaceholder": "Search podcasts on Apple Podcasts or YouTube...",
++      "searchBtn": "Search",
++      "searchTab": "Search Podcasts",
++      "directUrlTab": "Direct URL (YouTube / RSS)",
++      "urlLabel": "RSS or YouTube Link",
++      "urlHelper": "Supports YouTube channels, playlists or videos and podcast RSS feeds.",
++      "keepPolicyTitle": "Download and retention policy:",
++      "keepAll": "Download all and keep all",
++      "keep1": "Keep only the latest episode (deletes previous ones when new arrives)",
++      "keep3": "Keep the last 3 episodes",
++      "autoDownloadWeekly": "Check and download new episodes periodically (weekly)",
++      "subscribe": "Subscribe",
++      "unsubscribe": "Delete podcast",
++      "refresh": "Check now",
++      "refreshAll": "Check all",
++      "settings": "Retention settings",
++      "backToList": "All Podcasts",
++      "noResults": "No podcasts found",
++      "selectOne": "Select a podcast from the list",
++      "enterUrl": "Enter the podcast URL",
++      "subscribedSuccess": "Subscribed successfully! Episodes are being downloaded.",
++      "refreshStarted": "Checking for new episodes...",
++      "refreshAllStarted": "Checking all subscribed podcasts...",
++      "settingsSaved": "Settings saved successfully!",
++      "deletedSuccess": "Podcast deleted",
++      "playing": "Playing episode: %{title}",
++      "downloadingEp": "Download started!",
++      "deletedEp": "Episode file deleted."
+     }
+   },
+   "ra": {
+diff --git a/ui/src/podcast/AddPodcastDialog.jsx b/ui/src/podcast/AddPodcastDialog.jsx
+new file mode 100644
+index 00000000..caf8b46c
+--- /dev/null
++++ b/ui/src/podcast/AddPodcastDialog.jsx
+@@ -0,0 +1,467 @@
++import React, { useState, useEffect } from 'react'
++import {
++  Dialog,
++  DialogTitle,
++  DialogContent,
++  DialogActions,
++  Button,
++  TextField,
++  Typography,
++  Tabs,
++  Tab,
++  Box,
++  CircularProgress,
++  RadioGroup,
++  FormControlLabel,
++  Radio,
++  Checkbox,
++  Card,
++  CardMedia,
++  CardContent,
++  Chip,
++  makeStyles,
++  InputAdornment,
++  IconButton,
++} from '@material-ui/core'
++import SearchIcon from '@material-ui/icons/Search'
++import CloseIcon from '@material-ui/icons/Close'
++import RssFeedIcon from '@material-ui/icons/RssFeed'
++import YouTubeIcon from '@material-ui/icons/YouTube'
++import { useNotify, useTranslate } from 'react-admin'
++import { searchPodcasts, createPodcast } from '../seer/api'
++
++const useStyles = makeStyles((theme) => ({
++  dialogContent: {
++    paddingTop: theme.spacing(1),
++    minWidth: 500,
++    [theme.breakpoints.down('xs')]: {
++      minWidth: 'auto',
++    },
++  },
++  searchBox: {
++    marginBottom: theme.spacing(2),
++  },
++  resultsList: {
++    maxHeight: 320,
++    overflowY: 'auto',
++    display: 'flex',
++    flexDirection: 'column',
++    gap: theme.spacing(1),
++    marginBottom: theme.spacing(2),
++    paddingRight: theme.spacing(0.5),
++  },
++  resultCard: {
++    display: 'flex',
++    alignItems: 'center',
++    cursor: 'pointer',
++    padding: theme.spacing(1),
++    border: '2px solid transparent',
++    transition: 'border-color 150ms ease, background 150ms ease',
++    '&:hover': {
++      backgroundColor: theme.palette.action.hover,
++    },
++  },
++  resultCardSelected: {
++    borderColor: theme.palette.primary.main,
++    backgroundColor: theme.palette.action.selected,
++  },
++  cardMedia: {
++    width: 60,
++    height: 60,
++    borderRadius: 8,
++    flexShrink: 0,
++    backgroundColor: theme.palette.grey[300],
++  },
++  cardContent: {
++    flex: 1,
++    padding: '0 0 0 12px !important',
++    minWidth: 0,
++  },
++  cardTitle: {
++    fontWeight: 600,
++    fontSize: '0.95rem',
++    whiteSpace: 'nowrap',
++    overflow: 'hidden',
++    textOverflow: 'ellipsis',
++  },
++  cardAuthor: {
++    color: theme.palette.text.secondary,
++    fontSize: '0.85rem',
++    whiteSpace: 'nowrap',
++    overflow: 'hidden',
++    textOverflow: 'ellipsis',
++  },
++  policySection: {
++    marginTop: theme.spacing(2),
++    padding: theme.spacing(1.5),
++    borderRadius: 8,
++    backgroundColor:
++      theme.palette.type === 'dark'
++        ? 'rgba(255,255,255,0.05)'
++        : 'rgba(0,0,0,0.03)',
++  },
++  policyLabel: {
++    fontWeight: 600,
++    marginBottom: theme.spacing(0.5),
++  },
++}))
++
++export const AddPodcastDialog = ({ open, onClose, onCreated, initialItem }) => {
++  const classes = useStyles()
++  const notify = useNotify()
++  const translate = useTranslate()
++
++  const [tab, setTab] = useState(0)
++  const [searchTerm, setSearchTerm] = useState('')
++  const [searching, setSearching] = useState(false)
++  const [searchResults, setSearchResults] = useState([])
++  const [selectedResult, setSelectedResult] = useState(null)
++
++  const [directUrl, setDirectUrl] = useState('')
++  const [keepPolicy, setKeepPolicy] = useState(1) // default: keep 1
++  const [autoDownload, setAutoDownload] = useState(true)
++  const [submitting, setSubmitting] = useState(false)
++
++  // Reset when opened
++  useEffect(() => {
++    if (open) {
++      if (initialItem) {
++        setTab(0)
++        setSearchTerm(initialItem.title || '')
++        setSearchResults([initialItem])
++        setSelectedResult(initialItem)
++        setDirectUrl(initialItem.feedUrl || initialItem.url || '')
++      } else {
++        setTab(0)
++        setSearchTerm('')
++        setSearchResults([])
++        setSelectedResult(null)
++        setDirectUrl('')
++      }
++      setKeepPolicy(1)
++      setAutoDownload(true)
++      setSubmitting(false)
++    }
++  }, [open, initialItem])
++
++  const handleSearch = (e) => {
++    e?.preventDefault()
++    const query = searchTerm.trim()
++    if (!query) return
++
++    setSearching(true)
++    setSelectedResult(null)
++    searchPodcasts(query, 'all', 15)
++      .then((results) => {
++        setSearchResults(results || [])
++        if (!results || results.length === 0) {
++          notify(
++            translate('resources.podcast.noResults', {
++              _: 'Nenhum podcast encontrado',
++            }),
++            'info',
++          )
++        }
++      })
++      .catch((err) => {
++        notify(err.message || 'Erro ao buscar podcasts', 'warning')
++      })
++      .finally(() => setSearching(false))
++  }
++
++  const handleSubmit = () => {
++    let url = ''
++    let sourceType = 'rss'
++
++    if (tab === 0) {
++      if (!selectedResult) {
++        notify(
++          translate('resources.podcast.selectOne', {
++            _: 'Selecione um podcast da lista',
++          }),
++          'warning',
++        )
++        return
++      }
++      url = selectedResult.feedUrl
++      sourceType = selectedResult.sourceType || 'rss'
++    } else {
++      url = directUrl.trim()
++      if (!url) {
++        notify(
++          translate('resources.podcast.enterUrl', {
++            _: 'Insira a URL do podcast',
++          }),
++          'warning',
++        )
++        return
++      }
++      if (url.includes('youtube.com') || url.includes('youtu.be')) {
++        sourceType = 'youtube'
++      }
++    }
++
++    setSubmitting(true)
++    createPodcast({
++      url,
++      sourceType,
++      keepPolicy: Number(keepPolicy),
++      autoDownload,
++    })
++      .then((ch) => {
++        notify(
++          translate('resources.podcast.subscribedSuccess', {
++            _: 'Podcast inscrito com sucesso! Os episódios serão baixados.',
++          }),
++          'info',
++        )
++        if (onCreated) onCreated(ch)
++        onClose()
++      })
++      .catch((err) => {
++        notify(err.message || 'Erro ao inscrever podcast', 'warning')
++      })
++      .finally(() => setSubmitting(false))
++  }
++
++  return (
++    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
++      <DialogTitle>
++        {translate('resources.podcast.add', { _: 'Adicionar Podcast' })}
++      </DialogTitle>
++      <DialogContent className={classes.dialogContent}>
++        <Tabs
++          value={tab}
++          onChange={(_, val) => setTab(val)}
++          indicatorColor="primary"
++          textColor="primary"
++          variant="fullWidth"
++          style={{ marginBottom: 16 }}
++        >
++          <Tab
++            label={translate('resources.podcast.searchTab', {
++              _: 'Buscar Podcasts',
++            })}
++          />
++          <Tab
++            label={translate('resources.podcast.directUrlTab', {
++              _: 'URL Direta (YouTube / RSS)',
++            })}
++          />
++        </Tabs>
++
++        {tab === 0 && (
++          <div>
++            <form onSubmit={handleSearch} className={classes.searchBox}>
++              <TextField
++                fullWidth
++                variant="outlined"
++                size="small"
++                placeholder={translate('resources.podcast.searchPlaceholder', {
++                  _: 'Buscar podcasts no Apple Podcasts ou YouTube...',
++                })}
++                value={searchTerm}
++                onChange={(e) => setSearchTerm(e.target.value)}
++                InputProps={{
++                  startAdornment: (
++                    <InputAdornment position="start">
++                      <SearchIcon color="action" />
++                    </InputAdornment>
++                  ),
++                  endAdornment: (
++                    <InputAdornment position="end">
++                      {searchTerm && (
++                        <IconButton
++                          size="small"
++                          onClick={() => setSearchTerm('')}
++                        >
++                          <CloseIcon fontSize="small" />
++                        </IconButton>
++                      )}
++                      <Button
++                        size="small"
++                        color="primary"
++                        variant="contained"
++                        onClick={handleSearch}
++                        disabled={searching || !searchTerm.trim()}
++                        style={{ marginLeft: 8 }}
++                      >
++                        {searching ? (
++                          <CircularProgress size={20} color="inherit" />
++                        ) : (
++                          translate('resources.podcast.searchBtn', {
++                            _: 'Buscar',
++                          })
++                        )}
++                      </Button>
++                    </InputAdornment>
++                  ),
++                }}
++              />
++            </form>
++
++            <div className={classes.resultsList}>
++              {searching && (
++                <Box display="flex" justifyContent="center" p={3}>
++                  <CircularProgress size={32} />
++                </Box>
++              )}
++              {!searching &&
++                searchResults.map((item, index) => {
++                  const isSelected = selectedResult?.feedUrl === item.feedUrl
++                  return (
++                    <Card
++                      key={index}
++                      className={`${classes.resultCard} ${
++                        isSelected ? classes.resultCardSelected : ''
++                      }`}
++                      onClick={() => setSelectedResult(item)}
++                    >
++                      {item.imageUrl ? (
++                        <CardMedia
++                          className={classes.cardMedia}
++                          image={item.imageUrl}
++                          title={item.title}
++                        />
++                      ) : (
++                        <Box
++                          className={classes.cardMedia}
++                          display="flex"
++                          alignItems="center"
++                          justifyContent="center"
++                        >
++                          {item.sourceType === 'youtube' ? (
++                            <YouTubeIcon color="error" />
++                          ) : (
++                            <RssFeedIcon color="primary" />
++                          )}
++                        </Box>
++                      )}
++                      <CardContent className={classes.cardContent}>
++                        <Typography className={classes.cardTitle}>
++                          {item.title}
++                        </Typography>
++                        <Typography className={classes.cardAuthor}>
++                          {item.author || item.description}
++                        </Typography>
++                        <Box display="flex" gap={1} mt={0.5}>
++                          <Chip
++                            size="small"
++                            label={
++                              item.sourceType === 'youtube'
++                                ? 'YouTube'
++                                : 'Apple Podcasts / RSS'
++                            }
++                            icon={
++                              item.sourceType === 'youtube' ? (
++                                <YouTubeIcon />
++                              ) : (
++                                <RssFeedIcon />
++                              )
++                            }
++                            variant="outlined"
++                          />
++                        </Box>
++                      </CardContent>
++                    </Card>
++                  )
++                })}
++            </div>
++          </div>
++        )}
++
++        {tab === 1 && (
++          <Box mb={2}>
++            <TextField
++              fullWidth
++              variant="outlined"
++              label={translate('resources.podcast.urlLabel', {
++                _: 'Link do RSS ou YouTube',
++              })}
++              placeholder="https://feed.podbean.com/... ou https://youtube.com/@podcast"
++              value={directUrl}
++              onChange={(e) => setDirectUrl(e.target.value)}
++              helperText={translate('resources.podcast.urlHelper', {
++                _: 'Suporta canais, playlists ou vídeos do YouTube e feeds RSS de podcasts.',
++              })}
++            />
++          </Box>
++        )}
++
++        {/* Retention Policy & Automatic Download */}
++        <div className={classes.policySection}>
++          <Typography className={classes.policyLabel}>
++            {translate('resources.podcast.keepPolicyTitle', {
++              _: 'Política de download e retenção:',
++            })}
++          </Typography>
++          <RadioGroup
++            value={keepPolicy}
++            onChange={(e) => setKeepPolicy(Number(e.target.value))}
++          >
++            <FormControlLabel
++              value={1}
++              control={<Radio color="primary" size="small" />}
++              label={translate('resources.podcast.keep1', {
++                _: 'Manter apenas o último episódio (apaga anteriores ao baixar o novo)',
++              })}
++            />
++            <FormControlLabel
++              value={3}
++              control={<Radio color="primary" size="small" />}
++              label={translate('resources.podcast.keep3', {
++                _: 'Manter os 3 últimos episódios',
++              })}
++            />
++            <FormControlLabel
++              value={0}
++              control={<Radio color="primary" size="small" />}
++              label={translate('resources.podcast.keepAll', {
++                _: 'Baixar todos e manter todos',
++              })}
++            />
++          </RadioGroup>
++
++          <Box mt={1}>
++            <FormControlLabel
++              control={
++                <Checkbox
++                  checked={autoDownload}
++                  onChange={(e) => setAutoDownload(e.target.checked)}
++                  color="primary"
++                  size="small"
++                />
++              }
++              label={translate('resources.podcast.autoDownloadWeekly', {
++                _: 'Verificar e baixar novos episódios periodicamente (semanalmente)',
++              })}
++            />
++          </Box>
++        </div>
++      </DialogContent>
++      <DialogActions>
++        <Button onClick={onClose} disabled={submitting}>
++          {translate('ra.action.cancel', { _: 'Cancelar' })}
++        </Button>
++        <Button
++          onClick={handleSubmit}
++          color="primary"
++          variant="contained"
++          disabled={
++            submitting ||
++            (tab === 0 && !selectedResult) ||
++            (tab === 1 && !directUrl.trim())
++          }
++        >
++          {submitting ? (
++            <CircularProgress size={20} color="inherit" />
++          ) : (
++            translate('resources.podcast.subscribe', { _: 'Inscrever-se' })
++          )}
++        </Button>
++      </DialogActions>
++    </Dialog>
++  )
++}
++
++export default AddPodcastDialog
+diff --git a/ui/src/podcast/PodcastList.jsx b/ui/src/podcast/PodcastList.jsx
+new file mode 100644
+index 00000000..b15fd7dc
+--- /dev/null
++++ b/ui/src/podcast/PodcastList.jsx
+@@ -0,0 +1,365 @@
++import React, { useState, useEffect, useCallback } from 'react'
++import {
++  Box,
++  Typography,
++  Button,
++  IconButton,
++  Grid,
++  Card,
++  CardMedia,
++  CardContent,
++  CardActionArea,
++  Chip,
++  CircularProgress,
++  makeStyles,
++  Tooltip,
++} from '@material-ui/core'
++import AddIcon from '@material-ui/icons/Add'
++import RefreshIcon from '@material-ui/icons/Refresh'
++import MicIcon from '@material-ui/icons/Mic'
++import { Title, useNotify, useTranslate } from 'react-admin'
++import { useRefreshOnEvents } from '../common'
++import { listPodcasts, refreshAllPodcasts, refreshPodcast } from '../seer/api'
++import AddPodcastDialog from './AddPodcastDialog'
++import PodcastShow from './PodcastShow'
++
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  return {
++    root: {
++      padding: theme.spacing(2, 3, 12),
++      maxWidth: 1600,
++      margin: '0 auto',
++      [theme.breakpoints.down('xs')]: {
++        padding: theme.spacing(1, 1, 12),
++      },
++    },
++    topBar: {
++      display: 'flex',
++      alignItems: 'center',
++      justifyContent: 'space-between',
++      marginBottom: theme.spacing(3),
++      flexWrap: 'wrap',
++      gap: theme.spacing(2),
++    },
++    pageTitle: {
++      fontWeight: 800,
++      fontSize: '2rem',
++    },
++    actions: {
++      display: 'flex',
++      alignItems: 'center',
++      gap: theme.spacing(1.5),
++    },
++    emptyState: {
++      textAlign: 'center',
++      padding: theme.spacing(8, 3),
++      borderRadius: 20,
++      background: dark
++        ? 'linear-gradient(135deg, rgba(30, 215, 96, 0.08) 0%, rgba(124, 77, 255, 0.08) 100%)'
++        : 'linear-gradient(135deg, rgba(30, 215, 96, 0.04) 0%, rgba(124, 77, 255, 0.04) 100%)',
++      border: `1px solid ${dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)'}`,
++    },
++    emptyIcon: {
++      fontSize: 72,
++      color: theme.palette.primary.main,
++      marginBottom: theme.spacing(2),
++    },
++    emptyTitle: {
++      fontWeight: 800,
++      fontSize: '1.6rem',
++      marginBottom: theme.spacing(1),
++    },
++    emptyText: {
++      maxWidth: 540,
++      margin: '0 auto 24px',
++      color: theme.palette.text.secondary,
++      fontSize: '1rem',
++      lineHeight: 1.5,
++    },
++    card: {
++      height: '100%',
++      display: 'flex',
++      flexDirection: 'column',
++      borderRadius: 16,
++      overflow: 'hidden',
++      transition: 'transform 180ms ease, box-shadow 180ms ease',
++      border: `1px solid ${dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}`,
++      '&:hover': {
++        transform: 'translateY(-4px)',
++        boxShadow: dark
++          ? '0 12px 28px rgba(0,0,0,0.5)'
++          : '0 8px 24px rgba(0,0,0,0.12)',
++      },
++    },
++    cardMedia: {
++      paddingTop: '100%', // 1:1 Aspect Ratio
++      position: 'relative',
++      backgroundColor: theme.palette.grey[300],
++    },
++    cardContent: {
++      flex: 1,
++      display: 'flex',
++      flexDirection: 'column',
++      justifyContent: 'space-between',
++      padding: theme.spacing(2),
++    },
++    showTitle: {
++      fontWeight: 700,
++      fontSize: '1.05rem',
++      lineHeight: 1.3,
++      marginBottom: 4,
++      whiteSpace: 'nowrap',
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++    },
++    showAuthor: {
++      color: theme.palette.text.secondary,
++      fontSize: '0.85rem',
++      marginBottom: 12,
++      whiteSpace: 'nowrap',
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++    },
++    badgesRow: {
++      display: 'flex',
++      gap: theme.spacing(0.75),
++      flexWrap: 'wrap',
++    },
++    quickRefreshBtn: {
++      position: 'absolute',
++      right: 8,
++      bottom: 8,
++      backgroundColor: 'rgba(0,0,0,0.6)',
++      color: '#fff',
++      '&:hover': {
++        backgroundColor: 'rgba(0,0,0,0.85)',
++      },
++    },
++  }
++})
++
++export const PodcastList = () => {
++  const classes = useStyles()
++  const notify = useNotify()
++  const translate = useTranslate()
++
++  const [loading, setLoading] = useState(true)
++  const [podcasts, setPodcasts] = useState([])
++  const [selectedShowId, setSelectedShowId] = useState(null)
++  const [addDialogOpen, setAddDialogOpen] = useState(false)
++  const [refreshingAll, setRefreshingAll] = useState(false)
++
++  const loadData = useCallback(() => {
++    return listPodcasts()
++      .then((data) => {
++        setPodcasts(data || [])
++      })
++      .catch((err) => {
++        notify(err.message || 'Erro ao carregar podcasts', 'warning')
++      })
++      .finally(() => setLoading(false))
++  }, [notify])
++
++  useEffect(() => {
++    loadData()
++  }, [loadData])
++
++  useRefreshOnEvents({
++    events: ['podcast', 'seer'],
++    onRefresh: loadData,
++  })
++
++  const handleRefreshAll = () => {
++    setRefreshingAll(true)
++    refreshAllPodcasts()
++      .then(() => {
++        notify(
++          translate('resources.podcast.refreshAllStarted', {
++            _: 'Verificando todos os podcasts inscritos...',
++          }),
++          'info',
++        )
++      })
++      .catch((err) => notify(err.message || 'Erro ao atualizar', 'warning'))
++      .finally(() => setRefreshingAll(false))
++  }
++
++  const handleRefreshSingle = (e, id) => {
++    e.stopPropagation()
++    refreshPodcast(id)
++      .then(() => {
++        notify(
++          translate('resources.podcast.refreshStarted', {
++            _: 'Verificando episódios...',
++          }),
++          'info',
++        )
++      })
++      .catch((err) => notify(err.message || 'Erro ao atualizar', 'warning'))
++  }
++
++  const policyText = (policy) => {
++    switch (policy) {
++      case 1:
++        return 'Manter 1 último'
++      case 3:
++        return 'Manter 3 últimos'
++      default:
++        return 'Manter todos'
++    }
++  }
++
++  if (selectedShowId) {
++    return (
++      <PodcastShow
++        id={selectedShowId}
++        onBack={() => setSelectedShowId(null)}
++      />
++    )
++  }
++
++  return (
++    <div className={classes.root}>
++      <Title
++        title={'Navidrome - ' + translate('resources.podcast.name', { smart_count: 2, _: 'Podcasts' })}
++      />
++
++      <div className={classes.topBar}>
++        <div>
++          <Typography className={classes.pageTitle}>
++            {translate('resources.podcast.name', { smart_count: 2, _: 'Podcasts' })}
++          </Typography>
++          <Typography variant="body2" color="textSecondary">
++            {podcasts.length}{' '}
++            {podcasts.length === 1
++              ? 'podcast inscrito'
++              : 'podcasts inscritos'}
++          </Typography>
++        </div>
++
++        <div className={classes.actions}>
++          {podcasts.length > 0 && (
++            <Button
++              variant="outlined"
++              startIcon={
++                refreshingAll ? (
++                  <CircularProgress size={16} color="inherit" />
++                ) : (
++                  <RefreshIcon />
++                )
++              }
++              onClick={handleRefreshAll}
++              disabled={refreshingAll}
++            >
++              {translate('resources.podcast.refreshAll', { _: 'Verificar todos' })}
++            </Button>
++          )}
++
++          <Button
++            variant="contained"
++            color="primary"
++            startIcon={<AddIcon />}
++            onClick={() => setAddDialogOpen(true)}
++          >
++            {translate('resources.podcast.add', { _: 'Adicionar Podcast' })}
++          </Button>
++        </div>
++      </div>
++
++      {loading ? (
++        <Box display="flex" justifyContent="center" p={8}>
++          <CircularProgress size={48} />
++        </Box>
++      ) : podcasts.length === 0 ? (
++        <div className={classes.emptyState}>
++          <MicIcon className={classes.emptyIcon} />
++          <Typography className={classes.emptyTitle}>
++            Descubra e acompanhe seus Podcasts
++          </Typography>
++          <Typography className={classes.emptyText}>
++            Adicione podcasts do YouTube, Apple Podcasts ou feeds RSS.
++            Você pode escolher manter apenas o último episódio, os 3 últimos ou todos,
++            com verificação periódica semanal automática!
++          </Typography>
++          <Button
++            variant="contained"
++            color="primary"
++            size="large"
++            startIcon={<AddIcon />}
++            onClick={() => setAddDialogOpen(true)}
++          >
++            Adicionar meu primeiro Podcast
++          </Button>
++        </div>
++      ) : (
++        <Grid container spacing={3}>
++          {podcasts.map((show) => (
++            <Grid item xs={12} sm={6} md={4} lg={3} key={show.id}>
++              <Card className={classes.card}>
++                <CardActionArea
++                  onClick={() => setSelectedShowId(show.id)}
++                  style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch' }}
++                >
++                  <CardMedia
++                    className={classes.cardMedia}
++                    image={show.imageUrl}
++                    title={show.title}
++                  >
++                    <Tooltip title="Verificar agora">
++                      <IconButton
++                        size="small"
++                        className={classes.quickRefreshBtn}
++                        onClick={(e) => handleRefreshSingle(e, show.id)}
++                      >
++                        <RefreshIcon fontSize="small" />
++                      </IconButton>
++                    </Tooltip>
++                  </CardMedia>
++
++                  <CardContent className={classes.cardContent}>
++                    <div>
++                      <Typography className={classes.showTitle}>
++                        {show.title}
++                      </Typography>
++                      <Typography className={classes.showAuthor}>
++                        {show.author}
++                      </Typography>
++                    </div>
++
++                    <div className={classes.badgesRow}>
++                      <Chip
++                        size="small"
++                        label={policyText(show.keepPolicy)}
++                        variant="outlined"
++                        color="primary"
++                      />
++                      <Chip
++                        size="small"
++                        label={`${show.downloadedCount || 0}/${show.episodeCount || 0} baixados`}
++                        variant="default"
++                      />
++                    </div>
++                  </CardContent>
++                </CardActionArea>
++              </Card>
++            </Grid>
++          ))}
++        </Grid>
++      )}
++
++      <AddPodcastDialog
++        open={addDialogOpen}
++        onClose={() => setAddDialogOpen(false)}
++        onCreated={(newShow) => {
++          loadData()
++          if (newShow?.id) {
++            setSelectedShowId(newShow.id)
++          }
++        }}
++      />
++    </div>
++  )
++}
++
++export default PodcastList
+diff --git a/ui/src/podcast/PodcastShow.jsx b/ui/src/podcast/PodcastShow.jsx
+new file mode 100644
+index 00000000..9156f1d7
+--- /dev/null
++++ b/ui/src/podcast/PodcastShow.jsx
+@@ -0,0 +1,636 @@
++import React, { useState, useEffect, useCallback } from 'react'
++import {
++  Box,
++  Typography,
++  Button,
++  IconButton,
++  Chip,
++  Card,
++  CardMedia,
++  CardContent,
++  Table,
++  TableBody,
++  TableCell,
++  TableContainer,
++  TableHead,
++  TableRow,
++  Paper,
++  CircularProgress,
++  Dialog,
++  DialogTitle,
++  DialogContent,
++  DialogActions,
++  RadioGroup,
++  FormControlLabel,
++  Radio,
++  Checkbox,
++  makeStyles,
++  Tooltip,
++} from '@material-ui/core'
++import ArrowBackIcon from '@material-ui/icons/ArrowBack'
++import PlayArrowIcon from '@material-ui/icons/PlayArrow'
++import GetAppIcon from '@material-ui/icons/GetApp'
++import DeleteOutlineIcon from '@material-ui/icons/DeleteOutline'
++import RefreshIcon from '@material-ui/icons/Refresh'
++import SettingsIcon from '@material-ui/icons/Settings'
++import OpenInNewIcon from '@material-ui/icons/OpenInNew'
++import MicIcon from '@material-ui/icons/Mic'
++import { useNotify, useTranslate } from 'react-admin'
++import { useDispatch } from 'react-redux'
++import { playTracks } from '../actions'
++import { useRefreshOnEvents } from '../common'
++import {
++  getPodcast,
++  updatePodcast,
++  deletePodcast,
++  refreshPodcast,
++  downloadEpisode,
++  deleteEpisode,
++} from '../seer/api'
++
++const useStyles = makeStyles((theme) => ({
++  root: {
++    padding: theme.spacing(2, 3, 12),
++    maxWidth: 1400,
++    margin: '0 auto',
++    [theme.breakpoints.down('xs')]: {
++      padding: theme.spacing(1, 1, 12),
++    },
++  },
++  headerCard: {
++    display: 'flex',
++    padding: theme.spacing(2.5),
++    marginBottom: theme.spacing(3),
++    gap: theme.spacing(3),
++    borderRadius: 16,
++    [theme.breakpoints.down('xs')]: {
++      flexDirection: 'column',
++      alignItems: 'center',
++      textAlign: 'center',
++    },
++  },
++  cover: {
++    width: 180,
++    height: 180,
++    borderRadius: 12,
++    flexShrink: 0,
++    boxShadow: theme.shadows[4],
++    backgroundColor: theme.palette.grey[300],
++    display: 'flex',
++    alignItems: 'center',
++    justifyContent: 'center',
++  },
++  headerContent: {
++    flex: 1,
++    display: 'flex',
++    flexDirection: 'column',
++    justifyContent: 'space-between',
++    padding: '0 !important',
++  },
++  title: {
++    fontWeight: 800,
++    fontSize: '1.8rem',
++    lineHeight: 1.2,
++  },
++  author: {
++    color: theme.palette.text.secondary,
++    fontWeight: 600,
++    fontSize: '1.05rem',
++    marginTop: 4,
++    marginBottom: 8,
++  },
++  description: {
++    color: theme.palette.text.secondary,
++    fontSize: '0.9rem',
++    maxHeight: 60,
++    overflow: 'hidden',
++    textOverflow: 'ellipsis',
++    display: '-webkit-box',
++    WebkitLineClamp: 3,
++    WebkitBoxOrient: 'vertical',
++    marginBottom: theme.spacing(1.5),
++  },
++  actionsRow: {
++    display: 'flex',
++    alignItems: 'center',
++    gap: theme.spacing(1),
++    flexWrap: 'wrap',
++    marginTop: theme.spacing(1),
++  },
++  episodeRow: {
++    '&:hover': {
++      backgroundColor: theme.palette.action.hover,
++    },
++  },
++  playBtn: {
++    backgroundColor: theme.palette.primary.main,
++    color: theme.palette.primary.contrastText,
++    '&:hover': {
++      backgroundColor: theme.palette.primary.dark,
++    },
++  },
++}))
++
++export const PodcastShow = ({ id, onBack }) => {
++  const classes = useStyles()
++  const notify = useNotify()
++  const translate = useTranslate()
++  const dispatch = useDispatch()
++
++  const [loading, setLoading] = useState(true)
++  const [show, setShow] = useState(null)
++  const [episodes, setEpisodes] = useState([])
++  const [refreshing, setRefreshing] = useState(false)
++
++  // Settings Dialog
++  const [settingsOpen, setSettingsOpen] = useState(false)
++  const [editKeepPolicy, setEditKeepPolicy] = useState(1)
++  const [editAutoDownload, setEditAutoDownload] = useState(true)
++
++  // Delete Dialog
++  const [deleteOpen, setDeleteOpen] = useState(false)
++  const [deleteFiles, setDeleteFiles] = useState(true)
++
++  const loadData = useCallback(() => {
++    return getPodcast(id)
++      .then((data) => {
++        setShow(data)
++        setEpisodes(data.episodes || [])
++        setEditKeepPolicy(data.keepPolicy ?? 1)
++        setEditAutoDownload(data.autoDownload ?? true)
++      })
++      .catch((err) => {
++        notify(err.message || 'Erro ao carregar podcast', 'warning')
++      })
++      .finally(() => setLoading(false))
++  }, [id, notify])
++
++  useEffect(() => {
++    loadData()
++  }, [loadData])
++
++  useRefreshOnEvents({
++    events: ['podcast', 'seer'],
++    onRefresh: loadData,
++  })
++
++  const handleRefresh = () => {
++    setRefreshing(true)
++    refreshPodcast(id)
++      .then(() => {
++        notify(
++          translate('resources.podcast.refreshStarted', {
++            _: 'Verificando novos episódios...',
++          }),
++          'info',
++        )
++      })
++      .catch((err) => notify(err.message || 'Erro ao atualizar', 'warning'))
++      .finally(() => setRefreshing(false))
++  }
++
++  const handleSaveSettings = () => {
++    updatePodcast(id, {
++      keepPolicy: Number(editKeepPolicy),
++      autoDownload: editAutoDownload,
++    })
++      .then((updated) => {
++        setShow((prev) => ({ ...prev, ...updated }))
++        setSettingsOpen(false)
++        notify(
++          translate('resources.podcast.settingsSaved', {
++            _: 'Configurações salvas com sucesso!',
++          }),
++          'info',
++        )
++        // Refresh to apply new policy immediately
++        refreshPodcast(id)
++      })
++      .catch((err) => notify(err.message || 'Erro ao salvar', 'warning'))
++  }
++
++  const handleDelete = () => {
++    deletePodcast(id, deleteFiles)
++      .then(() => {
++        notify(
++          translate('resources.podcast.deletedSuccess', {
++            _: 'Podcast excluído',
++          }),
++          'info',
++        )
++        setDeleteOpen(false)
++        if (onBack) onBack()
++      })
++      .catch((err) => notify(err.message || 'Erro ao excluir', 'warning'))
++  }
++
++  const handlePlayEpisode = (ep) => {
++    const track = {
++      id: ep.id,
++      trackId: ep.id,
++      title: ep.title,
++      name: ep.title,
++      artist: show.title,
++      album: show.title,
++      cover: ep.imageUrl || show.imageUrl,
++      streamUrl: `/api/seer/podcasts/episodes/${ep.id}/stream`,
++      isPodcast: true,
++    }
++    dispatch(playTracks({ [ep.id]: track }, [ep.id], ep.id))
++    notify(
++      translate('resources.podcast.playing', {
++        _: 'Reproduzindo episódio: %{title}',
++        title: ep.title,
++      }),
++      'info',
++    )
++  }
++
++  const handleDownloadEp = (ep) => {
++    downloadEpisode(ep.id)
++      .then(() => {
++        notify(
++          translate('resources.podcast.downloadingEp', {
++            _: 'Download iniciado!',
++          }),
++          'info',
++        )
++        setEpisodes((prev) =>
++          prev.map((e) => (e.id === ep.id ? { ...e, status: 'downloading' } : e)),
++        )
++      })
++      .catch((err) => notify(err.message || 'Erro ao iniciar download', 'warning'))
++  }
++
++  const handleDeleteEp = (ep) => {
++    deleteEpisode(ep.id)
++      .then(() => {
++        notify(
++          translate('resources.podcast.deletedEp', {
++            _: 'Arquivo do episódio excluído.',
++          }),
++          'info',
++        )
++        setEpisodes((prev) =>
++          prev.map((e) =>
++            e.id === ep.id ? { ...e, status: 'deleted', filePath: '' } : e,
++          ),
++        )
++      })
++      .catch((err) => notify(err.message || 'Erro ao excluir áudio', 'warning'))
++  }
++
++  const formatDuration = (seconds) => {
++    if (!seconds) return ''
++    const h = Math.floor(seconds / 3600)
++    const m = Math.floor((seconds % 3600) / 60)
++    if (h > 0) return `${h}h ${m}m`
++    return `${m} min`
++  }
++
++  const formatDate = (dateStr) => {
++    if (!dateStr) return ''
++    try {
++      return new Date(dateStr).toLocaleDateString(undefined, {
++        day: '2-digit',
++        month: 'short',
++        year: 'numeric',
++      })
++    } catch {
++      return dateStr
++    }
++  }
++
++  const policyLabel = (policy) => {
++    switch (policy) {
++      case 1:
++        return 'Manter apenas o último'
++      case 3:
++        return 'Manter os 3 últimos'
++      default:
++        return 'Manter todos'
++    }
++  }
++
++  if (loading) {
++    return (
++      <Box display="flex" justifyContent="center" p={8}>
++        <CircularProgress size={48} />
++      </Box>
++    )
++  }
++
++  if (!show) {
++    return (
++      <Box p={4} textAlign="center">
++        <Typography variant="h6">Podcast não encontrado</Typography>
++        <Button onClick={onBack} startIcon={<ArrowBackIcon />} style={{ marginTop: 16 }}>
++          Voltar
++        </Button>
++      </Box>
++    )
++  }
++
++  return (
++    <div className={classes.root}>
++      <Button
++        startIcon={<ArrowBackIcon />}
++        onClick={onBack}
++        style={{ marginBottom: 16 }}
++      >
++        {translate('resources.podcast.backToList', { _: 'Todos os Podcasts' })}
++      </Button>
++
++      {/* Show Header */}
++      <Card className={classes.headerCard}>
++        {show.imageUrl ? (
++          <CardMedia className={classes.cover} image={show.imageUrl} title={show.title} />
++        ) : (
++          <div className={classes.cover}>
++            <MicIcon style={{ fontSize: 64, color: '#aaa' }} />
++          </div>
++        )}
++
++        <CardContent className={classes.headerContent}>
++          <div>
++            <Typography className={classes.title}>{show.title}</Typography>
++            <Typography className={classes.author}>{show.author}</Typography>
++            {show.description && (
++              <Typography className={classes.description}>
++                {show.description}
++              </Typography>
++            )}
++
++            <Box display="flex" gap={1} flexWrap="wrap" mb={1}>
++              <Chip
++                label={policyLabel(show.keepPolicy)}
++                color="primary"
++                variant="outlined"
++                size="small"
++              />
++              {show.autoDownload && (
++                <Chip
++                  label="Download semanal ativo"
++                  color="secondary"
++                  variant="outlined"
++                  size="small"
++                />
++              )}
++              {show.url && (
++                <Chip
++                  label="Página de origem"
++                  icon={<OpenInNewIcon fontSize="small" />}
++                  clickable
++                  component="a"
++                  href={show.url}
++                  target="_blank"
++                  rel="noreferrer"
++                  size="small"
++                />
++              )}
++            </Box>
++          </div>
++
++          <div className={classes.actionsRow}>
++            <Button
++              variant="contained"
++              color="primary"
++              startIcon={
++                refreshing ? (
++                  <CircularProgress size={16} color="inherit" />
++                ) : (
++                  <RefreshIcon />
++                )
++              }
++              onClick={handleRefresh}
++              disabled={refreshing}
++            >
++              {translate('resources.podcast.refresh', { _: 'Verificar agora' })}
++            </Button>
++            <Button
++              variant="outlined"
++              startIcon={<SettingsIcon />}
++              onClick={() => setSettingsOpen(true)}
++            >
++              {translate('resources.podcast.settings', {
++                _: 'Configurações de retenção',
++              })}
++            </Button>
++            <Button
++              variant="outlined"
++              color="secondary"
++              startIcon={<DeleteOutlineIcon />}
++              onClick={() => setDeleteOpen(true)}
++            >
++              {translate('resources.podcast.unsubscribe', { _: 'Excluir' })}
++            </Button>
++          </div>
++        </CardContent>
++      </Card>
++
++      {/* Episodes Table */}
++      <Typography variant="h5" style={{ fontWeight: 700, marginBottom: 16 }}>
++        {translate('resources.podcast.episodes', { _: 'Episódios' })} (
++        {episodes.length})
++      </Typography>
++
++      <TableContainer component={Paper} elevation={1} style={{ borderRadius: 12 }}>
++        <Table>
++          <TableHead>
++            <TableRow>
++              <TableCell width={60}></TableCell>
++              <TableCell>{translate('resources.seer.fields.title', { _: 'Título' })}</TableCell>
++              <TableCell width={140}>Data</TableCell>
++              <TableCell width={100}>Duração</TableCell>
++              <TableCell width={140}>Status</TableCell>
++              <TableCell width={100} align="right">Ações</TableCell>
++            </TableRow>
++          </TableHead>
++          <TableBody>
++            {episodes.map((ep) => {
++              const isDownloaded = ep.status === 'downloaded'
++              const isDownloading = ep.status === 'downloading'
++              return (
++                <TableRow key={ep.id} className={classes.episodeRow}>
++                  <TableCell>
++                    <IconButton
++                      size="small"
++                      className={classes.playBtn}
++                      onClick={() => handlePlayEpisode(ep)}
++                      aria-label="Play"
++                    >
++                      <PlayArrowIcon />
++                    </IconButton>
++                  </TableCell>
++                  <TableCell>
++                    <Typography style={{ fontWeight: 600, fontSize: '0.95rem' }}>
++                      {ep.title}
++                    </Typography>
++                    {ep.description && (
++                      <Typography
++                        variant="body2"
++                        color="textSecondary"
++                        style={{
++                          maxHeight: 40,
++                          overflow: 'hidden',
++                          textOverflow: 'ellipsis',
++                          display: '-webkit-box',
++                          WebkitLineClamp: 2,
++                          WebkitBoxOrient: 'vertical',
++                        }}
++                      >
++                        {ep.description}
++                      </Typography>
++                    )}
++                  </TableCell>
++                  <TableCell>{formatDate(ep.publishedAt)}</TableCell>
++                  <TableCell>{formatDuration(ep.duration)}</TableCell>
++                  <TableCell>
++                    {isDownloaded && (
++                      <Chip
++                        size="small"
++                        label="Baixado"
++                        style={{ backgroundColor: '#2e7d32', color: '#fff' }}
++                      />
++                    )}
++                    {isDownloading && (
++                      <Chip
++                        size="small"
++                        label="Baixando..."
++                        color="primary"
++                        icon={<CircularProgress size={14} color="inherit" />}
++                      />
++                    )}
++                    {ep.status === 'pending' && (
++                      <Chip size="small" label="Pendente" variant="outlined" />
++                    )}
++                    {ep.status === 'deleted' && (
++                      <Chip
++                        size="small"
++                        label="Retenção (excluído)"
++                        variant="outlined"
++                        color="default"
++                      />
++                    )}
++                    {ep.status === 'error' && (
++                      <Tooltip title={ep.error || 'Erro ao baixar'}>
++                        <Chip size="small" label="Erro" color="secondary" />
++                      </Tooltip>
++                    )}
++                  </TableCell>
++                  <TableCell align="right">
++                    {isDownloaded ? (
++                      <Tooltip title="Excluir áudio do disco">
++                        <IconButton
++                          size="small"
++                          color="secondary"
++                          onClick={() => handleDeleteEp(ep)}
++                        >
++                          <DeleteOutlineIcon />
++                        </IconButton>
++                      </Tooltip>
++                    ) : (
++                      <Tooltip title="Baixar episódio agora">
++                        <IconButton
++                          size="small"
++                          color="primary"
++                          disabled={isDownloading}
++                          onClick={() => handleDownloadEp(ep)}
++                        >
++                          <GetAppIcon />
++                        </IconButton>
++                      </Tooltip>
++                    )}
++                  </TableCell>
++                </TableRow>
++              )
++            })}
++          </TableBody>
++        </Table>
++      </TableContainer>
++
++      {/* Settings Dialog */}
++      <Dialog
++        open={settingsOpen}
++        onClose={() => setSettingsOpen(false)}
++        maxWidth="xs"
++        fullWidth
++      >
++        <DialogTitle>Configurações de Retenção</DialogTitle>
++        <DialogContent>
++          <Typography variant="subtitle2" style={{ marginBottom: 8, fontWeight: 600 }}>
++            Quantos episódios deseja manter baixados:
++          </Typography>
++          <RadioGroup
++            value={editKeepPolicy}
++            onChange={(e) => setEditKeepPolicy(Number(e.target.value))}
++          >
++            <FormControlLabel
++              value={1}
++              control={<Radio color="primary" size="small" />}
++              label="Manter apenas o último episódio (apaga anteriores)"
++            />
++            <FormControlLabel
++              value={3}
++              control={<Radio color="primary" size="small" />}
++              label="Manter os 3 últimos episódios"
++            />
++            <FormControlLabel
++              value={0}
++              control={<Radio color="primary" size="small" />}
++              label="Baixar todos e manter todos"
++            />
++          </RadioGroup>
++
++          <Box mt={2}>
++            <FormControlLabel
++              control={
++                <Checkbox
++                  checked={editAutoDownload}
++                  onChange={(e) => setEditAutoDownload(e.target.checked)}
++                  color="primary"
++                  size="small"
++                />
++              }
++              label="Baixar novos episódios automaticamente (semanalmente)"
++            />
++          </Box>
++        </DialogContent>
++        <DialogActions>
++          <Button onClick={() => setSettingsOpen(false)}>Cancelar</Button>
++          <Button onClick={handleSaveSettings} color="primary" variant="contained">
++            Salvar
++          </Button>
++        </DialogActions>
++      </Dialog>
++
++      {/* Delete Dialog */}
++      <Dialog open={deleteOpen} onClose={() => setDeleteOpen(false)}>
++        <DialogTitle>Excluir Podcast</DialogTitle>
++        <DialogContent>
++          <Typography style={{ marginBottom: 16 }}>
++            Tem certeza que deseja cancelar a inscrição de <strong>{show.title}</strong>?
++          </Typography>
++          <FormControlLabel
++            control={
++              <Checkbox
++                checked={deleteFiles}
++                onChange={(e) => setDeleteFiles(e.target.checked)}
++                color="secondary"
++              />
++            }
++            label="Excluir também os arquivos de áudio baixados do disco"
++          />
++        </DialogContent>
++        <DialogActions>
++          <Button onClick={() => setDeleteOpen(false)}>Cancelar</Button>
++          <Button onClick={handleDelete} color="secondary" variant="contained">
++            Confirmar Exclusão
++          </Button>
++        </DialogActions>
++      </Dialog>
++    </div>
++  )
++}
++
++export default PodcastShow
+diff --git a/ui/src/podcast/index.jsx b/ui/src/podcast/index.jsx
+new file mode 100644
+index 00000000..34c49bfe
+--- /dev/null
++++ b/ui/src/podcast/index.jsx
+@@ -0,0 +1,16 @@
++import React from 'react'
++import MicIcon from '@material-ui/icons/Mic'
++import MicNoneOutlinedIcon from '@material-ui/icons/MicNoneOutlined'
++import DynamicMenuIcon from '../layout/DynamicMenuIcon'
++import PodcastList from './PodcastList'
++
++export default {
++  list: PodcastList,
++  icon: (
++    <DynamicMenuIcon
++      path={'podcast'}
++      icon={MicNoneOutlinedIcon}
++      activeIcon={MicIcon}
++    />
++  ),
++}
+diff --git a/ui/src/reducers/playerReducer.js b/ui/src/reducers/playerReducer.js
+index d6ab7484..1605dedf 100644
+--- a/ui/src/reducers/playerReducer.js
++++ b/ui/src/reducers/playerReducer.js
+@@ -44,15 +44,17 @@ const mapToAudioLists = (item) => {
+   // If item comes from a playlist, trackId is mediaFileId
+   const trackId = item.mediaFileId || item.id
+ 
+-  if (item.isRadio) {
++  if (item.isRadio || item.isPodcast) {
+     return {
+       trackId,
+       uuid: uuidv4(),
+-      name: item.name,
++      name: item.name || item.title,
++      singer: item.artist,
+       song: item,
+       musicSrc: item.streamUrl,
+       cover: item.cover,
+-      isRadio: true,
++      isRadio: item.isRadio,
++      isPodcast: item.isPodcast,
+     }
+   }
+ 
+@@ -235,7 +237,7 @@ export const playerReducer = (previousState = initialState, payload) => {
+         ...previousState,
+         queue: previousState.queue.map((item) => ({
+           ...item,
+-          musicSrc: item.isRadio
++          musicSrc: item.isRadio || item.isPodcast
+             ? item.musicSrc
+             : resolvedUrls[item.trackId] || subsonic.streamUrl(item.trackId),
+         })),
+diff --git a/ui/src/seer/SearchView.jsx b/ui/src/seer/SearchView.jsx
+index 41ddfe8d..77fd6483 100644
+--- a/ui/src/seer/SearchView.jsx
++++ b/ui/src/seer/SearchView.jsx
+@@ -1,6 +1,20 @@
+-import { ButtonBase, Typography } from '@material-ui/core'
++import React, { useState, useEffect } from 'react'
++import {
++  Button,
++  ButtonBase,
++  Card,
++  CardMedia,
++  CardContent,
++  Chip,
++  Box,
++  Typography,
++} from '@material-ui/core'
+ import { makeStyles } from '@material-ui/core/styles'
++import YouTubeIcon from '@material-ui/icons/YouTube'
++import RssFeedIcon from '@material-ui/icons/RssFeed'
+ import { useTranslate } from 'react-admin'
++import { searchPodcasts } from './api'
++import AddPodcastDialog from '../podcast/AddPodcastDialog'
+ import { ItemAction } from './actions'
+ import { ArtistAvatar, Cover } from './artwork'
+ import {
+@@ -197,10 +211,25 @@ export const SearchSkeleton = () => {
+ export const SearchView = ({ query, results, loading, error, onRetry }) => {
+   const classes = useStyles()
+   const translate = useTranslate()
++
++  const [podcasts, setPodcasts] = useState([])
++  const [selectedPodcast, setSelectedPodcast] = useState(null)
++  const [dialogOpen, setDialogOpen] = useState(false)
++
++  useEffect(() => {
++    if (query && query.trim().length >= 2) {
++      searchPodcasts(query.trim(), 'all', 6)
++        .then((res) => setPodcasts(res || []))
++        .catch(() => setPodcasts([]))
++    } else {
++      setPodcasts([])
++    }
++  }, [query])
++
+   if (loading && !results) return <SearchSkeleton />
+   if (error) return <ErrorState onRetry={onRetry} />
+-  if (!results) return null
+-  if (results.length === 0) {
++  if (!results && podcasts.length === 0) return null
++  if ((!results || results.length === 0) && podcasts.length === 0) {
+     return (
+       <Typography
+         variant="h6"
+@@ -210,28 +239,30 @@ export const SearchView = ({ query, results, loading, error, onRetry }) => {
+       </Typography>
+     )
+   }
+-  const top = pickTop(results, query)
+-  const artists = results.filter((i) => i.kind === 'artist')
+-  const albums = results.filter((i) => i.kind === 'album')
+-  const tracks = results.filter((i) => i.kind === 'track')
++  const top = results && results.length > 0 ? pickTop(results, query) : null
++  const artists = (results || []).filter((i) => i.kind === 'artist')
++  const albums = (results || []).filter((i) => i.kind === 'album')
++  const tracks = (results || []).filter((i) => i.kind === 'track')
+   const firstTracks = tracks.slice(0, 4)
+   const moreTracks = tracks.slice(4)
+   return (
+     <div style={{ opacity: loading ? 0.5 : 1, transition: 'opacity 200ms' }}>
+-      <div className={classes.topRow}>
+-        <Section title={translate('resources.seer.sections.topResult')}>
+-          <TopResult item={top} />
+-        </Section>
+-        {firstTracks.length > 0 && (
+-          <Section title={translate('resources.seer.sections.songs')}>
+-            <div className={classes.songs}>
+-              {firstTracks.map((t) => (
+-                <TrackRow key={t.mbid} item={t} showAlbum={false} />
+-              ))}
+-            </div>
++      {top && (
++        <div className={classes.topRow}>
++          <Section title={translate('resources.seer.sections.topResult')}>
++            <TopResult item={top} />
+           </Section>
+-        )}
+-      </div>
++          {firstTracks.length > 0 && (
++            <Section title={translate('resources.seer.sections.songs')}>
++              <div className={classes.songs}>
++                {firstTracks.map((t) => (
++                  <TrackRow key={t.mbid} item={t} showAlbum={false} />
++                ))}
++              </div>
++            </Section>
++          )}
++        </div>
++      )}
+       {artists.length > 0 && (
+         <Section title={translate('resources.seer.sections.artists')}>
+           <Grid>
+@@ -257,6 +288,106 @@ export const SearchView = ({ query, results, loading, error, onRetry }) => {
+           ))}
+         </Section>
+       )}
++      {podcasts.length > 0 && (
++        <Section title="Podcasts (YouTube / RSS)">
++          <Grid>
++            {podcasts.map((pod, idx) => (
++              <Card
++                key={idx}
++                style={{
++                  display: 'flex',
++                  flexDirection: 'column',
++                  borderRadius: 14,
++                  padding: 12,
++                  justifyContent: 'space-between',
++                }}
++              >
++                <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
++                  {pod.imageUrl ? (
++                    <CardMedia
++                      image={pod.imageUrl}
++                      style={{
++                        width: 56,
++                        height: 56,
++                        borderRadius: 8,
++                        flexShrink: 0,
++                      }}
++                    />
++                  ) : (
++                    <Box
++                      style={{
++                        width: 56,
++                        height: 56,
++                        borderRadius: 8,
++                        backgroundColor: '#444',
++                        display: 'flex',
++                        alignItems: 'center',
++                        justifyContent: 'center',
++                        flexShrink: 0,
++                      }}
++                    >
++                      {pod.sourceType === 'youtube' ? (
++                        <YouTubeIcon color="error" />
++                      ) : (
++                        <RssFeedIcon color="primary" />
++                      )}
++                    </Box>
++                  )}
++                  <div style={{ minWidth: 0, flex: 1 }}>
++                    <Typography
++                      style={{
++                        fontWeight: 700,
++                        fontSize: '0.95rem',
++                        whiteSpace: 'nowrap',
++                        overflow: 'hidden',
++                        textOverflow: 'ellipsis',
++                      }}
++                    >
++                      {pod.title}
++                    </Typography>
++                    <Typography
++                      variant="body2"
++                      color="textSecondary"
++                      style={{
++                        whiteSpace: 'nowrap',
++                        overflow: 'hidden',
++                        textOverflow: 'ellipsis',
++                      }}
++                    >
++                      {pod.author || pod.description}
++                    </Typography>
++                    <Chip
++                      size="small"
++                      label={pod.sourceType === 'youtube' ? 'YouTube' : 'RSS / Apple'}
++                      icon={pod.sourceType === 'youtube' ? <YouTubeIcon /> : <RssFeedIcon />}
++                      variant="outlined"
++                      style={{ marginTop: 4, height: 22 }}
++                    />
++                  </div>
++                </div>
++                <Button
++                  size="small"
++                  variant="contained"
++                  color="primary"
++                  onClick={() => {
++                    setSelectedPodcast(pod)
++                    setDialogOpen(true)
++                  }}
++                  style={{ marginTop: 12 }}
++                >
++                  {translate('resources.podcast.subscribe', { _: 'Inscrever-se' })}
++                </Button>
++              </Card>
++            ))}
++          </Grid>
++        </Section>
++      )}
++
++      <AddPodcastDialog
++        open={dialogOpen}
++        onClose={() => setDialogOpen(false)}
++        initialItem={selectedPodcast}
++      />
+     </div>
+   )
+ }
+diff --git a/ui/src/seer/SeerPage.jsx b/ui/src/seer/SeerPage.jsx
+index 681d7e95..4ae28517 100644
+--- a/ui/src/seer/SeerPage.jsx
++++ b/ui/src/seer/SeerPage.jsx
+@@ -1,8 +1,9 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+-import { IconButton, InputBase } from '@material-ui/core'
++import { Button, IconButton, InputBase } from '@material-ui/core'
+ import { makeStyles } from '@material-ui/core/styles'
+ import CloseIcon from '@material-ui/icons/Close'
+ import SearchIcon from '@material-ui/icons/Search'
++import MicIcon from '@material-ui/icons/Mic'
+ import { Title, useNotify, useTranslate } from 'react-admin'
+ import { useHistory, useLocation } from 'react-router-dom'
+ import { useRefreshOnEvents } from '../common'
+@@ -255,6 +256,21 @@ const SeerPage = () => {
+           <div className={classes.welcomeText}>
+             {translate('resources.seer.message.welcomeText')}
+           </div>
++          <Button
++            variant="outlined"
++            startIcon={<MicIcon />}
++            onClick={() => history.push('/podcast')}
++            style={{
++              marginTop: 18,
++              color: '#fff',
++              borderColor: 'rgba(255,255,255,0.4)',
++              borderRadius: 20,
++              textTransform: 'none',
++              fontWeight: 600,
++            }}
++          >
++            {translate('resources.podcast.name', { smart_count: 2, _: 'Podcasts' })} (YouTube / RSS)
++          </Button>
+         </div>
+         <ImportsPanel
+           imports={imports}
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index 589c8cd7..231f014f 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -105,3 +105,44 @@ export const deleteAlbum = (id) =>
+     method: 'DELETE',
+   })
+ 
++export const searchPodcasts = (q, source = 'all', limit = 15) =>
++  httpClient(
++    `${SEER_URL}/podcasts/search?q=${encodeURIComponent(q)}&source=${source}&limit=${limit}`,
++  ).then(({ json }) => json)
++
++export const listPodcasts = () =>
++  httpClient(`${SEER_URL}/podcasts`).then(({ json }) => json)
++
++export const getPodcast = (id) =>
++  httpClient(`${SEER_URL}/podcasts/${id}`).then(({ json }) => json)
++
++export const createPodcast = (data) =>
++  httpClient(`${SEER_URL}/podcasts`, {
++    method: 'POST',
++    body: JSON.stringify(data),
++  }).then(({ json }) => json)
++
++export const updatePodcast = (id, data) =>
++  httpClient(`${SEER_URL}/podcasts/${id}`, {
++    method: 'PUT',
++    body: JSON.stringify(data),
++  }).then(({ json }) => json)
++
++export const deletePodcast = (id, deleteFiles = false) =>
++  httpClient(`${SEER_URL}/podcasts/${id}?deleteFiles=${deleteFiles}`, {
++    method: 'DELETE',
++  })
++
++export const refreshPodcast = (id) =>
++  httpClient(`${SEER_URL}/podcasts/${id}/refresh`, { method: 'POST' })
++
++export const refreshAllPodcasts = () =>
++  httpClient(`${SEER_URL}/podcasts/refresh-all`, { method: 'POST' })
++
++export const downloadEpisode = (id) =>
++  httpClient(`${SEER_URL}/podcasts/episodes/${id}/download`, { method: 'POST' })
++
++export const deleteEpisode = (id) =>
++  httpClient(`${SEER_URL}/podcasts/episodes/${id}`, { method: 'DELETE' })
++
++
+-- 
+2.55.0
+

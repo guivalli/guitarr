@@ -1,0 +1,68 @@
+From 1923a65672c9693ebfbab879d087a8dba5667b76 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 22 Oct 2026 21:25:29 +0000
+Subject: [PATCH 11/11] Seer: let yt-dlp solve YouTube challenges so downloads
+ stop failing
+
+yt-dlp needs a JavaScript runtime and its challenge solver to get the
+YouTube formats; without them downloads fail with 'format not available'.
+Allow the solver component (ejs:github) on every yt-dlp call; the image
+installs deno (see Dockerfile).
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+
+---
+ core/acquire/source_web.go      | 8 ++++++++
+ core/acquire/source_web_test.go | 3 +++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/core/acquire/source_web.go b/core/acquire/source_web.go
+index 0ec7410..ba0e3b1 100644
+--- a/core/acquire/source_web.go
++++ b/core/acquire/source_web.go
+@@ -73,6 +73,12 @@ var (
+ 
+ var errTooSlow = errors.New("download took too long")
+ 
++// ytdlpJSArgs let yt-dlp fetch the JavaScript it needs to solve YouTube's
++// challenges. Without them (default "no remote components") YouTube only
++// offers a few formats and downloads fail with "format not available".
++// The JS runtime itself (deno) is installed in the image.
++var ytdlpJSArgs = []string{"--remote-components", "ejs:github"}
++
+ type webCandidate struct {
+ 	URL      string
+ 	Title    string
+@@ -128,6 +134,7 @@ func (y *ytdlp) search(ctx context.Context, site webSite, req Request) ([]webCan
+ 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+ 	defer cancel()
+ 	args := []string{"--flat-playlist", "-J", "--no-warnings", "--socket-timeout", "20"}
++	args = append(args, ytdlpJSArgs...)
+ 	if site.cookies && y.Cookies != "" {
+ 		args = append(args, "--cookies", y.Cookies)
+ 	}
+@@ -289,6 +296,7 @@ func (y *ytdlp) download(ctx context.Context, site webSite, link, outTpl string,
+ 		"--print", "after_move:filepath",
+ 		"-o", outTpl,
+ 	}
++	args = append(args, ytdlpJSArgs...)
+ 	if y.FFmpeg != "" {
+ 		args = append(args, "--ffmpeg-location", y.FFmpeg)
+ 	}
+diff --git a/core/acquire/source_web_test.go b/core/acquire/source_web_test.go
+index 3a4c2fa..ca38f19 100644
+--- a/core/acquire/source_web_test.go
++++ b/core/acquire/source_web_test.go
+@@ -124,6 +124,9 @@ func TestYouTubeTriesCandidatesAndPlayerClients(t *testing.T) {
+ 	if strings.Count(calls, "v=fail1") != 3 || !strings.Contains(calls, "player_client=web_safari,mweb -- https://music.youtube.com/watch?v=needsclient") {
+ 		t.Errorf("expected each player client on the failing upload, then the second upload:\n%s", calls)
+ 	}
++	if !strings.Contains(calls, "--remote-components ejs:github") {
++		t.Errorf("YouTube challenge solver not allowed:\n%s", calls)
++	}
+ 	if !strings.Contains(calls, "--cookies /data/cookies.txt") {
+ 		t.Errorf("cookies not passed:\n%s", calls)
+ 	}
+-- 
+2.43.0
+

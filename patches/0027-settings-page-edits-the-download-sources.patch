@@ -1,0 +1,332 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] Seer: the settings page edits the download sources
+
+The settings page gets the download sources, the Soulseek and Lidarr connections, the
+Spotify credentials and the minimum free space. Each value saved there overrides the
+.env value and applies without a restart. Keys are sent once and never shown again.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index a74d4b8..da2b483 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -628,7 +628,35 @@
+         "help": "Ajuda",
+         "restartTour": "Ver o tour de novo",
+         "loadError": "Não consegui carregar as configurações do Seer",
+-        "saveError": "Não consegui salvar a configuração"
++        "saveError": "Não consegui salvar a configuração",
++        "sourcesSection": "Fontes de download",
++        "sources": "Fontes, em ordem de prioridade",
++        "sourcesHint": "Separadas por vírgula: youtube, soundcloud, soulseek, lidarr",
++        "youtubeEnabled": "YouTube ativado",
++        "soundcloudEnabled": "SoundCloud ativado",
++        "soulseekEnabled": "Soulseek ativado",
++        "lidarrEnabled": "Lidarr ativado",
++        "youtube": "YouTube",
++        "youtubeCookies": "Arquivo de cookies (opcional, para listas privadas)",
++        "soulseek": "Soulseek (slskd)",
++        "soulseekUrl": "Endereço do slskd",
++        "soulseekApiKey": "Chave da API",
++        "soulseekDownloads": "Pasta de downloads do slskd",
++        "soulseekPreferFlac": "Preferir FLAC",
++        "lidarr": "Lidarr",
++        "lidarrUrl": "Endereço do Lidarr",
++        "lidarrApiKey": "Chave da API",
++        "lidarrRootFolder": "Pasta raiz",
++        "spotify": "Spotify (importar playlists)",
++        "spotifyClientId": "Client ID",
++        "spotifyClientSecret": "Client secret",
++        "space": "Espaço em disco",
++        "minFreeSpace": "Espaço mínimo livre no disco (ex.: 2GB)",
++        "secretSaved": "Salvo. Deixe em branco para manter.",
++        "clear": "Apagar",
++        "save": "Salvar configurações",
++        "saved": "Configurações salvas",
++        "encryptionNote": "As chaves ficam criptografadas no banco. A chave de criptografia fica em seer.key, na pasta de dados."
+       },
+       "tour": {
+         "progress": "Passo %{current} de %{total}",
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index b5a33a9..2f8b552 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -631,7 +631,35 @@
+         "help": "Help",
+         "restartTour": "Show the tour again",
+         "loadError": "Could not load the Seer settings",
+-        "saveError": "Could not save the setting"
++        "saveError": "Could not save the setting",
++        "sourcesSection": "Download sources",
++        "sources": "Sources, in priority order",
++        "sourcesHint": "Comma-separated: youtube, soundcloud, soulseek, lidarr",
++        "youtubeEnabled": "YouTube enabled",
++        "soundcloudEnabled": "SoundCloud enabled",
++        "soulseekEnabled": "Soulseek enabled",
++        "lidarrEnabled": "Lidarr enabled",
++        "youtube": "YouTube",
++        "youtubeCookies": "Cookies file (optional, for private lists)",
++        "soulseek": "Soulseek (slskd)",
++        "soulseekUrl": "slskd address",
++        "soulseekApiKey": "API key",
++        "soulseekDownloads": "slskd downloads folder",
++        "soulseekPreferFlac": "Prefer FLAC",
++        "lidarr": "Lidarr",
++        "lidarrUrl": "Lidarr address",
++        "lidarrApiKey": "API key",
++        "lidarrRootFolder": "Root folder",
++        "spotify": "Spotify (playlist imports)",
++        "spotifyClientId": "Client ID",
++        "spotifyClientSecret": "Client secret",
++        "space": "Disk space",
++        "minFreeSpace": "Minimum free space on the disk (e.g. 2GB)",
++        "secretSaved": "Saved. Leave empty to keep it.",
++        "clear": "Clear",
++        "save": "Save settings",
++        "saved": "Settings saved",
++        "encryptionNote": "Keys are encrypted in the database. The encryption key is in seer.key, in the data folder."
+       },
+       "tour": {
+         "progress": "Step %{current} of %{total}",
+diff --git a/ui/src/seer/SeerSettings.jsx b/ui/src/seer/SeerSettings.jsx
+index c5e0b5e..cc1c1df 100644
+--- a/ui/src/seer/SeerSettings.jsx
++++ b/ui/src/seer/SeerSettings.jsx
+@@ -1,18 +1,59 @@
+ import { useEffect, useState } from 'react'
+-import { Button, FormControlLabel, Switch, Typography } from '@material-ui/core'
++import {
++  Button,
++  FormControlLabel,
++  Switch,
++  TextField,
++  Typography,
++} from '@material-ui/core'
+ import { Title, useNotify, useTranslate } from 'react-admin'
+-import { getSeerSettings, setSeerSettings } from './api'
++import { getSeerConfig, getSeerSettings, setSeerConfig, setSeerSettings } from './api'
+ import { Section } from './components'
+ 
++// Plain values, and the secrets with the flag the server reports for each one.
++const PLAIN_KEYS = [
++  'sources',
++  'youtubeEnabled',
++  'youtubeCookies',
++  'soundcloudEnabled',
++  'soulseekEnabled',
++  'soulseekUrl',
++  'soulseekDownloads',
++  'soulseekPreferFlac',
++  'lidarrEnabled',
++  'lidarrUrl',
++  'lidarrRootFolder',
++  'spotifyClientId',
++  'minFreeSpace',
++]
++const SECRET_SET = {
++  soulseekApiKey: 'soulseekApiKeySet',
++  lidarrApiKey: 'lidarrApiKeySet',
++  spotifyClientSecret: 'spotifyClientSecretSet',
++}
++
++const errorMessage = (err) => err?.body || err?.message || String(err)
++
+ export const SeerSettings = () => {
+   const translate = useTranslate()
+   const notify = useNotify()
+   const [settings, setSettings] = useState(null)
++  const [config, setConfig] = useState(null)
++  const [draft, setDraft] = useState({})
++  // A secret is only sent when it was typed; '' clears it.
++  const [secrets, setSecrets] = useState({})
++  const [saving, setSaving] = useState(false)
+ 
+   useEffect(() => {
+     getSeerSettings()
+       .then(setSettings)
+       .catch(() => notify('resources.seer.settings.loadError', 'warning'))
++    getSeerConfig()
++      .then((view) => {
++        setConfig(view)
++        setDraft(view)
++      })
++      .catch(() => notify('resources.seer.settings.loadError', 'warning'))
+   }, [notify])
+ 
+   const toggleAutoApprove = (e) => {
+@@ -21,6 +62,83 @@ export const SeerSettings = () => {
+       .catch(() => notify('resources.seer.settings.saveError', 'warning'))
+   }
+ 
++  const setField = (key, value) => setDraft((d) => ({ ...d, [key]: value }))
++  const setSecret = (key, value) => setSecrets((s) => ({ ...s, [key]: value }))
++
++  const save = () => {
++    const patch = {}
++    for (const key of PLAIN_KEYS) {
++      if (draft[key] !== config[key]) patch[key] = draft[key]
++    }
++    for (const key of Object.keys(SECRET_SET)) {
++      if (secrets[key] !== undefined) patch[key] = secrets[key]
++    }
++    if (Object.keys(patch).length === 0) return
++    setSaving(true)
++    setSeerConfig(patch)
++      .then((view) => {
++        setConfig(view)
++        setDraft(view)
++        setSecrets({})
++        notify('resources.seer.settings.saved', 'info')
++      })
++      .catch((err) => notify(errorMessage(err), 'warning'))
++      .finally(() => setSaving(false))
++  }
++
++  const text = (key, label, props = {}) => (
++    <TextField
++      key={key}
++      label={translate(label)}
++      value={draft[key] ?? ''}
++      onChange={(e) => setField(key, e.target.value)}
++      fullWidth
++      margin="normal"
++      {...props}
++    />
++  )
++
++  const toggle = (key, label) => (
++    <FormControlLabel
++      key={key}
++      control={
++        <Switch
++          color="primary"
++          checked={!!draft[key]}
++          onChange={(e) => setField(key, e.target.checked)}
++        />
++      }
++      label={translate(label)}
++    />
++  )
++
++  const secret = (key, label) => (
++    <div key={key} style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
++      <TextField
++        label={translate(label)}
++        type="password"
++        autoComplete="off"
++        value={secrets[key] ?? ''}
++        placeholder={config?.[SECRET_SET[key]] ? '••••••••' : ''}
++        helperText={
++          config?.[SECRET_SET[key]]
++            ? translate('resources.seer.settings.secretSaved')
++            : ''
++        }
++        onChange={(e) => setSecret(key, e.target.value)}
++        fullWidth
++        margin="normal"
++      />
++      <Button
++        size="small"
++        style={{ marginBottom: 12 }}
++        onClick={() => setSecret(key, '')}
++      >
++        {translate('resources.seer.settings.clear')}
++      </Button>
++    </div>
++  )
++
+   return (
+     <div style={{ padding: 24, maxWidth: 720 }}>
+       <Title title={translate('resources.seer.settings.title')} />
+@@ -42,6 +160,73 @@ export const SeerSettings = () => {
+           </Typography>
+         </div>
+       </Section>
++
++      {config && (
++        <>
++          <Section title={translate('resources.seer.settings.sourcesSection')}>
++            <div style={{ marginTop: 12 }}>
++              {text('sources', 'resources.seer.settings.sources', {
++                helperText: translate('resources.seer.settings.sourcesHint'),
++              })}
++              {toggle('youtubeEnabled', 'resources.seer.settings.youtubeEnabled')}
++              {toggle('soundcloudEnabled', 'resources.seer.settings.soundcloudEnabled')}
++              {toggle('soulseekEnabled', 'resources.seer.settings.soulseekEnabled')}
++              {toggle('lidarrEnabled', 'resources.seer.settings.lidarrEnabled')}
++            </div>
++          </Section>
++
++          <Section title={translate('resources.seer.settings.youtube')}>
++            <div style={{ marginTop: 12 }}>
++              {text('youtubeCookies', 'resources.seer.settings.youtubeCookies')}
++            </div>
++          </Section>
++
++          <Section title={translate('resources.seer.settings.soulseek')}>
++            <div style={{ marginTop: 12 }}>
++              {text('soulseekUrl', 'resources.seer.settings.soulseekUrl')}
++              {secret('soulseekApiKey', 'resources.seer.settings.soulseekApiKey')}
++              {text('soulseekDownloads', 'resources.seer.settings.soulseekDownloads')}
++              {toggle('soulseekPreferFlac', 'resources.seer.settings.soulseekPreferFlac')}
++            </div>
++          </Section>
++
++          <Section title={translate('resources.seer.settings.lidarr')}>
++            <div style={{ marginTop: 12 }}>
++              {text('lidarrUrl', 'resources.seer.settings.lidarrUrl')}
++              {secret('lidarrApiKey', 'resources.seer.settings.lidarrApiKey')}
++              {text('lidarrRootFolder', 'resources.seer.settings.lidarrRootFolder')}
++            </div>
++          </Section>
++
++          <Section title={translate('resources.seer.settings.spotify')}>
++            <div style={{ marginTop: 12 }}>
++              {text('spotifyClientId', 'resources.seer.settings.spotifyClientId')}
++              {secret('spotifyClientSecret', 'resources.seer.settings.spotifyClientSecret')}
++            </div>
++          </Section>
++
++          <Section title={translate('resources.seer.settings.space')}>
++            <div style={{ marginTop: 12 }}>
++              {text('minFreeSpace', 'resources.seer.settings.minFreeSpace')}
++            </div>
++          </Section>
++
++          <div style={{ marginTop: 24, display: 'flex', alignItems: 'center', gap: 16 }}>
++            <Button
++              variant="contained"
++              color="primary"
++              disabled={saving}
++              onClick={save}
++            >
++              {translate('resources.seer.settings.save')}
++            </Button>
++            <Typography variant="body2" color="textSecondary">
++              {translate('resources.seer.settings.encryptionNote')}
++            </Typography>
++          </div>
++        </>
++      )}
++
+       <Section title={translate('resources.seer.settings.help')}>
+         <Button
+           variant="outlined"
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index 965675c..24040a9 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -164,3 +164,12 @@ export const putClientState = (patch) =>
+     method: 'PUT',
+     body: JSON.stringify(patch),
+   }).then(({ json }) => json)
++
++export const getSeerConfig = () =>
++  httpClient(`${SEER_URL}/config`).then(({ json }) => json)
++
++export const setSeerConfig = (changes) =>
++  httpClient(`${SEER_URL}/config`, {
++    method: 'PUT',
++    body: JSON.stringify(changes),
++  }).then(({ json }) => json)

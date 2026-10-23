@@ -1,0 +1,4 @@
+# o app Android (node_modules, builds) e imagens soltas não entram no contexto do build da imagem
+apps/android
+/*.png
+/logo.jpeg

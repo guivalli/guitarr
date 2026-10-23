@@ -1,0 +1,6 @@
+# Emulador Android para testar o APK sem celular (precisa de /dev/kvm). Uso: ver test-emulator.sh
+FROM guitarr-android-builder
+RUN yes | sdkmanager --licenses >/dev/null && sdkmanager "emulator" "system-images;android-34;google_apis;x86_64" "build-tools;35.0.0" \
+ && echo no | avdmanager create avd -n guitarr -k "system-images;android-34;google_apis;x86_64" -d pixel_6 --force
+RUN apt-get update && apt-get install -y --no-install-recommends libpulse0 libnss3 libx11-6 libxcb1 libgl1 libxkbfile1 netcat-openbsd && rm -rf /var/lib/apt/lists/*
+ENV PATH=$PATH:/opt/android-sdk/emulator

@@ -1,0 +1,934 @@
+diff --git a/core/acquire/catalog_musicbrainz.go b/core/acquire/catalog_musicbrainz.go
+index 2ac7b3b8..a1d45b8b 100644
+--- a/core/acquire/catalog_musicbrainz.go
++++ b/core/acquire/catalog_musicbrainz.go
+@@ -247,13 +247,15 @@ func (a mbArtist) matches(query string) bool {
+ }
+ 
+ type mbRecording struct {
+-	ID           string         `json:"id"`
+-	Title        string         `json:"title"`
+-	Length       int            `json:"length"`
+-	Video        bool           `json:"video"`
+-	ArtistCredit mbArtistCredit `json:"artist-credit"`
+-	Score        int            `json:"score"`
+-	Releases     []struct {
++	ID     string `json:"id"`
++	Title  string `json:"title"`
++	Length int    `json:"length"`
++	Video  bool   `json:"video"`
++	// Disambiguation tells takes apart ("live, 2004-05-01", "acoustic").
++	Disambiguation string         `json:"disambiguation"`
++	ArtistCredit   mbArtistCredit `json:"artist-credit"`
++	Score          int            `json:"score"`
++	Releases       []struct {
+ 		Title        string `json:"title"`
+ 		Date         string `json:"date"`
+ 		Status       string `json:"status"`
+diff --git a/core/acquire/versions.go b/core/acquire/versions.go
+new file mode 100644
+index 00000000..8a8bdb95
+--- /dev/null
++++ b/core/acquire/versions.go
+@@ -0,0 +1,213 @@
++package acquire
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/url"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++)
++
++// Version is another recording of a song (live take, acoustic, remaster, another upload...)
++// that a library file can be swapped for.
++type Version struct {
++	// Source is "musicbrainz" for a catalog recording (fetched by the normal sources),
++	// or the web site of a direct upload ("YouTube", "YouTube Music", "SoundCloud").
++	Source         string `json:"source"`
++	MBID           string `json:"mbid,omitempty"`
++	Title          string `json:"title"`
++	Artist         string `json:"artist"`
++	Album          string `json:"album,omitempty"`
++	Year           int    `json:"year,omitempty"`
++	DurationMs     int    `json:"durationMs,omitempty"`
++	Disambiguation string `json:"disambiguation,omitempty"`
++	CoverID        string `json:"coverId,omitempty"`
++	URL            string `json:"url,omitempty"`
++	Channel        string `json:"channel,omitempty"`
++}
++
++// recordingLister is implemented by catalogs that can list every recording of a song.
++type recordingLister interface {
++	Recordings(ctx context.Context, artist, title string) ([]Version, error)
++}
++
++// Recordings lists the recordings of a song, one per distinct take (live, acoustic,
++// remix...), each shown with the release that best represents it.
++func (m *MusicBrainz) Recordings(ctx context.Context, artist, title string) ([]Version, error) {
++	var recs struct {
++		Recordings []mbRecording `json:"recordings"`
++	}
++	q := fmt.Sprintf(`recording:"%s" AND artist:"%s"`, luceneEscaper.Replace(title), luceneEscaper.Replace(artist))
++	if err := m.get(ctx, "/recording", url.Values{"query": {q}, "limit": {"60"}}, &recs); err != nil {
++		return nil, err
++	}
++	seen := map[string]bool{}
++	var out []Version
++	for _, r := range recs.Recordings {
++		if r.Score < 70 {
++			continue
++		}
++		it, ok := r.item()
++		if !ok {
++			continue
++		}
++		// remasters of the same take differ by a second or two: one entry per take
++		key := fold(it.Title) + "|" + fold(r.Disambiguation) + "|" + fmt.Sprint((it.DurationMs+2500)/5000)
++		if seen[key] {
++			continue
++		}
++		seen[key] = true
++		out = append(out, Version{
++			Source: "musicbrainz", MBID: it.MBID, Title: it.Title, Artist: it.Artist, Album: it.Album,
++			Year: it.Year, DurationMs: it.DurationMs, Disambiguation: r.Disambiguation, CoverID: it.CoverID,
++		})
++		if len(out) >= 25 {
++			break
++		}
++	}
++	return out, nil
++}
++
++// webSites returns the downloader and the sites of the enabled web sources.
++func (s *Service) webSites() (*ytdlp, []webSite) {
++	var d *ytdlp
++	var sites []webSite
++	for _, src := range s.srcs() {
++		if !src.Enabled() {
++			continue
++		}
++		switch v := src.(type) {
++		case *YouTube:
++			if d == nil {
++				d = &ytdlp{Binary: v.Binary, FFmpeg: v.FFmpeg, Format: v.Format, Cookies: v.Cookies, AttemptTimeout: v.AttemptTimeout}
++			}
++			sites = append(sites, siteYouTubeMusic, siteYouTube)
++		case *SoundCloud:
++			if d == nil {
++				d = &ytdlp{Binary: v.Binary, FFmpeg: v.FFmpeg, Format: v.Format, AttemptTimeout: v.AttemptTimeout}
++			}
++			sites = append(sites, siteSoundCloud)
++		}
++	}
++	return d, sites
++}
++
++// Versions lists other recordings of a song: the MusicBrainz takes first, then
++// uploads found on the web sources. A failing side only drops its part.
++func (s *Service) Versions(ctx context.Context, artist, title string, durationMs int) ([]Version, error) {
++	var (
++		mu   sync.Mutex
++		out  []Version
++		web  []Version
++		errs []error
++		wg   sync.WaitGroup
++	)
++	if rl, ok := s.catalog.(recordingLister); ok {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			v, err := rl.Recordings(ctx, artist, title)
++			mu.Lock()
++			defer mu.Unlock()
++			out = v
++			if err != nil {
++				errs = append(errs, err)
++			}
++		}()
++	}
++	if d, sites := s.webSites(); d != nil {
++		d.Candidates = 6
++		req := Request{Kind: KindTrack, Artist: artist, Title: title, DurationMs: durationMs}
++		for _, site := range sites {
++			wg.Add(1)
++			go func() {
++				defer wg.Done()
++				cands, err := d.search(ctx, site, req)
++				mu.Lock()
++				defer mu.Unlock()
++				if err != nil {
++					errs = append(errs, fmt.Errorf("%s: %w", site.name, err))
++				}
++				for _, c := range cands {
++					web = append(web, Version{
++						Source: site.name, URL: c.URL, Title: c.Title, Artist: artist,
++						DurationMs: int(c.Duration * 1000), Channel: strings.TrimSpace(c.Channel),
++					})
++				}
++			}()
++		}
++	}
++	wg.Wait()
++	seen := map[string]bool{}
++	sort.SliceStable(web, func(i, j int) bool { return siteRank(web[i].Source) < siteRank(web[j].Source) })
++	for _, v := range web {
++		if !seen[v.URL] {
++			seen[v.URL] = true
++			out = append(out, v)
++		}
++	}
++	if len(out) == 0 && len(errs) > 0 {
++		return nil, errors.Join(errs...)
++	}
++	return out, nil
++}
++
++func siteRank(name string) int {
++	switch name {
++	case siteYouTubeMusic.name:
++		return 0
++	case siteYouTube.name:
++		return 1
++	}
++	return 2
++}
++
++// FetchVersion downloads one Version into dir (outside the library) and returns the file.
++// A web upload is downloaded as is; a MusicBrainz recording goes through the track
++// sources in order, like a request for that recording would.
++func (s *Service) FetchVersion(ctx context.Context, v Version, dir string) (string, error) {
++	if v.URL != "" {
++		d, sites := s.webSites()
++		if d == nil {
++			return "", errors.New("no web source is enabled")
++		}
++		site, ok := webSite{}, false
++		for _, st := range sites {
++			if st.name == v.Source {
++				site, ok = st, true
++			}
++		}
++		if !ok {
++			return "", fmt.Errorf("source %q is not enabled", v.Source)
++		}
++		return d.downloadFirst(ctx, site, []webCandidate{{URL: v.URL}}, filepath.Join(dir, "version.%(ext)s"), 0)
++	}
++	if v.MBID == "" {
++		return "", errors.New("version has neither a link nor a MusicBrainz id")
++	}
++	req := Request{Kind: KindTrack, MBID: v.MBID, Artist: v.Artist, Title: v.Title, Album: v.Album, DurationMs: v.DurationMs}
++	var errs []string
++	for _, src := range s.srcs() {
++		if !src.Enabled() || !src.Supports(KindTrack) {
++			continue
++		}
++		res, err := src.Fetch(ctx, req, dir)
++		if ctx.Err() != nil {
++			return "", ctx.Err()
++		}
++		if err == nil && len(res.Paths) > 0 {
++			return res.Paths[0], nil
++		}
++		if err == nil {
++			err = errors.New("nothing was downloaded")
++		}
++		errs = append(errs, fmt.Sprintf("%s: %v", src.Name(), err))
++	}
++	if len(errs) == 0 {
++		return "", errors.New("no enabled source can download a single track")
++	}
++	return "", errors.New(strings.Join(errs, "; "))
++}
+diff --git a/core/acquire/versions_test.go b/core/acquire/versions_test.go
+new file mode 100644
+index 00000000..dc8d35bf
+--- /dev/null
++++ b/core/acquire/versions_test.go
+@@ -0,0 +1,86 @@
++package acquire
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestRecordingsOnePerTake(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/recording" || !strings.Contains(r.URL.Query().Get("query"), `recording:"Zóio de Lula"`) {
++			_, _ = w.Write([]byte(`{}`))
++			return
++		}
++		_, _ = w.Write([]byte(`{"recordings":[
++			{"id":"a","title":"Zóio de Lula","length":250000,"score":100,"artist-credit":[{"name":"Charlie Brown Jr."}],
++			 "releases":[{"title":"Preço Curto","date":"1999","status":"Official","release-group":{"id":"rg","primary-type":"Album"}}]},
++			{"id":"b","title":"Zóio de Lula","length":251000,"score":100,"artist-credit":[{"name":"Charlie Brown Jr."}],
++			 "releases":[{"title":"Remaster","date":"2010","status":"Official","release-group":{"id":"rg2","primary-type":"Album"}}]},
++			{"id":"c","title":"Zóio de Lula","disambiguation":"live","length":262000,"score":95,"artist-credit":[{"name":"Charlie Brown Jr."}],
++			 "releases":[{"title":"Acústico MTV","date":"2003","status":"Official","release-group":{"id":"rg3","primary-type":"Album","secondary-types":["Live"]}}]},
++			{"id":"d","title":"Outra","score":40,"releases":[{"title":"x"}]},
++			{"id":"e","title":"Zóio de Lula","score":90,"video":true,"releases":[{"title":"x"}]}]}`))
++	}))
++	defer srv.Close()
++	m := &MusicBrainz{BaseURL: srv.URL}
++	got, err := m.Recordings(context.Background(), "Charlie Brown Jr.", "Zóio de Lula")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(got) != 2 {
++		t.Fatalf("got %d versions: %+v", len(got), got)
++	}
++	if got[0].MBID != "a" || got[0].Album != "Preço Curto" || got[0].Source != "musicbrainz" {
++		t.Errorf("first = %+v", got[0])
++	}
++	if got[1].MBID != "c" || got[1].Disambiguation != "live" || got[1].Year != 2003 {
++		t.Errorf("second = %+v", got[1])
++	}
++}
++
++type versionSource struct {
++	name  string
++	kinds []Kind
++	paths []string
++	err   error
++	got   []Request
++}
++
++func (s *versionSource) Name() string  { return s.name }
++func (s *versionSource) Enabled() bool { return true }
++func (s *versionSource) Supports(k Kind) bool {
++	for _, x := range s.kinds {
++		if x == k {
++			return true
++		}
++	}
++	return false
++}
++func (s *versionSource) Fetch(_ context.Context, req Request, _ string) (Result, error) {
++	s.got = append(s.got, req)
++	return Result{Paths: s.paths}, s.err
++}
++
++func TestFetchVersionTriesTrackSourcesInOrder(t *testing.T) {
++	lidarr := &versionSource{name: "lidarr", kinds: []Kind{KindAlbum}}
++	slsk := &versionSource{name: "soulseek", kinds: []Kind{KindTrack, KindAlbum}, err: context.DeadlineExceeded}
++	yt := &versionSource{name: "youtube", kinds: []Kind{KindTrack}, paths: []string{"/tmp/x/a.opus"}}
++	s := &Service{}
++	s.SetSources([]Source{lidarr, slsk, yt})
++	p, err := s.FetchVersion(context.Background(), Version{MBID: "c", Title: "Zóio", Artist: "CBJR"}, "/tmp/x")
++	if err != nil || p != "/tmp/x/a.opus" {
++		t.Fatalf("FetchVersion = %q, %v", p, err)
++	}
++	if len(lidarr.got) != 0 || len(slsk.got) != 1 || slsk.got[0].MBID != "c" || slsk.got[0].Kind != KindTrack {
++		t.Errorf("calls: lidarr %v, soulseek %v", lidarr.got, slsk.got)
++	}
++	if _, err := s.FetchVersion(context.Background(), Version{}, "/tmp/x"); err == nil {
++		t.Error("empty version should fail")
++	}
++	if _, err := s.FetchVersion(context.Background(), Version{Source: "YouTube", URL: "https://x"}, "/tmp/x"); err == nil {
++		t.Error("link without a web source should fail")
++	}
++}
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index 08b2cb3f..33fdf318 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -5,6 +5,7 @@ package seer
+ import (
+ 	"context"
+ 	"database/sql"
++	"os"
+ 	"path/filepath"
+ 	"strings"
+ 	"sync"
+@@ -33,6 +34,8 @@ type Seer struct {
+ 	Settings *Settings
+ 	// Lyrics finds lyrics on LRCLIB and saves them next to the songs.
+ 	Lyrics *Lyrics
++	// Versions swaps a song's file for another recording of it.
++	Versions *Versions
+ 	reader *swapReader
+ }
+ 
+@@ -89,7 +92,12 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 	editor.SetCovers(&acquire.CoverFinder{UserAgent: opts.UserAgent}, catalog)
+ 	pStore := NewPodcastStore(db)
+ 	podcasts := NewPodcastService(pStore, func() string { return dest }, lib, broker, conf.Server.FFmpegPath, opts.YouTube.Path)
+-	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor, Podcasts: podcasts, Settings: settings, Lyrics: NewLyrics(ds, opts.UserAgent), reader: reader}
++	versions := NewVersions(svc, editor, func() string {
++		dir := filepath.Join(conf.Server.DataFolder.String(), "cache", "versions")
++		_ = os.MkdirAll(dir, 0o755)
++		return dir
++	})
++	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor, Podcasts: podcasts, Settings: settings, Lyrics: NewLyrics(ds, opts.UserAgent), Versions: versions, reader: reader}
+ }
+ 
+ // refreshUI tells open pages to reload (useRefreshOnEvents(['seer'])).
+diff --git a/core/seer/versions.go b/core/seer/versions.go
+new file mode 100644
+index 00000000..2f41ad48
+--- /dev/null
++++ b/core/seer/versions.go
+@@ -0,0 +1,207 @@
++package seer
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++	"go.senan.xyz/taglib"
++)
++
++// VersionSource finds and downloads other recordings of a song (the acquire Service).
++type VersionSource interface {
++	Versions(ctx context.Context, artist, title string, durationMs int) ([]acquire.Version, error)
++	FetchVersion(ctx context.Context, v acquire.Version, dir string) (string, error)
++}
++
++// VersionJob is the swap of one song for another version, running in the background.
++type VersionJob struct {
++	SongID    string          `json:"songId"`
++	Status    string          `json:"status"` // downloading, replacing, done, failed
++	Error     string          `json:"error,omitempty"`
++	Version   acquire.Version `json:"version"`
++	StartedAt time.Time       `json:"startedAt"`
++	UpdatedAt time.Time       `json:"updatedAt"`
++}
++
++// Versions swaps a library file for another recording of the same song. The new
++// audio takes the old file's tags and name, so Navidrome keeps the same song
++// (favorites, plays, ratings and playlists stay).
++type Versions struct {
++	src    VersionSource
++	editor *Editor
++	// dir is where downloads wait before replacing the file (outside the library).
++	dir func() string
++
++	mu   sync.Mutex
++	jobs map[string]*VersionJob
++}
++
++func NewVersions(src VersionSource, editor *Editor, dir func() string) *Versions {
++	return &Versions{src: src, editor: editor, dir: dir, jobs: map[string]*VersionJob{}}
++}
++
++// Find lists the other versions of a song.
++func (v *Versions) Find(ctx context.Context, songID string) ([]acquire.Version, error) {
++	mf, err := v.editor.song(ctx, songID)
++	if err != nil {
++		return nil, err
++	}
++	return v.src.Versions(ctx, firstArtist(mf), mf.Title, int(mf.Duration*1000))
++}
++
++// Job returns the latest swap of a song, or nil.
++func (v *Versions) Job(songID string) *VersionJob {
++	v.mu.Lock()
++	defer v.mu.Unlock()
++	if j := v.jobs[songID]; j != nil {
++		c := *j
++		return &c
++	}
++	return nil
++}
++
++var ErrVersionBusy = errors.New("this song is already being replaced")
++
++// Start downloads the version and replaces the song's file in the background.
++func (v *Versions) Start(ctx context.Context, songID string, ver acquire.Version) (*VersionJob, error) {
++	mf, err := v.editor.song(ctx, songID)
++	if err != nil {
++		return nil, err
++	}
++	if _, err := absolutePath(*mf); err != nil {
++		return nil, err
++	}
++	v.mu.Lock()
++	if j := v.jobs[songID]; j != nil && (j.Status == "downloading" || j.Status == "replacing") {
++		v.mu.Unlock()
++		return nil, ErrVersionBusy
++	}
++	now := time.Now()
++	job := &VersionJob{SongID: songID, Status: "downloading", Version: ver, StartedAt: now, UpdatedAt: now}
++	v.jobs[songID] = job
++	c := *job
++	v.mu.Unlock()
++	go v.run(context.WithoutCancel(ctx), songID, ver)
++	return &c, nil
++}
++
++func (v *Versions) set(songID, status, msg string) {
++	v.mu.Lock()
++	defer v.mu.Unlock()
++	if j := v.jobs[songID]; j != nil {
++		j.Status, j.Error, j.UpdatedAt = status, msg, time.Now()
++	}
++}
++
++func (v *Versions) run(ctx context.Context, songID string, ver acquire.Version) {
++	ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
++	defer cancel()
++	dir, err := os.MkdirTemp(v.dir(), "version-")
++	if err != nil {
++		v.set(songID, "failed", err.Error())
++		return
++	}
++	defer os.RemoveAll(dir)
++	path, err := v.src.FetchVersion(ctx, ver, dir)
++	if err != nil {
++		log.Warn(ctx, "Seer: could not download the other version", "song", songID, err)
++		v.set(songID, "failed", err.Error())
++		return
++	}
++	v.set(songID, "replacing", "")
++	if err := v.editor.ReplaceAudio(ctx, songID, path); err != nil {
++		log.Warn(ctx, "Seer: could not replace the song file", "song", songID, err)
++		v.set(songID, "failed", err.Error())
++		return
++	}
++	v.set(songID, "done", "")
++}
++
++// ReplaceAudio puts the audio of newPath in place of the song's file. The new file gets the old
++// tags (and embedded picture) and the old name, only the extension may change; then the folder is
++// rescanned. Same name and tags = same persistent ID, so the scanner treats it as the same song.
++func (e *Editor) ReplaceAudio(ctx context.Context, songID, newPath string) error {
++	mf, err := e.song(ctx, songID)
++	if err != nil {
++		return err
++	}
++	old, err := absolutePath(*mf)
++	if err != nil {
++		return err
++	}
++	ext := strings.ToLower(filepath.Ext(newPath))
++	if ext == "" {
++		return errors.New("the downloaded file has no extension")
++	}
++	dst := strings.TrimSuffix(old, filepath.Ext(old)) + ext
++	if dst != old {
++		if _, err := os.Stat(dst); err == nil {
++			return fmt.Errorf("%s already exists", filepath.Base(dst))
++		}
++	}
++	tags, err := e.tags.Read(old)
++	if err != nil {
++		return fmt.Errorf("could not read the tags of %s: %w", mf.Path, err)
++	}
++	// copy next to the old file first, so the final rename cannot fail half way
++	tmp := filepath.Join(filepath.Dir(old), ".guitarr-swap-"+filepath.Base(dst))
++	if err := copyFile(newPath, tmp); err != nil {
++		return fmt.Errorf("could not write in the music folder: %w", err)
++	}
++	defer os.Remove(tmp)
++	newTags, _ := e.tags.Read(tmp)
++	for k := range newTags {
++		if _, ok := tags[k]; !ok {
++			tags[k] = nil // drop what the download brought (description, URL...)
++		}
++	}
++	if err := e.tags.Write(tmp, tags); err != nil {
++		return fmt.Errorf("could not tag the new file: %w", err)
++	}
++	if iw, ok := e.tags.(ImageWriter); ok {
++		if img, _ := readImage(old); len(img) > 0 {
++			if err := iw.WriteImage(tmp, img); err != nil {
++				log.Warn(ctx, "Seer: could not copy the picture to the new version", "path", mf.Path, err)
++			}
++		}
++	}
++	if err := os.Rename(tmp, dst); err != nil {
++		return err
++	}
++	if dst != old {
++		if err := os.Remove(old); err != nil {
++			log.Warn(ctx, "Seer: new version saved, but the old file could not be removed", "path", mf.Path, err)
++		}
++	}
++	log.Info(ctx, "Seer: song replaced by another version", "path", mf.Path, "new", filepath.Base(dst))
++	return e.rescan(ctx, []model.MediaFile{*mf})
++}
++
++var readImage = func(path string) ([]byte, error) { return taglib.ReadImage(path) }
++
++func copyFile(src, dst string) error {
++	in, err := os.Open(src)
++	if err != nil {
++		return err
++	}
++	defer in.Close()
++	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
++	if err != nil {
++		return err
++	}
++	if _, err := io.Copy(out, in); err != nil {
++		out.Close()
++		return err
++	}
++	return out.Close()
++}
+diff --git a/core/seer/versions_test.go b/core/seer/versions_test.go
+new file mode 100644
+index 00000000..3d63d575
+--- /dev/null
++++ b/core/seer/versions_test.go
+@@ -0,0 +1,227 @@
++package seer
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++	"time"
++
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/model"
++)
++
++// pathTags keeps the tags of each file by path, like a real TagIO would.
++type pathTags struct {
++	files map[string]map[string][]string
++}
++
++func (f *pathTags) Read(path string) (map[string][]string, error) {
++	if _, err := os.Stat(path); err != nil {
++		return nil, err
++	}
++	out := map[string][]string{}
++	for k, v := range f.files[path] {
++		out[k] = v
++	}
++	return out, nil
++}
++
++func (f *pathTags) Write(path string, tags map[string][]string) error {
++	cur := f.files[path]
++	if cur == nil {
++		cur = map[string][]string{}
++	}
++	for k, v := range tags {
++		if v == nil {
++			delete(cur, k)
++		} else {
++			cur[k] = v
++		}
++	}
++	f.files[path] = cur
++	return nil
++}
++
++func swapSetup(t *testing.T) (string, *Editor, *fakeScanner, *pathTags, string) {
++	t.Helper()
++	root, ds, _ := setupTestLibrary(t)
++	old := filepath.Join(root, "Artist/Album/01.mp3")
++	tags := &pathTags{files: map[string]map[string][]string{
++		old: {"TITLE": {"Song"}, "MUSICBRAINZ_TRACKID": {"rec-1"}},
++	}}
++	sc := &fakeScanner{}
++	e := NewEditor(ds, sc, &fakeMaintenance{}, tags, nil)
++	dl := filepath.Join(t.TempDir(), "version.opus")
++	if err := os.WriteFile(dl, []byte("new audio"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	tags.files[dl] = map[string][]string{"TITLE": {"Song (Official Video)"}, "COMMENT": {"https://youtu.be/x"}}
++	return root, e, sc, tags, dl
++}
++
++func TestReplaceAudioKeepsNameTagsAndSong(t *testing.T) {
++	root, e, sc, tags, dl := swapSetup(t)
++	tags.files[filepath.Join(root, "Artist/Album/.guitarr-swap-01.opus")] = tags.files[dl]
++
++	if err := e.ReplaceAudio(context.Background(), "s1", dl); err != nil {
++		t.Fatal(err)
++	}
++	dst := filepath.Join(root, "Artist/Album/01.opus")
++	if b, err := os.ReadFile(dst); err != nil || string(b) != "new audio" {
++		t.Fatalf("new file = %q, %v", b, err)
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist/Album/01.mp3")); !os.IsNotExist(err) {
++		t.Errorf("old file still there: %v", err)
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist/Album/.guitarr-swap-01.opus")); !os.IsNotExist(err) {
++		t.Errorf("temporary file left behind: %v", err)
++	}
++	got := tags.files[filepath.Join(root, "Artist/Album/.guitarr-swap-01.opus")]
++	want := map[string][]string{"TITLE": {"Song"}, "MUSICBRAINZ_TRACKID": {"rec-1"}}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("tags of the new file = %v, want %v", got, want)
++	}
++	if w := [][]model.ScanTarget{{{LibraryID: 1, FolderPath: "Artist/Album"}}}; !reflect.DeepEqual(sc.targets, w) {
++		t.Errorf("scan targets = %v", sc.targets)
++	}
++}
++
++func TestReplaceAudioSameExtensionOverwrites(t *testing.T) {
++	root, e, _, _, _ := swapSetup(t)
++	dl := filepath.Join(t.TempDir(), "x.mp3")
++	if err := os.WriteFile(dl, []byte("mp3 take 2"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.ReplaceAudio(context.Background(), "s1", dl); err != nil {
++		t.Fatal(err)
++	}
++	if b, _ := os.ReadFile(filepath.Join(root, "Artist/Album/01.mp3")); string(b) != "mp3 take 2" {
++		t.Errorf("file = %q", b)
++	}
++}
++
++func TestReplaceAudioRefusesToOverwriteAnotherFile(t *testing.T) {
++	root, e, _, _, dl := swapSetup(t)
++	other := filepath.Join(root, "Artist/Album/01.opus")
++	if err := os.WriteFile(other, []byte("someone else"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	if err := e.ReplaceAudio(context.Background(), "s1", dl); err == nil {
++		t.Fatal("want an error")
++	}
++	if b, _ := os.ReadFile(other); string(b) != "someone else" {
++		t.Errorf("other file changed: %q", b)
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist/Album/01.mp3")); err != nil {
++		t.Errorf("old file removed: %v", err)
++	}
++}
++
++type fakeVersionSource struct {
++	file string
++	err  error
++	got  acquire.Version
++}
++
++func (f *fakeVersionSource) Versions(context.Context, string, string, int) ([]acquire.Version, error) {
++	return []acquire.Version{{Source: "musicbrainz", MBID: "r2", Title: "Song (live)"}}, nil
++}
++
++func (f *fakeVersionSource) FetchVersion(_ context.Context, v acquire.Version, dir string) (string, error) {
++	f.got = v
++	if f.err != nil {
++		return "", f.err
++	}
++	p := filepath.Join(dir, "dl.mp3")
++	return p, os.WriteFile(p, []byte(f.file), 0o644)
++}
++
++func waitJob(t *testing.T, v *Versions, id string) *VersionJob {
++	t.Helper()
++	for range 200 {
++		if j := v.Job(id); j != nil && (j.Status == "done" || j.Status == "failed") {
++			return j
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	t.Fatal("job did not finish")
++	return nil
++}
++
++func TestVersionsJob(t *testing.T) {
++	root, e, _, _, _ := swapSetup(t)
++	src := &fakeVersionSource{file: "live take"}
++	tmp := t.TempDir()
++	v := NewVersions(src, e, func() string { return tmp })
++
++	list, err := v.Find(context.Background(), "s1")
++	if err != nil || len(list) != 1 {
++		t.Fatalf("Find = %v, %v", list, err)
++	}
++	if _, err := v.Find(context.Background(), "nope"); !errors.Is(err, ErrItemNotFound) {
++		t.Errorf("unknown song: %v", err)
++	}
++	job, err := v.Start(context.Background(), "s1", list[0])
++	if err != nil || job.Status != "downloading" {
++		t.Fatalf("Start = %+v, %v", job, err)
++	}
++	if j := waitJob(t, v, "s1"); j.Status != "done" {
++		t.Fatalf("job = %+v", j)
++	}
++	if b, _ := os.ReadFile(filepath.Join(root, "Artist/Album/01.mp3")); string(b) != "live take" {
++		t.Errorf("file = %q", b)
++	}
++	if src.got.MBID != "r2" {
++		t.Errorf("fetched %+v", src.got)
++	}
++	if left, _ := os.ReadDir(tmp); len(left) != 0 {
++		t.Errorf("download folder not cleaned: %v", left)
++	}
++
++	src.err = errors.New("nothing found")
++	if _, err := v.Start(context.Background(), "s1", list[0]); err != nil {
++		t.Fatal(err)
++	}
++	if j := waitJob(t, v, "s1"); j.Status != "failed" || j.Error != "nothing found" {
++		t.Errorf("job = %+v", j)
++	}
++}
++
++// TestReplaceAudioWithTaglib swaps a real MP3 for a real Opus file and checks the tags moved over.
++func TestReplaceAudioWithTaglib(t *testing.T) {
++	root, ds, _ := setupTestLibrary(t)
++	old := filepath.Join(root, "Artist/Album/01.mp3")
++	src := copyFixture(t, "test.mp3", t.TempDir())
++	b, _ := os.ReadFile(src)
++	if err := os.WriteFile(old, b, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	tio := taglibIO{}
++	if err := tio.Write(old, map[string][]string{"TITLE": {"Guitarr"}, "MUSICBRAINZ_TRACKID": {"rec-1"}}); err != nil {
++		t.Fatal(err)
++	}
++	oldTags, _ := tio.Read(old)
++	dl := copyFixture(t, "test.opus", t.TempDir())
++	newTags, _ := tio.Read(dl)
++	e := NewEditor(ds, &fakeScanner{}, &fakeMaintenance{}, nil, nil)
++	if err := e.ReplaceAudio(context.Background(), "s1", dl); err != nil {
++		t.Fatal(err)
++	}
++	after, err := tio.Read(filepath.Join(root, "Artist/Album/01.opus"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !reflect.DeepEqual(after["TITLE"], []string{"Guitarr"}) || !reflect.DeepEqual(after["MUSICBRAINZ_TRACKID"], []string{"rec-1"}) {
++		t.Errorf("tags = %v", after)
++	}
++	for k := range newTags {
++		if _, inOld := oldTags[k]; !inOld {
++			if v, kept := after[k]; kept {
++				t.Errorf("tag %s from the download was kept: %v", k, v)
++			}
++		}
++	}
++}
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 8396863d..955f2911 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -76,6 +76,7 @@ type Router struct {
+ 	podcasts Podcasts
+ 	settings Settings
+ 	lyrics   LyricsService
++	versions Versions
+ }
+ 
+ func New(ds model.DataStore, s *seer.Seer) *Router {
+@@ -89,6 +90,7 @@ func New(ds model.DataStore, s *seer.Seer) *Router {
+ 		podcasts: s.Podcasts,
+ 		settings: s,
+ 		lyrics:   s.Lyrics,
++		versions: s.Versions,
+ 	}
+ 	r.Handler = r.routes()
+ 	return r
+@@ -192,6 +194,9 @@ func (api *Router) routes() http.Handler {
+ 				r.Put("/album/{id}/cover", api.uploadCover)
+ 				r.Get("/metadata-report", api.metadataReport)
+ 				r.Delete("/album/{id}", api.deleteAlbum)
++				r.Get("/song/{id}/versions", api.songVersions)
++				r.Post("/song/{id}/versions", api.replaceSongVersion)
++				r.Get("/song/{id}/versions/job", api.songVersionJob)
+ 			})
+ 		}
+ 		if api.podcasts != nil {
+diff --git a/server/seerapi/versions.go b/server/seerapi/versions.go
+new file mode 100644
+index 00000000..610b6a39
+--- /dev/null
++++ b/server/seerapi/versions.go
+@@ -0,0 +1,79 @@
++package seerapi
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/core/seer"
++	"github.com/navidrome/navidrome/log"
++)
++
++// Versions swaps a song for another recording of it (admin-only, under /library).
++type Versions interface {
++	Find(ctx context.Context, songID string) ([]acquire.Version, error)
++	Start(ctx context.Context, songID string, v acquire.Version) (*seer.VersionJob, error)
++	Job(songID string) *seer.VersionJob
++}
++
++// songVersions lists other recordings of the song (MusicBrainz takes and web uploads).
++func (api *Router) songVersions(w http.ResponseWriter, r *http.Request) {
++	if api.versions == nil {
++		http.Error(w, "not available", http.StatusNotFound)
++		return
++	}
++	list, err := api.versions.Find(r.Context(), chi.URLParam(r, "id"))
++	switch {
++	case errors.Is(err, seer.ErrItemNotFound):
++		http.Error(w, "not found", http.StatusNotFound)
++	case err != nil:
++		log.Warn(r.Context(), "Seer: version search failed", err)
++		http.Error(w, err.Error(), http.StatusBadGateway)
++	default:
++		if list == nil {
++			list = []acquire.Version{}
++		}
++		writeJSON(w, http.StatusOK, list)
++	}
++}
++
++// replaceSongVersion starts downloading the chosen version; it replaces the file when it arrives.
++func (api *Router) replaceSongVersion(w http.ResponseWriter, r *http.Request) {
++	if api.versions == nil {
++		http.Error(w, "not available", http.StatusNotFound)
++		return
++	}
++	var v acquire.Version
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&v); err != nil || (v.URL == "" && v.MBID == "") {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	job, err := api.versions.Start(r.Context(), chi.URLParam(r, "id"), v)
++	switch {
++	case errors.Is(err, seer.ErrItemNotFound):
++		http.Error(w, "not found", http.StatusNotFound)
++	case errors.Is(err, seer.ErrVersionBusy):
++		http.Error(w, err.Error(), http.StatusConflict)
++	case err != nil:
++		http.Error(w, err.Error(), http.StatusBadRequest)
++	default:
++		writeJSON(w, http.StatusAccepted, job)
++	}
++}
++
++// songVersionJob reports the latest swap of the song (404 when there was none).
++func (api *Router) songVersionJob(w http.ResponseWriter, r *http.Request) {
++	if api.versions == nil {
++		http.Error(w, "not available", http.StatusNotFound)
++		return
++	}
++	job := api.versions.Job(chi.URLParam(r, "id"))
++	if job == nil {
++		http.Error(w, "no job", http.StatusNotFound)
++		return
++	}
++	writeJSON(w, http.StatusOK, job)
++}

@@ -1,0 +1,24 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] Seer: the sidebar lists Songs first
+
+The sidebar lists Songs first, as the user preferred in the earlier version (the patch
+from that version does not apply cleanly to the current code, so the change is redone here).
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+diff --git a/ui/src/layout/Menu.jsx b/ui/src/layout/Menu.jsx
+index 0a9b14d..cbc194c 100644
+--- a/ui/src/layout/Menu.jsx
++++ b/ui/src/layout/Menu.jsx
+@@ -132,7 +132,10 @@ const Menu = ({ dense = false }) => {
+           renderAlbumMenuItemLink(type, albumLists[type]),
+         )}
+       </SubMenu>
+-      {resources.filter(subItems(undefined)).map(renderResourceMenuItemLink)}
++      {resources
++        .filter(subItems(undefined))
++        .sort((a, b) => (a.name === 'song' ? -1 : b.name === 'song' ? 1 : 0))
++        .map(renderResourceMenuItemLink)}
+       {config.devSidebarPlaylists && open ? (
+         <>
+           <Divider />

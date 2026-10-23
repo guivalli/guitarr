@@ -1,0 +1,804 @@
+From e2a8995e61a64aae8de0a8e7a2d74be008024d05 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 21:28:40 +0000
+Subject: [PATCH 06/10] Seer: a new rounded default theme for the whole UI
+
+Adds the Seer theme (near-black floating surfaces, pill controls, gradient
+headers, a blurred player bar) and makes it the default. Browsers still on
+the old Dark default switch once; later choices are kept.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ conf/configuration.go            |   2 +-
+ ui/src/config.js                 |   2 +-
+ ui/src/store/createAdminStore.js |  19 +-
+ ui/src/themes/index.js           |   4 +
+ ui/src/themes/seer.css.js        | 195 ++++++++++++
+ ui/src/themes/seer.js            | 492 +++++++++++++++++++++++++++++++
+ 6 files changed, 711 insertions(+), 3 deletions(-)
+ create mode 100644 ui/src/themes/seer.css.js
+ create mode 100644 ui/src/themes/seer.js
+
+diff --git a/conf/configuration.go b/conf/configuration.go
+index da87b42..3a09b9d 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -1072,7 +1072,7 @@ func setViperDefaults() {
+ 	viper.SetDefault("enablefavourites", true)
+ 	viper.SetDefault("enablestarrating", true)
+ 	viper.SetDefault("enableuserediting", true)
+-	viper.SetDefault("defaulttheme", "Dark")
++	viper.SetDefault("defaulttheme", "Seer")
+ 	viper.SetDefault("defaultlanguage", "")
+ 	viper.SetDefault("defaultuivolume", consts.DefaultUIVolume)
+ 	viper.SetDefault("uisearchdebouncems", consts.DefaultUISearchDebounceMs)
+diff --git a/ui/src/config.js b/ui/src/config.js
+index 1dd9cb0..aee963c 100644
+--- a/ui/src/config.js
++++ b/ui/src/config.js
+@@ -17,7 +17,7 @@ const defaultConfig = {
+   gaTrackingId: '',
+   devActivityPanel: true,
+   enableStarRating: true,
+-  defaultTheme: 'Dark',
++  defaultTheme: 'Seer',
+   defaultLanguage: '',
+   defaultUIVolume: 100,
+   uiSearchDebounceMs: 200,
+diff --git a/ui/src/store/createAdminStore.js b/ui/src/store/createAdminStore.js
+index 4888e49..bba5b54 100644
+--- a/ui/src/store/createAdminStore.js
++++ b/ui/src/store/createAdminStore.js
+@@ -11,6 +11,23 @@ import { adminReducer, adminSaga, USER_LOGOUT } from 'react-admin'
+ import throttle from 'lodash.throttle'
+ import { loadState, saveState } from './persistState'
+ 
++// Navidrome Seer ships its own default theme. Browsers that were left on the
++// old default move to it once; any later choice is respected.
++const SEER_THEME_KEY = 'seerThemeApplied'
++const migrateTheme = (state) => {
++  try {
++    if (localStorage.getItem(SEER_THEME_KEY)) return state
++    localStorage.setItem(SEER_THEME_KEY, '1')
++  } catch {
++    return state
++  }
++  if (state?.theme === 'DarkTheme') {
++    const { theme: _, ...rest } = state
++    return rest
++  }
++  return state
++}
++
+ const createAdminStore = ({
+   authProvider,
+   dataProvider,
+@@ -40,7 +57,7 @@ const createAdminStore = ({
+       })) ||
+     compose
+ 
+-  const persistedState = loadState()
++  const persistedState = migrateTheme(loadState())
+   if (persistedState?.player?.savedPlayIndex) {
+     persistedState.player.playIndex = persistedState.player.savedPlayIndex
+   }
+diff --git a/ui/src/themes/index.js b/ui/src/themes/index.js
+index 391a97f..fd4e3d0 100644
+--- a/ui/src/themes/index.js
++++ b/ui/src/themes/index.js
+@@ -25,8 +25,12 @@ import MoonbaseAlphaTheme from './moonbaseAlpha'
+ import MoonbaseBravoTheme from './moonbaseBravo'
+ import TokyoNightLightTheme from './tokyoNightLight'
+ import TokyoNightTheme from './tokyoNight'
++import SeerTheme from './seer'
+ 
+ export default {
++  // Navidrome Seer default
++  SeerTheme,
++
+   // Classic default themes
+   LightTheme,
+   DarkTheme,
+diff --git a/ui/src/themes/seer.css.js b/ui/src/themes/seer.css.js
+new file mode 100644
+index 0000000..0fba9e1
+--- /dev/null
++++ b/ui/src/themes/seer.css.js
+@@ -0,0 +1,195 @@
++const green = '#1ed760'
++
++const stylesheet = `
++.react-jinke-music-player-main .music-player-panel {
++    background: rgba(10, 10, 14, 0.92);
++    -webkit-backdrop-filter: blur(20px) saturate(140%);
++    backdrop-filter: blur(20px) saturate(140%);
++    border-top: 1px solid rgba(255, 255, 255, 0.06);
++    box-shadow: 0 -12px 32px rgba(0, 0, 0, 0.45);
++    color: #fff;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .img-content {
++    animation: none !important;
++    transform: none !important;
++    border-radius: 8px;
++    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.5);
++}
++
++.react-jinke-music-player-main svg:hover {
++    color: #fff;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .group > i,
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content svg {
++    color: #b3b3bb;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .group:hover svg {
++    color: #fff;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .play-btn {
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    width: 40px;
++    height: 40px;
++    padding: 0 !important;
++    border-radius: 50%;
++    background: #fff;
++    transition: transform .15s ease;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .play-btn:hover {
++    transform: scale(1.06);
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .play-btn svg {
++    color: #000 !important;
++    font-size: 22px;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .player-content .audio-lists-btn {
++    background-color: rgba(255, 255, 255, 0.06);
++    box-shadow: none;
++    border-radius: 999px;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .rc-slider-rail {
++    background-color: rgba(255, 255, 255, 0.18) !important;
++    border-radius: 999px;
++    height: 4px;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .rc-slider-track {
++    background-color: #fff !important;
++    border-radius: 999px;
++    height: 4px;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .rc-slider:hover .rc-slider-track {
++    background-color: ${green} !important;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .rc-slider-handle {
++    background-color: #fff;
++    border: none;
++    width: 12px;
++    height: 12px;
++    margin-top: -4px;
++    opacity: 0;
++    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5);
++    transition: opacity .15s ease;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .rc-slider:hover .rc-slider-handle {
++    opacity: 1;
++}
++
++.react-jinke-music-player-main .music-player-panel .panel-content .rc-slider-handle:active {
++    box-shadow: 0 0 0 4px rgba(30, 215, 96, 0.3);
++}
++
++.react-jinke-music-player-main ::-webkit-scrollbar-thumb {
++    background-color: rgba(255, 255, 255, 0.2);
++    border-radius: 999px;
++}
++
++.react-jinke-music-player-main .loading svg {
++    color: ${green} !important;
++}
++
++.react-jinke-music-player-main .audio-item.playing svg,
++.react-jinke-music-player-main .audio-item.playing .player-singer {
++    color: ${green} !important;
++}
++
++.audio-lists-panel {
++    background: rgba(24, 24, 30, 0.96);
++    -webkit-backdrop-filter: blur(20px);
++    backdrop-filter: blur(20px);
++    border: 1px solid rgba(255, 255, 255, 0.06);
++    border-radius: 16px;
++    bottom: 88px;
++    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
++    overflow: hidden;
++}
++
++.audio-lists-panel-header {
++    background: transparent;
++    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
++    box-shadow: none;
++}
++
++.audio-lists-panel-content .audio-item {
++    border-radius: 8px;
++    margin: 2px 8px;
++    background-color: transparent !important;
++}
++
++.audio-lists-panel-content .audio-item:hover,
++.audio-lists-panel-content .audio-item:active {
++    background-color: rgba(255, 255, 255, 0.07) !important;
++}
++
++.audio-lists-panel-content .audio-item.playing,
++.audio-lists-panel-content .audio-item.playing svg {
++    color: ${green};
++}
++
++.audio-lists-panel-content .audio-item:active .group:not([class=".player-delete"]) svg,
++.audio-lists-panel-content .audio-item:hover .group:not([class=".player-delete"]) svg {
++    color: ${green};
++}
++
++/* Mobile */
++
++.react-jinke-music-player-mobile {
++    background: linear-gradient(180deg, #24242e 0%, #0a0a0e 70%);
++}
++
++.react-jinke-music-player-mobile-cover {
++    border: none;
++    border-radius: 16px;
++    box-shadow: 0 24px 48px rgba(0, 0, 0, 0.6);
++}
++
++.react-jinke-music-player-mobile-cover .cover {
++    border-radius: 16px;
++}
++
++.react-jinke-music-player-mobile-progress .rc-slider-track,
++.react-jinke-music-player-mobile-progress .rc-slider-handle {
++    background-color: #fff;
++}
++
++.react-jinke-music-player-mobile-progress .rc-slider-handle {
++    border: none;
++}
++
++.react-jinke-music-player-mobile-operation .items .item svg,
++.react-jinke-music-player-mobile-header svg {
++    color: #fff;
++}
++
++.react-jinke-music-player-mobile-toggle .play-btn {
++    color: #000;
++    background: #fff;
++    border-radius: 50%;
++}
++
++.react-jinke-music-player .music-player-controller {
++    border: none;
++    background: #18181e;
++    color: ${green};
++    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
++}
++
++.react-jinke-music-player .music-player-controller .music-player-controller-setting {
++    background: rgba(30, 215, 96, 0.3);
++}
++`
++
++export default stylesheet
+diff --git a/ui/src/themes/seer.js b/ui/src/themes/seer.js
+new file mode 100644
+index 0000000..45952db
+--- /dev/null
++++ b/ui/src/themes/seer.js
+@@ -0,0 +1,492 @@
++import stylesheet from './seer.css.js'
++
++// Seer: the default look of Navidrome Seer. Near-black surfaces floating on
++// a black canvas, generous rounding, pill controls and one green accent.
++const green = '#1ed760'
++const greenDark = '#17b350'
++const canvas = '#000000'
++const surface = '#121216'
++const raised = '#1b1b21'
++const hover = 'rgba(255,255,255,0.07)'
++const text = '#ffffff'
++const muted = '#a7a7b0'
++const line = 'rgba(255,255,255,0.08)'
++const font =
++  "'Inter', 'Plus Jakarta Sans', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
++
++const playFab = {
++  minWidth: 0,
++  width: 56,
++  height: 56,
++  padding: 0,
++  borderRadius: '50%',
++  background: green,
++  color: '#000',
++  border: 0,
++  boxShadow: '0 8px 24px rgba(30,215,96,0.25)',
++  transition: 'transform .15s ease, background-color .15s ease',
++  '&:hover': {
++    transform: 'scale(1.06)',
++    backgroundColor: `${green} !important`,
++  },
++  '& svg': { fontSize: 30, color: '#000 !important' },
++  '& > span:first-child > span': { display: 'none' },
++  '& > span:first-child': { padding: 0 },
++}
++
++// For Album, Playlist and Artist action bars: a big green play button
++// followed by quiet round icon buttons.
++const musicListActions = {
++  padding: '1rem 0',
++  alignItems: 'center',
++  flexWrap: 'wrap',
++  gap: 8,
++  '@global': {
++    button: {
++      border: 0,
++      borderRadius: 999,
++      backgroundColor: 'transparent',
++      color: muted,
++      margin: '0 2px',
++      '&:hover': {
++        color: text,
++        backgroundColor: `${hover} !important`,
++      },
++    },
++    'button:first-child:not(:only-child)': {
++      ...playFab,
++      marginRight: 16,
++    },
++    'button:only-child': {
++      margin: '0 4px',
++    },
++    'button>span:first-child>span, button:not(:first-child)>span:first-child>svg':
++      {
++        color: muted,
++      },
++    'button:hover>span:first-child>span, button:not(:first-child):hover>span:first-child>svg':
++      {
++        color: text,
++      },
++  },
++}
++
++const header = (color) => ({
++  background: `linear-gradient(180deg, ${color} 0%, rgba(18,18,22,0) 100%)`,
++  borderRadius: 16,
++  boxShadow: 'none',
++})
++
++export default {
++  themeName: 'Seer',
++  typography: {
++    fontFamily: font,
++    h5: { fontWeight: 800, letterSpacing: '-0.02em' },
++    h6: { fontSize: '1rem', fontWeight: 700 },
++    button: { textTransform: 'none', fontWeight: 700 },
++  },
++  shape: { borderRadius: 12 },
++  palette: {
++    type: 'dark',
++    primary: { light: '#5ff08d', main: green, dark: greenDark },
++    secondary: { main: '#ffffff', contrastText: '#000' },
++    background: { default: canvas, paper: surface },
++    text: { primary: text, secondary: muted },
++    divider: line,
++    action: { hover },
++  },
++  overrides: {
++    MuiCssBaseline: {
++      '@global': {
++        '*::-webkit-scrollbar': { width: 10, height: 10 },
++        '*::-webkit-scrollbar-thumb': {
++          background: 'rgba(255,255,255,0.18)',
++          borderRadius: 999,
++          border: `2px solid ${surface}`,
++        },
++        '*::-webkit-scrollbar-track': { background: 'transparent' },
++      },
++    },
++    MuiPaper: {
++      rounded: { borderRadius: 16 },
++      elevation1: { boxShadow: 'none' },
++    },
++    MuiCard: { root: { borderRadius: 16 } },
++    MuiPopover: {
++      paper: {
++        background: raised,
++        borderRadius: 12,
++        boxShadow: '0 16px 40px rgba(0,0,0,0.6)',
++        border: `1px solid ${line}`,
++      },
++    },
++    MuiMenu: { paper: { background: raised } },
++    MuiMenuItem: {
++      root: {
++        fontSize: '0.9rem',
++        borderRadius: 8,
++        margin: '0 6px',
++        '&:hover': { backgroundColor: hover },
++      },
++    },
++    MuiDialog: {
++      paper: {
++        background: raised,
++        borderRadius: 20,
++        boxShadow: '0 24px 64px rgba(0,0,0,0.7)',
++      },
++    },
++    MuiTooltip: {
++      tooltip: {
++        background: '#2a2a32',
++        fontSize: '0.8rem',
++        borderRadius: 8,
++        padding: '6px 10px',
++      },
++    },
++    MuiDivider: { root: { margin: '.5rem 0', backgroundColor: line } },
++    MuiButton: {
++      root: {
++        borderRadius: 999,
++        padding: '6px 18px',
++        textTransform: 'none',
++        fontWeight: 700,
++      },
++      contained: {
++        boxShadow: 'none',
++        '&:hover': { boxShadow: 'none' },
++      },
++      containedPrimary: {
++        color: '#000',
++        '&:hover': { backgroundColor: greenDark },
++      },
++      outlined: { borderColor: 'rgba(255,255,255,0.3)' },
++      textSecondary: { color: text },
++    },
++    MuiIconButton: {
++      root: {
++        '&:hover': { backgroundColor: hover },
++      },
++    },
++    MuiFab: {
++      primary: { color: '#000' },
++    },
++    MuiChip: {
++      root: {
++        borderRadius: 999,
++        backgroundColor: 'rgba(255,255,255,0.1)',
++        fontWeight: 600,
++      },
++    },
++    MuiOutlinedInput: {
++      root: {
++        borderRadius: 12,
++        '&:hover $notchedOutline': { borderColor: 'rgba(255,255,255,0.4)' },
++      },
++      notchedOutline: { borderColor: 'rgba(255,255,255,0.15)' },
++    },
++    MuiFilledInput: {
++      root: {
++        borderRadius: 12,
++        borderTopLeftRadius: 12,
++        borderTopRightRadius: 12,
++        backgroundColor: 'rgba(255,255,255,0.06)',
++        '&:hover': { backgroundColor: 'rgba(255,255,255,0.09)' },
++        '&$focused': { backgroundColor: 'rgba(255,255,255,0.09)' },
++      },
++      underline: {
++        '&:before, &:after': { display: 'none' },
++      },
++    },
++    MuiSwitch: {
++      track: { borderRadius: 999 },
++    },
++    MuiDrawer: {
++      root: { background: canvas },
++      paper: { background: canvas, borderRight: 0 },
++      paperAnchorDockedLeft: { borderRight: 0 },
++    },
++    MuiListItem: {
++      root: {
++        '&$selected, &$selected:hover': { backgroundColor: hover },
++      },
++    },
++    MuiListItemIcon: { root: { color: muted, minWidth: 44 } },
++    MuiTableRow: {
++      root: {
++        transition: 'background-color .15s ease',
++        '&:hover': { backgroundColor: `${hover} !important` },
++        '& td:first-child': {
++          borderTopLeftRadius: 8,
++          borderBottomLeftRadius: 8,
++        },
++        '& td:last-child': {
++          borderTopRightRadius: 8,
++          borderBottomRightRadius: 8,
++        },
++      },
++      head: {
++        '&:hover': { backgroundColor: 'transparent !important' },
++      },
++    },
++    MuiTableCell: {
++      root: {
++        borderBottom: 0,
++        padding: '10px 12px',
++        color: muted,
++      },
++      body: { color: text },
++      head: {
++        borderBottom: `1px solid ${line}`,
++        color: muted,
++        fontSize: '0.72rem',
++        fontWeight: 600,
++        textTransform: 'uppercase',
++        letterSpacing: 1.2,
++        backgroundColor: 'transparent',
++      },
++      sizeSmall: { padding: '8px 12px' },
++    },
++    MuiToolbar: {
++      root: { backgroundColor: 'transparent' },
++    },
++    MuiAppBar: {
++      root: { boxShadow: 'none' },
++      colorSecondary: { backgroundColor: canvas, color: text },
++      positionFixed: {
++        backgroundColor: `${canvas} !important`,
++        boxShadow: 'none',
++      },
++    },
++    MuiTabs: {
++      indicator: { backgroundColor: green, height: 3, borderRadius: 3 },
++    },
++    MuiTab: { root: { textTransform: 'none', fontWeight: 700 } },
++    MuiLinearProgress: {
++      root: { borderRadius: 999 },
++      bar: { borderRadius: 999 },
++    },
++    MuiSnackbarContent: {
++      root: { borderRadius: 12, backgroundColor: '#2a2a32', color: text },
++    },
++    RaLayout: {
++      root: { backgroundColor: canvas },
++      appFrame: { backgroundColor: canvas },
++      content: {
++        background: `linear-gradient(180deg, #1c1c24 0px, ${surface} 320px)`,
++        borderRadius: 16,
++        margin: '0 8px 8px 0',
++        padding: '16px 24px !important',
++        minHeight: 'calc(100vh - 64px)',
++        '@media (max-width: 599.95px)': {
++          margin: 0,
++          borderRadius: 0,
++          padding: '8px 12px !important',
++        },
++      },
++    },
++    RaSidebar: {
++      root: { height: 'initial' },
++      drawerPaper: { backgroundColor: canvas, marginTop: 0 },
++      fixed: { backgroundColor: canvas },
++    },
++    RaMenuItemLink: {
++      root: {
++        color: muted,
++        borderRadius: 10,
++        margin: '2px 8px',
++        paddingTop: 8,
++        paddingBottom: 8,
++        transition: 'color .15s ease, background-color .15s ease',
++        '&:hover': { color: text, backgroundColor: hover },
++      },
++      active: {
++        color: `${text} !important`,
++        backgroundColor: 'rgba(255,255,255,0.09)',
++        '& svg': { color: green },
++      },
++      icon: { minWidth: 40 },
++    },
++    NDSubMenu: {
++      menuHeader: { color: muted },
++    },
++    RaList: {
++      content: { backgroundColor: 'transparent', boxShadow: 'none' },
++    },
++    RaListToolbar: {
++      toolbar: {
++        padding: '0 .5rem !important',
++        backgroundColor: 'transparent',
++      },
++    },
++    RaTopToolbar: { root: { backgroundColor: 'transparent' } },
++    RaDatagrid: {
++      headerCell: { backgroundColor: 'transparent' },
++    },
++    RaSearchInput: {
++      input: {
++        '& .MuiInputBase-root, & .MuiFilledInput-root': {
++          backgroundColor: 'rgba(255,255,255,0.08)',
++          borderRadius: '999px !important',
++        },
++        '& .MuiFilledInput-root:hover, & .MuiFilledInput-root.Mui-focused': {
++          backgroundColor: 'rgba(255,255,255,0.12)',
++        },
++      },
++    },
++    RaFilterButton: { root: { marginRight: '0.5rem' } },
++    RaButton: { button: { margin: '0 4px' } },
++    RaPaginationActions: {
++      button: {
++        minWidth: 40,
++        height: 40,
++        borderRadius: 999,
++        margin: '0 2px',
++      },
++      currentPageButton: {
++        backgroundColor: `${green} !important`,
++        color: '#000',
++      },
++    },
++    RaToolbar: {
++      toolbar: { backgroundColor: 'transparent' },
++    },
++    NDAlbumGridView: {
++      root: { margin: '12px 0' },
++      albumContainer: {
++        backgroundColor: 'rgba(255,255,255,0.03)',
++        borderRadius: 14,
++        padding: 12,
++        transition: 'background-color .2s ease',
++        '&:hover': { backgroundColor: 'rgba(255,255,255,0.08)' },
++      },
++      link: {
++        borderRadius: 10,
++        overflow: 'hidden',
++        boxShadow: '0 8px 24px rgba(0,0,0,0.45)',
++      },
++      tileBar: {
++        background:
++          'linear-gradient(to top, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0) 60%)',
++      },
++      albumName: {
++        marginTop: 10,
++        fontWeight: 700,
++        fontSize: 15,
++        color: text,
++      },
++      albumSubtitle: { color: muted, fontSize: 13 },
++      albumVersion: { color: muted },
++      albumPlayButton: {
++        backgroundColor: green,
++        color: '#000 !important',
++        borderRadius: '50%',
++        boxShadow: '0 8px 16px rgba(0,0,0,0.4)',
++        padding: 8,
++        margin: 6,
++        transition: 'transform .15s ease',
++        '&:hover': {
++          background: `${green} !important`,
++          transform: 'scale(1.08)',
++        },
++      },
++    },
++    NDAlbumDetails: {
++      root: {
++        ...header('rgba(30,215,96,0.22)'),
++        padding: '24px !important',
++      },
++      cardContents: { alignItems: 'flex-end', gap: 8 },
++      coverParent: {
++        borderRadius: 12,
++        overflow: 'hidden',
++        boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
++      },
++      recordName: {
++        fontSize: 'calc(1.4rem + 2vw)',
++        fontWeight: 900,
++        letterSpacing: '-0.03em',
++        lineHeight: 1.05,
++      },
++      recordArtist: { fontSize: '1rem', fontWeight: 700 },
++      recordMeta: { fontSize: '.875rem', color: 'rgba(255,255,255,0.75)' },
++    },
++    NDPlaylistDetails: {
++      container: {
++        ...header('rgba(124,77,255,0.28)'),
++        paddingTop: '2rem !important',
++      },
++      root: {
++        ...header('rgba(124,77,255,0.28)'),
++        padding: '24px !important',
++      },
++      cardContents: { alignItems: 'flex-end' },
++      coverParent: {
++        borderRadius: 12,
++        overflow: 'hidden',
++        boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
++      },
++      title: {
++        fontSize: 'calc(1.4rem + 2vw)',
++        fontWeight: 900,
++        letterSpacing: '-0.03em',
++        color: text,
++      },
++      details: { fontSize: '.875rem', color: 'rgba(255,255,255,0.75)' },
++    },
++    NDDesktopArtistDetails: {
++      root: { padding: 0 },
++      artistImage: { boxShadow: 'none' },
++      cover: { boxShadow: '0 16px 48px rgba(0,0,0,0.55)' },
++      artistDetail: {
++        ...header('rgba(79,179,255,0.28)'),
++        padding: 24,
++        alignItems: 'flex-end',
++      },
++      artistName: {
++        fontSize: 'calc(1.6rem + 2.5vw)',
++        fontWeight: 900,
++        letterSpacing: '-0.03em',
++        lineHeight: 1.05,
++      },
++    },
++    NDCollapsibleComment: {
++      commentBlock: { fontSize: '.875rem', color: 'rgba(255,255,255,0.75)' },
++    },
++    NDAlbumShow: { albumActions: musicListActions },
++    NDPlaylistShow: { playlistActions: musicListActions },
++    NDArtistShow: {
++      actions: { ...musicListActions, padding: '1.5rem 0' },
++      actionsContainer: { overflow: 'visible' },
++    },
++    NDAudioPlayer: {
++      audioTitle: { color: text, fontSize: '0.9rem', fontWeight: 600 },
++      songTitle: { fontWeight: 600 },
++      songInfo: { fontSize: '0.75rem', color: muted },
++    },
++    NDLogin: {
++      main: {
++        backgroundColor: canvas,
++        boxShadow: 'inset 0 0 0 2000px rgba(0,0,0,0.55)',
++        justifyContent: 'center !important',
++      },
++      card: {
++        background: 'rgba(18,18,22,0.85)',
++        backdropFilter: 'blur(16px)',
++        border: `1px solid ${line}`,
++        borderRadius: 24,
++        boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
++      },
++      systemNameLink: { color: text },
++      avatar: { marginBottom: 0 },
++      button: { borderRadius: 999, color: '#000' },
++    },
++    NDNotification: {
++      root: { borderRadius: 12 },
++    },
++  },
++  player: {
++    theme: 'dark',
++    stylesheet,
++  },
++}
+-- 
+2.43.0
+

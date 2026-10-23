@@ -1,0 +1,1901 @@
+From 06bf39789d8d42641b18fa7d6083dd072be7e881 Mon Sep 17 00:00:00 2001
+From: Guitarr <noreply@example.com>
+Date: Sun, 11 Oct 2026 10:15:00 -0300
+Subject: [PATCH] Seer: add buttons to edit metadata and delete albums or songs
+
+---
+ core/seer/editor.go                    | 402 +++++++++++++++++++++++++
+ core/seer/editor_test.go               | 296 ++++++++++++++++++
+ core/seer/seer.go                      |  12 +-
+ resources/i18n/pt-br.json              |  14 +-
+ server/seerapi/library.go              |  64 ++++
+ server/seerapi/library_test.go         |  77 +++++
+ server/seerapi/seerapi.go              |  33 +-
+ ui/src/App.jsx                         |   4 +
+ ui/src/actions/dialogs.js              |  25 ++
+ ui/src/album/AlbumActions.jsx          |  36 +++
+ ui/src/common/ContextMenus.jsx         |  22 ++
+ ui/src/common/SongContextMenu.jsx      |  22 ++
+ ui/src/dialogs/DeleteConfirmDialog.jsx | 155 ++++++++++
+ ui/src/dialogs/Dialogs.jsx             |   4 +
+ ui/src/dialogs/EditMetadataDialog.jsx  | 316 +++++++++++++++++++
+ ui/src/dialogs/index.js                |   2 +
+ ui/src/i18n/en.json                    |  14 +-
+ ui/src/reducers/dialogReducer.js       |  62 ++++
+ ui/src/seer/api.js                     |  23 ++
+ 19 files changed, 1576 insertions(+), 7 deletions(-)
+ create mode 100644 core/seer/editor.go
+ create mode 100644 core/seer/editor_test.go
+ create mode 100644 server/seerapi/library.go
+ create mode 100644 server/seerapi/library_test.go
+ create mode 100644 ui/src/dialogs/DeleteConfirmDialog.jsx
+ create mode 100644 ui/src/dialogs/EditMetadataDialog.jsx
+
+diff --git a/core/seer/editor.go b/core/seer/editor.go
+new file mode 100644
+index 00000000..a252d333
+--- /dev/null
++++ b/core/seer/editor.go
+@@ -0,0 +1,402 @@
++package seer
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"slices"
++	"strings"
++	"time"
++
++	. "github.com/Masterminds/squirrel"
++	"github.com/navidrome/navidrome/core"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++	"go.senan.xyz/taglib"
++)
++
++// Errors returned by the Editor. The API maps them to HTTP status codes.
++var (
++	ErrItemNotFound = errors.New("not found")
++	ErrInvalidTags  = errors.New("invalid tags")
++)
++
++// TagChanges are the tags to write. A nil field is left untouched; an empty string removes the tag.
++type TagChanges struct {
++	Title       *string `json:"title,omitempty"`
++	Artist      *string `json:"artist,omitempty"`
++	Album       *string `json:"album,omitempty"`
++	AlbumArtist *string `json:"albumArtist,omitempty"`
++	Genre       *string `json:"genre,omitempty"`
++	Year        *string `json:"year,omitempty"`
++	TrackNumber *string `json:"trackNumber,omitempty"`
++	DiscNumber  *string `json:"discNumber,omitempty"`
++}
++
++// albumOnly keeps the fields that make sense for every track of an album.
++func (c TagChanges) albumOnly() TagChanges {
++	return TagChanges{Album: c.Album, AlbumArtist: c.AlbumArtist, Genre: c.Genre, Year: c.Year}
++}
++
++func (c TagChanges) empty() bool {
++	return c == TagChanges{}
++}
++
++var (
++	positiveNumber = regexp.MustCompile(`^[1-9][0-9]{0,3}$`)
++	yearOrDate     = regexp.MustCompile(`^[0-9]{4}(-[0-9]{2}(-[0-9]{2})?)?$`)
++)
++
++// validate trims every value and rejects numbers and dates the scanner could not read back.
++func (c *TagChanges) validate() error {
++	for _, f := range []**string{&c.Title, &c.Artist, &c.Album, &c.AlbumArtist, &c.Genre, &c.Year, &c.TrackNumber, &c.DiscNumber} {
++		if *f != nil {
++			v := strings.TrimSpace(**f)
++			*f = &v
++		}
++	}
++	if c.Title != nil && *c.Title == "" {
++		return fmt.Errorf("%w: the title cannot be empty", ErrInvalidTags)
++	}
++	if c.Album != nil && *c.Album == "" {
++		return fmt.Errorf("%w: the album name cannot be empty", ErrInvalidTags)
++	}
++	for name, v := range map[string]*string{"track number": c.TrackNumber, "disc number": c.DiscNumber} {
++		if v != nil && *v != "" && !positiveNumber.MatchString(*v) {
++			return fmt.Errorf("%w: %s must be a positive number", ErrInvalidTags, name)
++		}
++	}
++	if c.Year != nil && *c.Year != "" && !yearOrDate.MatchString(*c.Year) {
++		return fmt.Errorf("%w: use a year (2001) or a date (2001-09-11)", ErrInvalidTags)
++	}
++	return nil
++}
++
++// tagMap turns the changes into TagLib properties. An empty slice erases the tag.
++// current holds the file's existing properties, used to keep related tags consistent.
++func (c TagChanges) tagMap(current map[string][]string) map[string][]string {
++	tags := map[string][]string{}
++	set := func(v *string, key string, stale ...string) {
++		if v == nil {
++			return
++		}
++		tags[key] = nil
++		if *v != "" {
++			tags[key] = []string{*v}
++		}
++		// Navidrome prefers these over the main tag (ARTISTS over ARTIST) or uses them to sort,
++		// so leaving the old values would hide the edit.
++		for _, k := range stale {
++			if _, ok := current[k]; ok {
++				tags[k] = nil
++			}
++		}
++	}
++	set(c.Title, taglib.Title, taglib.TitleSort)
++	set(c.Artist, taglib.Artist, taglib.Artists, taglib.ArtistSort, "ARTISTSSORT")
++	set(c.Album, taglib.Album, taglib.AlbumSort)
++	set(c.AlbumArtist, taglib.AlbumArtist, "ALBUMARTISTS", taglib.AlbumArtistSort, "ALBUMARTISTSSORT")
++	set(c.Genre, taglib.Genre)
++	set(c.TrackNumber, taglib.TrackNumber)
++	set(c.DiscNumber, taglib.DiscNumber)
++	if c.Year != nil {
++		set(c.Year, taglib.Date)
++		// The scanner may show the original or release date instead of DATE: keep them in step.
++		for _, k := range []string{taglib.OriginalDate, taglib.ReleaseDate} {
++			if _, ok := current[k]; ok {
++				set(c.Year, k)
++			}
++		}
++	}
++	return tags
++}
++
++// TagIO reads and writes tags in audio files (TagLib in production, a fake in tests).
++type TagIO interface {
++	Read(path string) (map[string][]string, error)
++	Write(path string, tags map[string][]string) error
++}
++
++type taglibIO struct{}
++
++func (taglibIO) Read(path string) (map[string][]string, error) { return taglib.ReadTags(path) }
++func (taglibIO) Write(path string, tags map[string][]string) error {
++	return taglib.WriteTags(path, tags, 0)
++}
++
++// Editor lets admins fix tags and delete albums or tracks from the web UI. Every change is
++// written to the files and then picked up by a quick scan of the affected folders, so the
++// library stays in sync with what is on disk.
++type Editor struct {
++	ds          model.DataStore
++	scanner     model.Scanner
++	maintenance core.Maintenance
++	tags        TagIO
++	// keep are folders never removed when they become empty (e.g. the Seer destination).
++	keep func() []string
++}
++
++// NewEditor builds an Editor that writes tags with TagLib.
++func NewEditor(ds model.DataStore, scanner model.Scanner, maintenance core.Maintenance, tags TagIO, keep func() []string) *Editor {
++	if tags == nil {
++		tags = taglibIO{}
++	}
++	if keep == nil {
++		keep = func() []string { return nil }
++	}
++	return &Editor{ds: ds, scanner: scanner, maintenance: maintenance, tags: tags, keep: keep}
++}
++
++// EditResult tells the UI where the edited item lives now (the album ID changes with its name).
++type EditResult struct {
++	ID      string `json:"id"`
++	AlbumID string `json:"albumId"`
++}
++
++// EditSong writes the changes to one track.
++func (e *Editor) EditSong(ctx context.Context, id string, changes TagChanges) (*EditResult, error) {
++	if err := changes.validate(); err != nil {
++		return nil, err
++	}
++	mf, err := e.song(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	if changes.empty() {
++		return &EditResult{ID: mf.ID, AlbumID: mf.AlbumID}, nil
++	}
++	if err := e.writeTags(ctx, []model.MediaFile{*mf}, changes); err != nil {
++		return nil, err
++	}
++	// The scanner updates the record matched by path, so the track keeps its ID.
++	albumID := mf.AlbumID
++	if cur, err := e.ds.MediaFile().Get(ctx, mf.ID); err == nil {
++		albumID = cur.AlbumID
++	}
++	return &EditResult{ID: mf.ID, AlbumID: albumID}, nil
++}
++
++// EditAlbum writes the album-level changes (name, album artist, year, genre) to all its tracks.
++func (e *Editor) EditAlbum(ctx context.Context, id string, changes TagChanges) (*EditResult, error) {
++	changes = changes.albumOnly()
++	if err := changes.validate(); err != nil {
++		return nil, err
++	}
++	files, err := e.albumSongs(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	if changes.empty() {
++		return &EditResult{ID: id, AlbumID: id}, nil
++	}
++	if err := e.writeTags(ctx, files, changes); err != nil {
++		return nil, err
++	}
++	albumID := id
++	if cur, err := e.ds.MediaFile().Get(ctx, files[0].ID); err == nil {
++		albumID = cur.AlbumID
++	}
++	return &EditResult{ID: albumID, AlbumID: albumID}, nil
++}
++
++// DeleteSong removes the track's file from disk and from the library.
++func (e *Editor) DeleteSong(ctx context.Context, id string) error {
++	mf, err := e.song(ctx, id)
++	if err != nil {
++		return err
++	}
++	return e.deleteFiles(ctx, []model.MediaFile{*mf}, false)
++}
++
++// DeleteAlbum removes all the album's files, and its folder when nothing else is left in it.
++func (e *Editor) DeleteAlbum(ctx context.Context, id string) error {
++	files, err := e.albumSongs(ctx, id)
++	if err != nil {
++		return err
++	}
++	return e.deleteFiles(ctx, files, true)
++}
++
++func (e *Editor) song(ctx context.Context, id string) (*model.MediaFile, error) {
++	mf, err := e.ds.MediaFile().Get(ctx, id)
++	if errors.Is(err, model.ErrNotFound) || (err == nil && mf.Missing) {
++		return nil, ErrItemNotFound
++	}
++	if err != nil {
++		return nil, err
++	}
++	return mf, nil
++}
++
++func (e *Editor) albumSongs(ctx context.Context, id string) ([]model.MediaFile, error) {
++	files, err := e.ds.MediaFile().GetAll(ctx, model.QueryOptions{
++		Filters: And{Eq{"media_file.album_id": id}, Eq{"media_file.missing": false}},
++	})
++	if err != nil {
++		return nil, err
++	}
++	if len(files) == 0 {
++		return nil, ErrItemNotFound
++	}
++	return files, nil
++}
++
++// writeTags writes the changes to every file, then rescans their folders. It stops at the first
++// file that cannot be written, but still rescans so the library matches the files already changed.
++func (e *Editor) writeTags(ctx context.Context, files []model.MediaFile, changes TagChanges) error {
++	var writeErr error
++	var written []model.MediaFile
++	for _, mf := range files {
++		path, err := absolutePath(mf)
++		if err != nil {
++			writeErr = err
++			break
++		}
++		current, err := e.tags.Read(path)
++		if err != nil {
++			writeErr = fmt.Errorf("could not read the tags of %s: %w", mf.Path, err)
++			break
++		}
++		if err := e.tags.Write(path, changes.tagMap(current)); err != nil {
++			writeErr = fmt.Errorf("could not write the tags of %s (is the music folder writable?): %w", mf.Path, err)
++			break
++		}
++		written = append(written, mf)
++	}
++	if len(written) > 0 {
++		log.Info(ctx, "Seer: tags edited", "files", len(written), "first", written[0].Path)
++		if err := e.rescan(ctx, written); err != nil {
++			return errors.Join(writeErr, err)
++		}
++	}
++	return writeErr
++}
++
++// deleteFiles removes the files, rescans their folders and purges the now-missing records.
++func (e *Editor) deleteFiles(ctx context.Context, files []model.MediaFile, removeLeftovers bool) error {
++	var deleteErr error
++	var deleted []model.MediaFile
++	folders := map[string]string{} // absolute folder -> library root
++	for _, mf := range files {
++		path, err := absolutePath(mf)
++		if err != nil {
++			deleteErr = err
++			break
++		}
++		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
++			deleteErr = fmt.Errorf("could not delete %s (is the music folder writable?): %w", mf.Path, err)
++			break
++		}
++		deleted = append(deleted, mf)
++		folders[filepath.Dir(path)] = filepath.Clean(mf.LibraryPath)
++	}
++	if len(deleted) == 0 {
++		return deleteErr
++	}
++	log.Info(ctx, "Seer: files deleted", "files", len(deleted), "first", deleted[0].Path)
++	for dir, root := range folders {
++		e.removeEmptyFolders(ctx, dir, root, removeLeftovers)
++	}
++	if err := e.rescan(ctx, deleted); err != nil {
++		return errors.Join(deleteErr, err)
++	}
++	ids := make([]string, len(deleted))
++	for i, mf := range deleted {
++		ids[i] = mf.ID
++	}
++	if err := e.maintenance.DeleteMissingFiles(ctx, ids); err != nil {
++		return errors.Join(deleteErr, fmt.Errorf("files deleted, but removing them from the library failed: %w", err))
++	}
++	return deleteErr
++}
++
++// leftovers are files that belong to an album folder and are useless without its tracks.
++var leftovers = []string{
++	".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".cue", ".log", ".nfo", ".txt", ".m3u",
++	".m3u8", ".sfv", ".md5", ".accurip", ".lrc", ".pdf", ".ini", ".db",
++}
++
++// removeEmptyFolders deletes dir when it holds no other tracks or folders, then its parents
++// while they are empty, never going above the library root or into a kept folder.
++// With removeLeftovers, covers, cue sheets and logs left behind are deleted too.
++func (e *Editor) removeEmptyFolders(ctx context.Context, dir, root string, removeLeftovers bool) {
++	keep := e.keep()
++	for first := true; ; first = false {
++		dir = filepath.Clean(dir)
++		if !isInside(root, dir) || dir == root || slices.Contains(keep, dir) {
++			return
++		}
++		entries, err := os.ReadDir(dir)
++		if err != nil {
++			return
++		}
++		if first && removeLeftovers && len(entries) > 0 {
++			for _, en := range entries {
++				if en.IsDir() || !slices.Contains(leftovers, strings.ToLower(filepath.Ext(en.Name()))) &&
++					!strings.HasPrefix(en.Name(), ".") {
++					return // something else lives here: keep the folder
++				}
++			}
++			for _, en := range entries {
++				_ = os.Remove(filepath.Join(dir, en.Name()))
++			}
++		}
++		if err := os.Remove(dir); err != nil {
++			return // not empty
++		}
++		log.Debug(ctx, "Seer: removed empty folder", "folder", dir)
++		dir = filepath.Dir(dir)
++	}
++}
++
++// rescan runs a quick scan of the folders holding the files and waits for it. If another scan
++// is running (the file watcher may have started one), it waits and tries again.
++func (e *Editor) rescan(ctx context.Context, files []model.MediaFile) error {
++	ctx = context.WithoutCancel(ctx) // the files changed already: finish even if the browser gives up
++	seen := map[model.ScanTarget]bool{}
++	var targets []model.ScanTarget
++	for _, mf := range files {
++		t := model.ScanTarget{LibraryID: mf.LibraryID, FolderPath: existingFolder(mf.LibraryPath, filepath.Dir(mf.Path))}
++		if !seen[t] {
++			seen[t] = true
++			targets = append(targets, t)
++		}
++	}
++	deadline := time.Now().Add(3 * time.Minute)
++	for {
++		_, err := e.scanner.ScanFolders(ctx, false, targets)
++		if !errors.Is(err, model.ErrAlreadyScanning) {
++			if err != nil {
++				return fmt.Errorf("files changed, but the library scan failed: %w", err)
++			}
++			return nil
++		}
++		if time.Now().After(deadline) {
++			return errors.New("files changed, but a library scan is still running: they will show up after it")
++		}
++		time.Sleep(2 * time.Second)
++	}
++}
++
++// existingFolder returns rel, or its closest parent that still exists ("." for the library root).
++func existingFolder(root, rel string) string {
++	for rel != "." && rel != "/" && rel != "" {
++		if st, err := os.Stat(filepath.Join(root, rel)); err == nil && st.IsDir() {
++			return rel
++		}
++		rel = filepath.Dir(rel)
++	}
++	return "."
++}
++
++func absolutePath(mf model.MediaFile) (string, error) {
++	root := filepath.Clean(mf.LibraryPath)
++	path := filepath.Join(root, mf.Path)
++	if mf.LibraryPath == "" || !isInside(root, path) || path == root {
++		return "", fmt.Errorf("refusing to touch %q: it is outside the library", mf.Path)
++	}
++	return path, nil
++}
+diff --git a/core/seer/editor_test.go b/core/seer/editor_test.go
+new file mode 100644
+index 00000000..1b65763d
+--- /dev/null
++++ b/core/seer/editor_test.go
+@@ -0,0 +1,296 @@
++package seer
++
++import (
++	"context"
++	"errors"
++	"io"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/tests"
++)
++
++func ptr(s string) *string { return &s }
++
++func TestTagChangesValidate(t *testing.T) {
++	ok := []TagChanges{
++		{},
++		{Title: ptr("  Song  "), Year: ptr("2001"), TrackNumber: ptr("3"), DiscNumber: ptr("")},
++		{Year: ptr("2001-09-11"), Genre: ptr("")},
++	}
++	for _, c := range ok {
++		if err := c.validate(); err != nil {
++			t.Errorf("validate(%+v) = %v", c, err)
++		}
++	}
++	bad := []TagChanges{
++		{Title: ptr("  ")},
++		{Album: ptr("")},
++		{TrackNumber: ptr("0")},
++		{TrackNumber: ptr("3/12")},
++		{DiscNumber: ptr("x")},
++		{Year: ptr("01")},
++		{Year: ptr("2001/09")},
++	}
++	for _, c := range bad {
++		if err := c.validate(); !errors.Is(err, ErrInvalidTags) {
++			t.Errorf("validate(%+v) = %v, want ErrInvalidTags", c, err)
++		}
++	}
++	c := TagChanges{Title: ptr("  Song  ")}
++	_ = c.validate()
++	if *c.Title != "Song" {
++		t.Errorf("title not trimmed: %q", *c.Title)
++	}
++}
++
++func TestTagMap(t *testing.T) {
++	current := map[string][]string{
++		"ARTIST": {"A"}, "ARTISTS": {"A", "B"}, "ARTISTSORT": {"A"},
++		"DATE": {"1999"}, "ORIGINALDATE": {"1990"},
++	}
++	got := TagChanges{
++		Artist: ptr("New"), Genre: ptr(""), Year: ptr("2001"),
++	}.tagMap(current)
++	want := map[string][]string{
++		"ARTIST": {"New"}, "ARTISTS": nil, "ARTISTSORT": nil,
++		"GENRE": nil, "DATE": {"2001"}, "ORIGINALDATE": {"2001"},
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("tagMap =\n%v\nwant\n%v", got, want)
++	}
++}
++
++func TestTagMapAlbumOnly(t *testing.T) {
++	c := TagChanges{Title: ptr("x"), Album: ptr("Al"), TrackNumber: ptr("1")}.albumOnly()
++	if c.Title != nil || c.TrackNumber != nil || c.Album == nil {
++		t.Errorf("albumOnly kept track fields: %+v", c)
++	}
++}
++
++// TestTaglibRoundTrip writes tags to a real MP3 with TagLib and reads them back.
++func TestTaglibRoundTrip(t *testing.T) {
++	path := copyFixture(t, "01 Invisible (RED) Edit Version.mp3", t.TempDir())
++	tio := taglibIO{}
++	current, err := tio.Read(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	changes := TagChanges{Title: ptr("Novo título"), Album: ptr("Álbum"), TrackNumber: ptr("7"), Genre: ptr("")}
++	if err := tio.Write(path, changes.tagMap(current)); err != nil {
++		t.Fatal(err)
++	}
++	after, err := tio.Read(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for k, v := range map[string]string{"TITLE": "Novo título", "ALBUM": "Álbum", "TRACKNUMBER": "7"} {
++		if len(after[k]) != 1 || after[k][0] != v {
++			t.Errorf("%s = %v, want %q", k, after[k], v)
++		}
++	}
++	if _, ok := after["GENRE"]; ok {
++		t.Errorf("GENRE should be removed, got %v", after["GENRE"])
++	}
++	if !reflect.DeepEqual(after["ARTIST"], current["ARTIST"]) {
++		t.Errorf("ARTIST changed: %v -> %v", current["ARTIST"], after["ARTIST"])
++	}
++}
++
++type fakeScanner struct {
++	targets [][]model.ScanTarget
++	busy    int // how many calls answer ErrAlreadyScanning
++}
++
++func (f *fakeScanner) ScanAll(ctx context.Context, full bool) ([]string, error) { return nil, nil }
++func (f *fakeScanner) Status(context.Context) (*model.ScannerStatus, error)     { return nil, nil }
++func (f *fakeScanner) ScanFolders(_ context.Context, _ bool, t []model.ScanTarget) ([]string, error) {
++	if f.busy > 0 {
++		f.busy--
++		return nil, model.ErrAlreadyScanning
++	}
++	f.targets = append(f.targets, t)
++	return nil, nil
++}
++
++type fakeMaintenance struct{ deleted []string }
++
++func (f *fakeMaintenance) DeleteMissingFiles(_ context.Context, ids []string) error {
++	f.deleted = append(f.deleted, ids...)
++	return nil
++}
++func (f *fakeMaintenance) DeleteAllMissingFiles(context.Context) error          { return nil }
++func (f *fakeMaintenance) RemapMissingFile(context.Context, string, string) error { return nil }
++
++type fakeTags struct{ written map[string]map[string][]string }
++
++func (f *fakeTags) Read(path string) (map[string][]string, error) {
++	if _, err := os.Stat(path); err != nil {
++		return nil, err
++	}
++	return map[string][]string{}, nil
++}
++func (f *fakeTags) Write(path string, tags map[string][]string) error {
++	f.written[path] = tags
++	return nil
++}
++
++// setupTestLibrary builds <root>/Artist/Album with two tracks and a cover, plus another artist folder.
++func setupTestLibrary(t *testing.T) (string, *tests.MockDataStore, model.MediaFiles) {
++	root := t.TempDir()
++	album := filepath.Join(root, "Artist", "Album")
++	for _, p := range []string{filepath.Join(album, "01.mp3"), filepath.Join(album, "02.mp3"), filepath.Join(album, "cover.jpg"), filepath.Join(root, "Other", "x.mp3")} {
++		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
++			t.Fatal(err)
++		}
++	}
++	files := model.MediaFiles{
++		{ID: "s1", AlbumID: "al1", LibraryID: 1, LibraryPath: root, Path: "Artist/Album/01.mp3"},
++		{ID: "s2", AlbumID: "al1", LibraryID: 1, LibraryPath: root, Path: "Artist/Album/02.mp3"},
++	}
++	repo := tests.CreateMockMediaFileRepo()
++	repo.SetData(files)
++	return root, &tests.MockDataStore{MockedMediaFile: repo}, files
++}
++
++func TestEditorEditSong(t *testing.T) {
++	root, ds, _ := setupTestLibrary(t)
++	sc, tags := &fakeScanner{busy: 1}, &fakeTags{written: map[string]map[string][]string{}}
++	e := NewEditor(ds, sc, &fakeMaintenance{}, tags, nil)
++
++	res, err := e.EditSong(context.Background(), "s1", TagChanges{Title: ptr("New")})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.ID != "s1" || res.AlbumID != "al1" {
++		t.Errorf("result = %+v", res)
++	}
++	got := tags.written[filepath.Join(root, "Artist/Album/01.mp3")]
++	if !reflect.DeepEqual(got, map[string][]string{"TITLE": {"New"}}) {
++		t.Errorf("written = %v", got)
++	}
++	want := [][]model.ScanTarget{{{LibraryID: 1, FolderPath: "Artist/Album"}}}
++	if !reflect.DeepEqual(sc.targets, want) {
++		t.Errorf("scan targets = %v, want %v", sc.targets, want)
++	}
++	if _, err := e.EditSong(context.Background(), "nope", TagChanges{Title: ptr("x")}); !errors.Is(err, ErrItemNotFound) {
++		t.Errorf("missing song: %v", err)
++	}
++	if _, err := e.EditSong(context.Background(), "s1", TagChanges{TrackNumber: ptr("x")}); !errors.Is(err, ErrInvalidTags) {
++		t.Errorf("bad track: %v", err)
++	}
++}
++
++func TestEditorEditAlbumWritesEveryTrack(t *testing.T) {
++	_, ds, _ := setupTestLibrary(t)
++	tags := &fakeTags{written: map[string]map[string][]string{}}
++	e := NewEditor(ds, &fakeScanner{}, &fakeMaintenance{}, tags, nil)
++	if _, err := e.EditAlbum(context.Background(), "al1", TagChanges{Album: ptr("New"), Title: ptr("ignored")}); err != nil {
++		t.Fatal(err)
++	}
++	if len(tags.written) != 2 {
++		t.Fatalf("wrote %d files", len(tags.written))
++	}
++	for p, tm := range tags.written {
++		if _, ok := tm["TITLE"]; ok || tm["ALBUM"][0] != "New" {
++			t.Errorf("%s: %v", p, tm)
++		}
++	}
++}
++
++func TestEditorDeleteSongKeepsAlbumFolder(t *testing.T) {
++	root, ds, _ := setupTestLibrary(t)
++	m := &fakeMaintenance{}
++	e := NewEditor(ds, &fakeScanner{}, m, &fakeTags{}, nil)
++	if err := e.DeleteSong(context.Background(), "s1"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist/Album/01.mp3")); !os.IsNotExist(err) {
++		t.Error("file not deleted")
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist/Album/02.mp3")); err != nil {
++		t.Error("other track was touched")
++	}
++	if !reflect.DeepEqual(m.deleted, []string{"s1"}) {
++		t.Errorf("purged %v", m.deleted)
++	}
++}
++
++func TestEditorDeleteAlbumRemovesFolders(t *testing.T) {
++	root, ds, _ := setupTestLibrary(t)
++	sc, m := &fakeScanner{}, &fakeMaintenance{}
++	e := NewEditor(ds, sc, m, &fakeTags{}, nil)
++	if err := e.DeleteAlbum(context.Background(), "al1"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist")); !os.IsNotExist(err) {
++		t.Error("empty artist folder should be removed")
++	}
++	if _, err := os.Stat(filepath.Join(root, "Other", "x.mp3")); err != nil {
++		t.Error("another artist was touched")
++	}
++	if _, err := os.Stat(root); err != nil {
++		t.Error("library root removed")
++	}
++	if len(m.deleted) != 2 {
++		t.Errorf("purged %v", m.deleted)
++	}
++	// The album folder is gone, so the scan falls back to the library root.
++	if want := [][]model.ScanTarget{{{LibraryID: 1, FolderPath: "."}}}; !reflect.DeepEqual(sc.targets, want) {
++		t.Errorf("scan targets = %v, want %v", sc.targets, want)
++	}
++}
++
++func TestEditorDeleteAlbumKeepsFoldersWithOtherFiles(t *testing.T) {
++	root, ds, _ := setupTestLibrary(t)
++	extra := filepath.Join(root, "Artist", "Album", "bonus.flac")
++	if err := os.WriteFile(extra, []byte("x"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	e := NewEditor(ds, &fakeScanner{}, &fakeMaintenance{}, &fakeTags{}, nil)
++	if err := e.DeleteAlbum(context.Background(), "al1"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(extra); err != nil {
++		t.Error("a file not in the album was deleted")
++	}
++	if _, err := os.Stat(filepath.Join(root, "Artist", "Album", "cover.jpg")); err != nil {
++		t.Error("cover deleted although the folder stays")
++	}
++}
++
++func TestAbsolutePathRejectsEscapes(t *testing.T) {
++	for _, p := range []string{"../etc/passwd", "a/../../x", "", "."} {
++		if _, err := absolutePath(model.MediaFile{LibraryPath: "/music", Path: p}); err == nil {
++			t.Errorf("absolutePath(%q) should fail", p)
++		}
++	}
++	if got, err := absolutePath(model.MediaFile{LibraryPath: "/music", Path: "A/b.mp3"}); err != nil || got != "/music/A/b.mp3" {
++		t.Errorf("absolutePath = %q, %v", got, err)
++	}
++}
++
++func copyFixture(t *testing.T, name, dir string) string {
++	t.Helper()
++	src, err := os.Open(filepath.Join("..", "..", "tests", "fixtures", name))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer src.Close()
++	dst := filepath.Join(dir, name)
++	out, err := os.Create(dst)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer out.Close()
++	if _, err := io.Copy(out, src); err != nil {
++		t.Fatal(err)
++	}
++	return dst
++}
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index 35a9243f..768dbd62 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -9,6 +9,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/core"
+ 	"github.com/navidrome/navidrome/core/acquire"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
+@@ -23,6 +24,8 @@ type Seer struct {
+ 	Storage  *Storage
+ 	// Duplicates finds and cleans songs downloaded twice.
+ 	Duplicates *Duplicates
++	// Editor lets admins edit tags and delete albums or tracks (served under /api/seer/library).
++	Editor *Editor
+ }
+ 
+ // Enabled reports whether the feature is turned on in the configuration.
+@@ -58,7 +61,14 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 	imp.OnChange = func() { refreshUI(broker) }
+ 	dest := cfg.DestDir
+ 	dups := &Duplicates{ds: ds, lib: lib, destDir: func() string { return dest }}
+-	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups}
++	keep := func() []string {
++		if dest == "" {
++			return nil
++		}
++		return []string{filepath.Clean(dest)}
++	}
++	editor := NewEditor(ds, scanner, core.NewMaintenance(ds), nil, keep)
++	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor}
+ }
+ 
+ // refreshUI tells open pages to reload (useRefreshOnEvents(['seer'])).
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index c3c07015..88fbb917 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -51,7 +51,12 @@
+         "playNext": "Toca a seguir",
+         "info": "Detalhes",
+         "showInPlaylist": "Ir para playlist",
+-        "instantMix": "Mix Instantâneo"
++        "instantMix": "Mix Instantâneo",
++        "editMetadata": "Editar Metadados",
++        "delete": "Excluir Música"
++      },
++      "notifications": {
++        "deleteConfirm": "Tem certeza que deseja excluir permanentemente esta música do seu disco? Esta ação não pode ser desfeita."
+       }
+     },
+     "album": {
+@@ -94,7 +99,12 @@
+         "download": "Baixar",
+         "info": "Detalhes",
+         "share": "Compartilhar",
+-        "refresh": "Atualizar Metadados"
++        "refresh": "Atualizar Metadados",
++        "editMetadata": "Editar Metadados",
++        "delete": "Excluir Álbum"
++      },
++      "notifications": {
++        "deleteConfirm": "Tem certeza que deseja excluir permanentemente este álbum e todas as suas faixas do seu disco? Esta ação não pode ser desfeita."
+       },
+       "lists": {
+         "all": "Todos",
+diff --git a/server/seerapi/library.go b/server/seerapi/library.go
+new file mode 100644
+index 00000000..4d7df709
+--- /dev/null
++++ b/server/seerapi/library.go
+@@ -0,0 +1,64 @@
++package seerapi
++
++import (
++	"encoding/json"
++	"errors"
++	"net/http"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/navidrome/navidrome/core/seer"
++	"github.com/navidrome/navidrome/log"
++)
++
++// Admin-only library editing: PUT edits tags, DELETE removes the files from disk.
++
++func (api *Router) editSong(w http.ResponseWriter, r *http.Request) {
++	changes, ok := decodeChanges(w, r)
++	if !ok {
++		return
++	}
++	res, err := api.editor.EditSong(r.Context(), chi.URLParam(r, "id"), changes)
++	writeEditResult(w, r, res, err)
++}
++
++func (api *Router) editAlbum(w http.ResponseWriter, r *http.Request) {
++	changes, ok := decodeChanges(w, r)
++	if !ok {
++		return
++	}
++	res, err := api.editor.EditAlbum(r.Context(), chi.URLParam(r, "id"), changes)
++	writeEditResult(w, r, res, err)
++}
++
++func (api *Router) deleteSong(w http.ResponseWriter, r *http.Request) {
++	writeEditResult(w, r, nil, api.editor.DeleteSong(r.Context(), chi.URLParam(r, "id")))
++}
++
++func (api *Router) deleteAlbum(w http.ResponseWriter, r *http.Request) {
++	writeEditResult(w, r, nil, api.editor.DeleteAlbum(r.Context(), chi.URLParam(r, "id")))
++}
++
++func decodeChanges(w http.ResponseWriter, r *http.Request) (seer.TagChanges, bool) {
++	var changes seer.TagChanges
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&changes); err != nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return changes, false
++	}
++	return changes, true
++}
++
++func writeEditResult(w http.ResponseWriter, r *http.Request, res *seer.EditResult, err error) {
++	switch {
++	case errors.Is(err, seer.ErrItemNotFound):
++		http.Error(w, "not found", http.StatusNotFound)
++	case errors.Is(err, seer.ErrInvalidTags):
++		http.Error(w, err.Error(), http.StatusBadRequest)
++	case err != nil:
++		log.Error(r.Context(), "Seer: library edit failed", err)
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++	case res == nil:
++		w.WriteHeader(http.StatusNoContent)
++	default:
++		writeJSON(w, http.StatusOK, res)
++	}
++}
+diff --git a/server/seerapi/library_test.go b/server/seerapi/library_test.go
+new file mode 100644
+index 00000000..4f9ac6c7
+--- /dev/null
++++ b/server/seerapi/library_test.go
+@@ -0,0 +1,77 @@
++package seerapi
++
++import (
++	"context"
++	"fmt"
++	"strings"
++	"testing"
++
++	"github.com/navidrome/navidrome/core/seer"
++	"github.com/navidrome/navidrome/model"
++)
++
++type fakeEditor struct{ calls []string }
++
++func (f *fakeEditor) EditSong(_ context.Context, id string, c seer.TagChanges) (*seer.EditResult, error) {
++	if id == "missing" {
++		return nil, seer.ErrItemNotFound
++	}
++	if c.TrackNumber != nil {
++		return nil, fmt.Errorf("%w: bad track", seer.ErrInvalidTags)
++	}
++	f.calls = append(f.calls, "editSong:"+id+":"+*c.Title)
++	return &seer.EditResult{ID: id, AlbumID: "al2"}, nil
++}
++func (f *fakeEditor) EditAlbum(_ context.Context, id string, c seer.TagChanges) (*seer.EditResult, error) {
++	f.calls = append(f.calls, "editAlbum:"+id+":"+*c.Album)
++	return &seer.EditResult{ID: "al2", AlbumID: "al2"}, nil
++}
++func (f *fakeEditor) DeleteSong(_ context.Context, id string) error {
++	f.calls = append(f.calls, "deleteSong:"+id)
++	return nil
++}
++func (f *fakeEditor) DeleteAlbum(_ context.Context, id string) error {
++	f.calls = append(f.calls, "deleteAlbum:"+id)
++	return nil
++}
++
++func TestLibraryAPI(t *testing.T) {
++	ed := &fakeEditor{}
++	api := NewWithServices(nil, &fakeService{}, ed)
++	user := model.User{ID: "u1"}
++	admin := model.User{ID: "adm", IsAdmin: true}
++
++	if w := do(t, api, user, "DELETE", "/library/song/s1", ""); w.Code != 403 {
++		t.Errorf("non-admin delete: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/library/song/s1", `{"title":"New"}`); w.Code != 200 || !strings.Contains(w.Body.String(), `"albumId":"al2"`) {
++		t.Errorf("edit song: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, admin, "PUT", "/library/song/missing", `{"title":"x"}`); w.Code != 404 {
++		t.Errorf("edit missing: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/library/song/s1", `{"title":"x","trackNumber":"a"}`); w.Code != 400 {
++		t.Errorf("invalid tags: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/library/song/s1", `not json`); w.Code != 400 {
++		t.Errorf("invalid body: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/library/album/al1", `{"album":"A"}`); w.Code != 200 {
++		t.Errorf("edit album: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, admin, "DELETE", "/library/song/s1", ""); w.Code != 204 {
++		t.Errorf("delete song: %d", w.Code)
++	}
++	if w := do(t, api, admin, "DELETE", "/library/album/al1", ""); w.Code != 204 {
++		t.Errorf("delete album: %d", w.Code)
++	}
++	want := "editSong:s1:New,editAlbum:al1:A,deleteSong:s1,deleteAlbum:al1"
++	if got := strings.Join(ed.calls, ","); got != want {
++		t.Errorf("calls = %s, want %s", got, want)
++	}
++
++	// Without an editor the routes do not exist.
++	if w := do(t, NewWithService(nil, &fakeService{}), admin, "DELETE", "/library/song/s1", ""); w.Code != 404 && w.Code != 405 {
++		t.Errorf("no editor: %d", w.Code)
++	}
++}
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 5cfa62a3..ef1768f6 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -53,6 +53,14 @@ type Duplicates interface {
+ 	Clean(ctx context.Context) (*seer.DupReport, error)
+ }
+ 
++// Editor is the admin tool that edits tags and deletes library items.
++type Editor interface {
++	EditSong(ctx context.Context, id string, changes seer.TagChanges) (*seer.EditResult, error)
++	EditAlbum(ctx context.Context, id string, changes seer.TagChanges) (*seer.EditResult, error)
++	DeleteSong(ctx context.Context, id string) error
++	DeleteAlbum(ctx context.Context, id string) error
++}
++
+ type Router struct {
+ 	http.Handler
+ 	ds      model.DataStore
+@@ -60,10 +68,18 @@ type Router struct {
+ 	imp     Imports
+ 	storage Storage
+ 	dups    Duplicates
++	editor  Editor
+ }
+ 
+ func New(ds model.DataStore, s *seer.Seer) *Router {
+-	r := &Router{ds: ds, svc: s, imp: s.Importer, storage: s.Storage, dups: s.Duplicates}
++	r := &Router{
++		ds:      ds,
++		svc:     s,
++		imp:     s.Importer,
++		storage: s.Storage,
++		dups:    s.Duplicates,
++		editor:  s.Editor,
++	}
+ 	r.Handler = r.routes()
+ 	return r
+ }
+@@ -91,7 +107,12 @@ func NewWithDuplicates(ds model.DataStore, svc Service, d Duplicates) *Router {
+ 
+ // NewWithService builds the router around any Service (used by tests).
+ func NewWithService(ds model.DataStore, svc Service) *Router {
+-	r := &Router{ds: ds, svc: svc}
++	return NewWithServices(ds, svc, nil)
++}
++
++// NewWithServices also takes the library Editor; with a nil editor the /library routes are off.
++func NewWithServices(ds model.DataStore, svc Service, editor Editor) *Router {
++	r := &Router{ds: ds, svc: svc, editor: editor}
+ 	r.Handler = r.routes()
+ 	return r
+ }
+@@ -130,6 +151,14 @@ func (api *Router) routes() http.Handler {
+ 				r.Post("/{id}/items/{pos}/resolve", api.resolveImportItem)
+ 			})
+ 		}
++		if api.editor != nil {
++			r.With(adminOnly).Route("/library", func(r chi.Router) {
++				r.Put("/song/{id}", api.editSong)
++				r.Delete("/song/{id}", api.deleteSong)
++				r.Put("/album/{id}", api.editAlbum)
++				r.Delete("/album/{id}", api.deleteAlbum)
++			})
++		}
+ 	})
+ 	return r
+ }
+diff --git a/ui/src/App.jsx b/ui/src/App.jsx
+index 92df18b3..0969937c 100644
+--- a/ui/src/App.jsx
++++ b/ui/src/App.jsx
+@@ -39,6 +39,8 @@ import {
+   downloadMenuDialogReducer,
+   shareDialogReducer,
+   transcodingReducer,
++  editMetadataDialogReducer,
++  deleteConfirmDialogReducer,
+ } from './reducers'
+ import createAdminStore from './store/createAdminStore'
+ import { i18nProvider, retrieveTranslation } from './i18n'
+@@ -81,6 +83,8 @@ const adminStore = createAdminStore({
+     settings: settingsReducer,
+     replayGain: replayGainReducer,
+     transcoding: transcodingReducer,
++    editMetadataDialog: editMetadataDialogReducer,
++    deleteConfirmDialog: deleteConfirmDialogReducer,
+   },
+ })
+ 
+diff --git a/ui/src/actions/dialogs.js b/ui/src/actions/dialogs.js
+index dea4d620..53aa32f6 100644
+--- a/ui/src/actions/dialogs.js
++++ b/ui/src/actions/dialogs.js
+@@ -86,3 +86,28 @@ export const openSaveQueueDialog = () => ({
+ export const closeSaveQueueDialog = () => ({
+   type: SAVE_QUEUE_CLOSE,
+ })
++
++export const EDIT_METADATA_OPEN = 'EDIT_METADATA_OPEN'
++export const EDIT_METADATA_CLOSE = 'EDIT_METADATA_CLOSE'
++export const DELETE_CONFIRM_OPEN = 'DELETE_CONFIRM_OPEN'
++export const DELETE_CONFIRM_CLOSE = 'DELETE_CONFIRM_CLOSE'
++
++export const openEditMetadataDialog = (record, recordType) => ({
++  type: EDIT_METADATA_OPEN,
++  record,
++  recordType,
++})
++
++export const closeEditMetadataDialog = () => ({
++  type: EDIT_METADATA_CLOSE,
++})
++
++export const openDeleteConfirmDialog = (record, recordType) => ({
++  type: DELETE_CONFIRM_OPEN,
++  record,
++  recordType,
++})
++
++export const closeDeleteConfirmDialog = () => ({
++  type: DELETE_CONFIRM_CLOSE,
++})
+diff --git a/ui/src/album/AlbumActions.jsx b/ui/src/album/AlbumActions.jsx
+index c3b3a4bc..b41e57e8 100644
+--- a/ui/src/album/AlbumActions.jsx
++++ b/ui/src/album/AlbumActions.jsx
+@@ -5,6 +5,7 @@ import {
+   Button,
+   sanitizeListRestProps,
+   TopToolbar,
++  usePermissions,
+   useRecordContext,
+   useTranslate,
+ } from 'react-admin'
+@@ -15,6 +16,8 @@ import CloudDownloadOutlinedIcon from '@material-ui/icons/CloudDownloadOutlined'
+ import { RiPlayListAddFill, RiPlayList2Fill } from 'react-icons/ri'
+ import PlaylistAddIcon from '@material-ui/icons/PlaylistAdd'
+ import ShareIcon from '@material-ui/icons/Share'
++import EditIcon from '@material-ui/icons/Edit'
++import DeleteIcon from '@material-ui/icons/Delete'
+ import {
+   playNext,
+   addTracks,
+@@ -24,6 +27,8 @@ import {
+   openDownloadMenu,
+   DOWNLOAD_MENU_ALBUM,
+   openShareMenu,
++  openEditMetadataDialog,
++  openDeleteConfirmDialog,
+ } from '../actions'
+ import { formatBytes } from '../utils'
+ import config from '../config'
+@@ -85,6 +90,17 @@ const AlbumActions = ({
+     dispatch(openDownloadMenu(record, DOWNLOAD_MENU_ALBUM))
+   }, [dispatch, record])
+ 
++  const { permissions } = usePermissions()
++  const isAdmin = permissions === 'admin'
++
++  const handleEditMetadata = React.useCallback(() => {
++    dispatch(openEditMetadataDialog(record, 'album'))
++  }, [dispatch, record])
++
++  const handleDeleteAlbum = React.useCallback(() => {
++    dispatch(openDeleteConfirmDialog(record, 'album'))
++  }, [dispatch, record])
++
+   return (
+     <TopToolbar className={className} {...sanitizeListRestProps(rest)}>
+       <div className={classes.toolbar}>
+@@ -143,6 +159,26 @@ const AlbumActions = ({
+             record={record}
+             size="small"
+           />
++          {isAdmin && config.seerEnabled && (
++            <>
++              <AlbumButton
++                onClick={handleEditMetadata}
++                label={translate('resources.album.actions.editMetadata', {
++                  _: 'Edit Metadata',
++                })}
++              >
++                <EditIcon />
++              </AlbumButton>
++              <AlbumButton
++                onClick={handleDeleteAlbum}
++                label={translate('resources.album.actions.delete', {
++                  _: 'Delete Album',
++                })}
++              >
++                <DeleteIcon />
++              </AlbumButton>
++            </>
++          )}
+         </div>
+         <div>{isNotSmall && <ToggleFieldsMenu resource="albumSong" />}</div>
+       </div>
+diff --git a/ui/src/common/ContextMenus.jsx b/ui/src/common/ContextMenus.jsx
+index 4407392c..a7b1fd12 100644
+--- a/ui/src/common/ContextMenus.jsx
++++ b/ui/src/common/ContextMenus.jsx
+@@ -25,6 +25,8 @@ import {
+   DOWNLOAD_MENU_ALBUM,
+   DOWNLOAD_MENU_ARTIST,
+   openShareMenu,
++  openEditMetadataDialog,
++  openDeleteConfirmDialog,
+ } from '../actions'
+ import { LoveButton } from './LoveButton'
+ import config from '../config'
+@@ -143,6 +145,26 @@ const ContextMenu = ({
+       label: translate('resources.album.actions.refresh'),
+       action: (record) => refreshMetadata(resource, record.id),
+     },
++    editMetadata: {
++      enabled:
++        permissions === 'admin' &&
++        config.seerEnabled &&
++        !isArtist &&
++        !record.missing,
++      needData: false,
++      label: translate('resources.album.actions.editMetadata', {
++        _: 'Edit Metadata',
++      }),
++      action: (record) => dispatch(openEditMetadataDialog(record, 'album')),
++    },
++    delete: {
++      enabled: permissions === 'admin' && config.seerEnabled && !isArtist,
++      needData: false,
++      label: translate('resources.album.actions.delete', {
++        _: 'Delete Album',
++      }),
++      action: (record) => dispatch(openDeleteConfirmDialog(record, 'album')),
++    },
+     ...(!hideInfo && {
+       info: {
+         enabled: true,
+diff --git a/ui/src/common/SongContextMenu.jsx b/ui/src/common/SongContextMenu.jsx
+index ac5b10e1..0ffc7ebc 100644
+--- a/ui/src/common/SongContextMenu.jsx
++++ b/ui/src/common/SongContextMenu.jsx
+@@ -21,6 +21,8 @@ import {
+   openDownloadMenu,
+   DOWNLOAD_MENU_SONG,
+   openShareMenu,
++  openEditMetadataDialog,
++  openDeleteConfirmDialog,
+ } from '../actions'
+ import { LoveButton } from './LoveButton'
+ import config from '../config'
+@@ -168,6 +170,26 @@ export const SongContextMenu = ({
+         dispatch(openExtendedInfoDialog(fullRecord))
+       },
+     },
++    editMetadata: {
++      enabled: permissions === 'admin' && config.seerEnabled && !record.missing,
++      label: translate('resources.song.actions.editMetadata', {
++        _: 'Edit Metadata',
++      }),
++      action: (record) => {
++        const id = record.mediaFileId || record.id
++        dispatch(openEditMetadataDialog({ ...record, id }, 'song'))
++      },
++    },
++    delete: {
++      enabled: permissions === 'admin' && config.seerEnabled,
++      label: translate('resources.song.actions.delete', {
++        _: 'Delete Track',
++      }),
++      action: (record) => {
++        const id = record.mediaFileId || record.id
++        dispatch(openDeleteConfirmDialog({ ...record, id }, 'song'))
++      },
++    },
+   }
+ 
+   const handleClick = (e) => {
+diff --git a/ui/src/dialogs/DeleteConfirmDialog.jsx b/ui/src/dialogs/DeleteConfirmDialog.jsx
+new file mode 100644
+index 00000000..95d7fce3
+--- /dev/null
++++ b/ui/src/dialogs/DeleteConfirmDialog.jsx
+@@ -0,0 +1,155 @@
++import React, { useState, useCallback } from 'react'
++import { useDispatch, useSelector } from 'react-redux'
++import { useNotify, useRefresh, useTranslate } from 'react-admin'
++import { useHistory, useLocation } from 'react-router-dom'
++import {
++  Button,
++  CircularProgress,
++  Dialog,
++  DialogActions,
++  DialogContent,
++  DialogContentText,
++  DialogTitle,
++  makeStyles,
++} from '@material-ui/core'
++import DeleteIcon from '@material-ui/icons/Delete'
++import { closeDeleteConfirmDialog } from '../actions'
++import { deleteAlbum, deleteSong } from '../seer/api'
++
++const useStyles = makeStyles((theme) => ({
++  deleteButton: {
++    backgroundColor: theme.palette.error.main,
++    color: theme.palette.error.contrastText,
++    '&:hover': {
++      backgroundColor: theme.palette.error.dark,
++    },
++  },
++  itemName: {
++    fontWeight: 'bold',
++    color: theme.palette.text.primary,
++  },
++}))
++
++export const DeleteConfirmDialog = () => {
++  const classes = useStyles()
++  const dispatch = useDispatch()
++  const translate = useTranslate()
++  const notify = useNotify()
++  const refresh = useRefresh()
++  const history = useHistory()
++  const location = useLocation()
++
++  const { open, record, recordType } = useSelector(
++    (state) => state.deleteConfirmDialog || {},
++  )
++
++  const isAlbum = recordType === 'album'
++  const [isDeleting, setIsDeleting] = useState(false)
++
++  const handleClose = useCallback(
++    (e) => {
++      if (e) e.stopPropagation()
++      if (!isDeleting) {
++        dispatch(closeDeleteConfirmDialog())
++      }
++    },
++    [dispatch, isDeleting],
++  )
++
++  const handleDelete = useCallback(async () => {
++    if (!record || !record.id) return
++
++    setIsDeleting(true)
++    try {
++      if (isAlbum) {
++        await deleteAlbum(record.id)
++      } else {
++        await deleteSong(record.id)
++      }
++
++      notify('ra.notification.deleted', {
++        type: 'info',
++        messageArgs: { smart_count: 1 },
++      })
++
++      if (isAlbum && location.pathname.startsWith(`/album/${record.id}`)) {
++        history.push('/album')
++      }
++
++      refresh()
++      dispatch(closeDeleteConfirmDialog())
++    } catch (err) {
++      notify(err.message || 'ra.page.error', { type: 'warning' })
++    } finally {
++      setIsDeleting(false)
++    }
++  }, [
++    record,
++    isAlbum,
++    location.pathname,
++    history,
++    refresh,
++    dispatch,
++    notify,
++  ])
++
++  if (!open || !record) {
++    return null
++  }
++
++  const itemName = isAlbum
++    ? record.name || record.album || ''
++    : record.title || ''
++  const itemArtist = record.artist || record.albumArtist || ''
++
++  const dialogTitle = isAlbum
++    ? translate('resources.album.actions.delete', { _: 'Delete Album' })
++    : translate('resources.song.actions.delete', { _: 'Delete Track' })
++
++  const dialogMessage = isAlbum
++    ? translate('resources.album.notifications.deleteConfirm', {
++        _: 'Are you sure you want to permanently delete this album and all its tracks from your storage? This action cannot be undone.',
++      })
++    : translate('resources.song.notifications.deleteConfirm', {
++        _: 'Are you sure you want to permanently delete this track from your storage? This action cannot be undone.',
++      })
++
++  return (
++    <Dialog
++      open={open}
++      onClose={handleClose}
++      aria-labelledby="delete-confirm-dialog-title"
++      maxWidth="xs"
++      fullWidth
++    >
++      <DialogTitle id="delete-confirm-dialog-title">{dialogTitle}</DialogTitle>
++      <DialogContent>
++        <DialogContentText>
++          <span className={classes.itemName}>
++            {itemName}
++            {itemArtist ? ` — ${itemArtist}` : ''}
++          </span>
++        </DialogContentText>
++        <DialogContentText>{dialogMessage}</DialogContentText>
++      </DialogContent>
++      <DialogActions>
++        <Button onClick={handleClose} disabled={isDeleting}>
++          {translate('ra.action.cancel', { _: 'Cancel' })}
++        </Button>
++        <Button
++          onClick={handleDelete}
++          className={classes.deleteButton}
++          variant="contained"
++          disabled={isDeleting}
++          startIcon={
++            isDeleting ? <CircularProgress size={20} color="inherit" /> : <DeleteIcon />
++          }
++        >
++          {translate('ra.action.delete', { _: 'Delete' })}
++        </Button>
++      </DialogActions>
++    </Dialog>
++  )
++}
++
++export default DeleteConfirmDialog
+diff --git a/ui/src/dialogs/Dialogs.jsx b/ui/src/dialogs/Dialogs.jsx
+index f37c5582..e122a6fe 100644
+--- a/ui/src/dialogs/Dialogs.jsx
++++ b/ui/src/dialogs/Dialogs.jsx
+@@ -3,6 +3,8 @@ import DownloadMenuDialog from './DownloadMenuDialog'
+ import { HelpDialog } from './HelpDialog'
+ import { ShareDialog } from './ShareDialog'
+ import { SaveQueueDialog } from './SaveQueueDialog'
++import { EditMetadataDialog } from './EditMetadataDialog'
++import { DeleteConfirmDialog } from './DeleteConfirmDialog'
+ 
+ export const Dialogs = (props) => (
+   <>
+@@ -11,5 +13,7 @@ export const Dialogs = (props) => (
+     <DownloadMenuDialog />
+     <HelpDialog />
+     <ShareDialog />
++    <EditMetadataDialog />
++    <DeleteConfirmDialog />
+   </>
+ )
+diff --git a/ui/src/dialogs/EditMetadataDialog.jsx b/ui/src/dialogs/EditMetadataDialog.jsx
+new file mode 100644
+index 00000000..068f3217
+--- /dev/null
++++ b/ui/src/dialogs/EditMetadataDialog.jsx
+@@ -0,0 +1,316 @@
++import React, { useState, useEffect, useCallback } from 'react'
++import { useDispatch, useSelector } from 'react-redux'
++import { useNotify, useRefresh, useTranslate } from 'react-admin'
++import { useHistory, useLocation } from 'react-router-dom'
++import {
++  Button,
++  CircularProgress,
++  Dialog,
++  DialogActions,
++  DialogContent,
++  DialogTitle,
++  Grid,
++  TextField,
++  makeStyles,
++} from '@material-ui/core'
++import { closeEditMetadataDialog } from '../actions'
++import { editAlbum, editSong } from '../seer/api'
++
++const useStyles = makeStyles((theme) => ({
++  dialogContent: {
++    paddingTop: theme.spacing(1),
++  },
++  field: {
++    marginBottom: theme.spacing(2),
++  },
++}))
++
++export const EditMetadataDialog = () => {
++  const classes = useStyles()
++  const dispatch = useDispatch()
++  const translate = useTranslate()
++  const notify = useNotify()
++  const refresh = useRefresh()
++  const history = useHistory()
++  const location = useLocation()
++
++  const { open, record, recordType } = useSelector(
++    (state) => state.editMetadataDialog || {},
++  )
++
++  const isAlbum = recordType === 'album'
++
++  const [title, setTitle] = useState('')
++  const [artist, setArtist] = useState('')
++  const [album, setAlbum] = useState('')
++  const [albumArtist, setAlbumArtist] = useState('')
++  const [year, setYear] = useState('')
++  const [genre, setGenre] = useState('')
++  const [trackNumber, setTrackNumber] = useState('')
++  const [discNumber, setDiscNumber] = useState('')
++  const [isSaving, setIsSaving] = useState(false)
++
++  useEffect(() => {
++    if (open && record) {
++      if (isAlbum) {
++        setAlbum(record.name || record.album || '')
++        setAlbumArtist(record.albumArtist || record.artist || '')
++        setYear(record.year != null ? String(record.year) : '')
++        setGenre(record.genre || '')
++      } else {
++        setTitle(record.title || '')
++        setArtist(record.artist || '')
++        setAlbum(record.album || '')
++        setAlbumArtist(record.albumArtist || '')
++        setYear(record.year != null ? String(record.year) : '')
++        setGenre(record.genre || '')
++        setTrackNumber(
++          record.trackNumber != null ? String(record.trackNumber) : '',
++        )
++        setDiscNumber(
++          record.discNumber != null ? String(record.discNumber) : '',
++        )
++      }
++    }
++  }, [open, record, isAlbum])
++
++  const handleClose = useCallback(
++    (e) => {
++      if (e) e.stopPropagation()
++      if (!isSaving) {
++        dispatch(closeEditMetadataDialog())
++      }
++    },
++    [dispatch, isSaving],
++  )
++
++  const handleSave = useCallback(
++    async (e) => {
++      if (e) e.preventDefault()
++      if (!record || !record.id) return
++
++      const cleanAlbum = album.trim()
++      if (!cleanAlbum) {
++        notify('resources.album.fields.album', { type: 'warning' })
++        return
++      }
++
++      if (!isAlbum && !title.trim()) {
++        notify('resources.song.fields.title', { type: 'warning' })
++        return
++      }
++
++      setIsSaving(true)
++      try {
++        const changes = {
++          album: cleanAlbum,
++          albumArtist: albumArtist.trim(),
++          year: year.trim(),
++          genre: genre.trim(),
++        }
++
++        let res
++        if (isAlbum) {
++          res = await editAlbum(record.id, changes)
++        } else {
++          changes.title = title.trim()
++          changes.artist = artist.trim()
++          changes.trackNumber = trackNumber.trim()
++          changes.discNumber = discNumber.trim()
++          res = await editSong(record.id, changes)
++        }
++
++        notify('ra.notification.updated', {
++          type: 'info',
++          messageArgs: { smart_count: 1 },
++        })
++
++        // If the album was renamed and user is on its show page, update URL
++        if (
++          isAlbum &&
++          res?.albumId &&
++          res.albumId !== record.id &&
++          location.pathname.startsWith(`/album/${record.id}`)
++        ) {
++          history.replace(`/album/${res.albumId}/show`)
++        }
++
++        refresh()
++        dispatch(closeEditMetadataDialog())
++      } catch (err) {
++        notify(err.message || 'ra.page.error', { type: 'warning' })
++      } finally {
++        setIsSaving(false)
++      }
++    },
++    [
++      record,
++      isAlbum,
++      album,
++      albumArtist,
++      year,
++      genre,
++      title,
++      artist,
++      trackNumber,
++      discNumber,
++      notify,
++      location.pathname,
++      history,
++      refresh,
++      dispatch,
++    ],
++  )
++
++  if (!open || !record) {
++    return null
++  }
++
++  const dialogTitle = isAlbum
++    ? translate('resources.album.actions.editMetadata', {
++        _: 'Edit Album Metadata',
++      })
++    : translate('resources.song.actions.editMetadata', {
++        _: 'Edit Metadata',
++      })
++
++  return (
++    <Dialog
++      open={open}
++      onClose={handleClose}
++      aria-labelledby="edit-metadata-dialog-title"
++      fullWidth
++      maxWidth="sm"
++    >
++      <form onSubmit={handleSave}>
++        <DialogTitle id="edit-metadata-dialog-title">
++          {dialogTitle}
++        </DialogTitle>
++        <DialogContent className={classes.dialogContent}>
++          {!isAlbum && (
++            <TextField
++              className={classes.field}
++              value={title}
++              onChange={(e) => setTitle(e.target.value)}
++              fullWidth
++              variant="outlined"
++              label={translate('resources.song.fields.title', { _: 'Title' })}
++              required
++              disabled={isSaving}
++              autoFocus
++            />
++          )}
++
++          {!isAlbum && (
++            <TextField
++              className={classes.field}
++              value={artist}
++              onChange={(e) => setArtist(e.target.value)}
++              fullWidth
++              variant="outlined"
++              label={translate('resources.song.fields.artist', { _: 'Artist' })}
++              disabled={isSaving}
++            />
++          )}
++
++          <TextField
++            className={classes.field}
++            value={album}
++            onChange={(e) => setAlbum(e.target.value)}
++            fullWidth
++            variant="outlined"
++            label={translate('resources.song.fields.album', { _: 'Album' })}
++            required
++            disabled={isSaving}
++            autoFocus={isAlbum}
++          />
++
++          <TextField
++            className={classes.field}
++            value={albumArtist}
++            onChange={(e) => setAlbumArtist(e.target.value)}
++            fullWidth
++            variant="outlined"
++            label={translate('resources.song.fields.albumArtist', {
++              _: 'Album Artist',
++            })}
++            disabled={isSaving}
++          />
++
++          {!isAlbum && (
++            <Grid container spacing={2}>
++              <Grid item xs={6}>
++                <TextField
++                  className={classes.field}
++                  value={trackNumber}
++                  onChange={(e) => setTrackNumber(e.target.value)}
++                  fullWidth
++                  variant="outlined"
++                  label={translate('resources.song.fields.trackNumber', {
++                    _: 'Track #',
++                  })}
++                  disabled={isSaving}
++                />
++              </Grid>
++              <Grid item xs={6}>
++                <TextField
++                  className={classes.field}
++                  value={discNumber}
++                  onChange={(e) => setDiscNumber(e.target.value)}
++                  fullWidth
++                  variant="outlined"
++                  label={translate('resources.song.fields.disc', {
++                    _: 'Disc #',
++                  })}
++                  disabled={isSaving}
++                />
++              </Grid>
++            </Grid>
++          )}
++
++          <Grid container spacing={2}>
++            <Grid item xs={6}>
++              <TextField
++                className={classes.field}
++                value={year}
++                onChange={(e) => setYear(e.target.value)}
++                fullWidth
++                variant="outlined"
++                label={translate('resources.song.fields.year', { _: 'Year' })}
++                disabled={isSaving}
++                placeholder="YYYY"
++              />
++            </Grid>
++            <Grid item xs={6}>
++              <TextField
++                className={classes.field}
++                value={genre}
++                onChange={(e) => setGenre(e.target.value)}
++                fullWidth
++                variant="outlined"
++                label={translate('resources.song.fields.genre', { _: 'Genre' })}
++                disabled={isSaving}
++              />
++            </Grid>
++          </Grid>
++        </DialogContent>
++        <DialogActions>
++          <Button onClick={handleClose} disabled={isSaving}>
++            {translate('ra.action.cancel', { _: 'Cancel' })}
++          </Button>
++          <Button
++            type="submit"
++            color="primary"
++            variant="contained"
++            disabled={isSaving || (isAlbum ? !album.trim() : !title.trim())}
++            startIcon={isSaving ? <CircularProgress size={20} /> : null}
++          >
++            {translate('ra.action.save', { _: 'Save' })}
++          </Button>
++        </DialogActions>
++      </form>
++    </Dialog>
++  )
++}
++
++export default EditMetadataDialog
+diff --git a/ui/src/dialogs/index.js b/ui/src/dialogs/index.js
+index 3234e468..348921ca 100644
+--- a/ui/src/dialogs/index.js
++++ b/ui/src/dialogs/index.js
+@@ -3,4 +3,6 @@ export * from './SelectPlaylistInput'
+ export * from './ListenBrainzTokenDialog'
+ export * from './SaveQueueDialog'
+ export * from './QuickConnectDialog'
++export * from './EditMetadataDialog'
++export * from './DeleteConfirmDialog'
+ export * from './Dialogs'
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 503890a0..62453533 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -51,7 +51,12 @@
+         "download": "Download",
+         "playNext": "Play Next",
+         "info": "Get Info",
+-        "instantMix": "Instant Mix"
++        "instantMix": "Instant Mix",
++        "editMetadata": "Edit Metadata",
++        "delete": "Delete Track"
++      },
++      "notifications": {
++        "deleteConfirm": "Are you sure you want to permanently delete this track from your storage? This action cannot be undone."
+       }
+     },
+     "album": {
+@@ -95,7 +100,12 @@
+         "addToPlaylist": "Add to Playlist",
+         "download": "Download",
+         "info": "Get Info",
+-        "refresh": "Refresh Metadata"
++        "refresh": "Refresh Metadata",
++        "editMetadata": "Edit Metadata",
++        "delete": "Delete Album"
++      },
++      "notifications": {
++        "deleteConfirm": "Are you sure you want to permanently delete this album and all its tracks from your storage? This action cannot be undone."
+       },
+       "lists": {
+         "all": "All",
+diff --git a/ui/src/reducers/dialogReducer.js b/ui/src/reducers/dialogReducer.js
+index e1a77f10..78cc887d 100644
+--- a/ui/src/reducers/dialogReducer.js
++++ b/ui/src/reducers/dialogReducer.js
+@@ -17,6 +17,10 @@ import {
+   SAVE_QUEUE_CLOSE,
+   SHARE_MENU_OPEN,
+   SHARE_MENU_CLOSE,
++  EDIT_METADATA_OPEN,
++  EDIT_METADATA_CLOSE,
++  DELETE_CONFIRM_OPEN,
++  DELETE_CONFIRM_CLOSE,
+ } from '../actions'
+ 
+ export const shareDialogReducer = (
+@@ -186,3 +190,61 @@ export const saveQueueDialogReducer = (
+       return previousState
+   }
+ }
++
++export const editMetadataDialogReducer = (
++  previousState = {
++    open: false,
++    record: undefined,
++    recordType: undefined,
++  },
++  payload,
++) => {
++  const { type } = payload
++  switch (type) {
++    case EDIT_METADATA_OPEN:
++      return {
++        ...previousState,
++        open: true,
++        record: payload.record,
++        recordType: payload.recordType,
++      }
++    case EDIT_METADATA_CLOSE:
++      return {
++        ...previousState,
++        open: false,
++        record: undefined,
++        recordType: undefined,
++      }
++    default:
++      return previousState
++  }
++}
++
++export const deleteConfirmDialogReducer = (
++  previousState = {
++    open: false,
++    record: undefined,
++    recordType: undefined,
++  },
++  payload,
++) => {
++  const { type } = payload
++  switch (type) {
++    case DELETE_CONFIRM_OPEN:
++      return {
++        ...previousState,
++        open: true,
++        record: payload.record,
++        recordType: payload.recordType,
++      }
++    case DELETE_CONFIRM_CLOSE:
++      return {
++        ...previousState,
++        open: false,
++        record: undefined,
++        recordType: undefined,
++      }
++    default:
++      return previousState
++  }
++}
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index 35184954..589c8cd7 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -82,3 +82,26 @@ export const cleanDuplicates = () =>
+   httpClient(`${SEER_URL}/duplicates/clean`, { method: 'POST' }).then(
+     ({ json }) => json,
+   )
++
++export const editSong = (id, changes) =>
++  httpClient(`${SEER_URL}/library/song/${id}`, {
++    method: 'PUT',
++    body: JSON.stringify(changes),
++  }).then(({ json }) => json)
++
++export const deleteSong = (id) =>
++  httpClient(`${SEER_URL}/library/song/${id}`, {
++    method: 'DELETE',
++  })
++
++export const editAlbum = (id, changes) =>
++  httpClient(`${SEER_URL}/library/album/${id}`, {
++    method: 'PUT',
++    body: JSON.stringify(changes),
++  }).then(({ json }) => json)
++
++export const deleteAlbum = (id) =>
++  httpClient(`${SEER_URL}/library/album/${id}`, {
++    method: 'DELETE',
++  })
++
+-- 
+2.55.0
+

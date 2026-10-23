@@ -1,0 +1,68 @@
+diff --git a/core/seer/podcast.go b/core/seer/podcast.go
+index d7eca9b..b535f33 100644
+--- a/core/seer/podcast.go
++++ b/core/seer/podcast.go
+@@ -213,8 +213,15 @@ func (s *PodcastService) SyncChannel(ctx context.Context, channelID string) erro
+ 	return s.processChannelEpisodes(ctx, ch)
+ }
+ 
++// KeepManual is the keep policy for channels where nothing is downloaded by itself:
++// the user picks each episode to download.
++const KeepManual = -1
++
+ // processChannelEpisodes downloads episodes matching keep policy and deletes older ones.
+ func (s *PodcastService) processChannelEpisodes(ctx context.Context, ch *PodcastChannel) error {
++	if ch.KeepPolicy == KeepManual {
++		return nil
++	}
+ 	allEps, err := s.store.ListEpisodes(ctx, ch.ID)
+ 	if err != nil {
+ 		return err
+diff --git a/core/seer/podcast_test.go b/core/seer/podcast_test.go
+index da09c15..552d7e4 100644
+--- a/core/seer/podcast_test.go
++++ b/core/seer/podcast_test.go
+@@ -239,3 +239,28 @@ func TestParseRSSFeedChannelImage(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestManualChannelDownloadsNothingByItself(t *testing.T) {
++	db := setupTestDB(t)
++	defer db.Close()
++	store := NewPodcastStore(db)
++	ctx := context.Background()
++
++	ch := &PodcastChannel{ID: "m1", UserID: "u1", Title: "Manual", FeedURL: "https://example.com/f.xml", KeepPolicy: KeepManual}
++	if err := store.CreateChannel(ctx, ch); err != nil {
++		t.Fatalf("CreateChannel failed: %v", err)
++	}
++	pub := time.Now().UTC()
++	if err := store.CreateEpisode(ctx, &PodcastEpisode{ID: "x1", ChannelID: "m1", GUID: "g1", Title: "Ep", PublishedAt: &pub, Status: "pending"}); err != nil {
++		t.Fatalf("CreateEpisode failed: %v", err)
++	}
++
++	svc := NewPodcastService(store, func() string { return t.TempDir() }, nil, nil, "ffmpeg", "yt-dlp")
++	if err := svc.processChannelEpisodes(ctx, ch); err != nil {
++		t.Fatalf("processChannelEpisodes failed: %v", err)
++	}
++	eps, err := store.ListEpisodes(ctx, "m1")
++	if err != nil || len(eps) != 1 || eps[0].Status != "pending" {
++		t.Fatalf("manual channel must leave episodes pending, got %+v (err %v)", eps, err)
++	}
++}
+diff --git a/server/seerapi/podcast.go b/server/seerapi/podcast.go
+index 617f31f..b2e2998 100644
+--- a/server/seerapi/podcast.go
++++ b/server/seerapi/podcast.go
+@@ -133,6 +133,10 @@ func (api *Router) updatePodcast(w http.ResponseWriter, r *http.Request) {
+ 		http.Error(w, "invalid body", http.StatusBadRequest)
+ 		return
+ 	}
++	if body.KeepPolicy != seer.KeepManual && body.KeepPolicy != 0 && body.KeepPolicy != 1 && body.KeepPolicy != 3 {
++		http.Error(w, "keepPolicy must be -1 (manual), 0 (all), 1 or 3", http.StatusBadRequest)
++		return
++	}
+ 	updated, err := api.podcasts.Update(r.Context(), id, body.KeepPolicy, body.AutoDownload)
+ 	if err != nil {
+ 		http.Error(w, err.Error(), http.StatusInternalServerError)

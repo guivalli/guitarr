@@ -1,0 +1,216 @@
+diff --git a/core/acquire/clear.go b/core/acquire/clear.go
+new file mode 100644
+index 0000000..b10a7b4
+--- /dev/null
++++ b/core/acquire/clear.go
+@@ -0,0 +1,36 @@
++package acquire
++
++import "context"
++
++// ClearFinished forgets the finished requests (available or failed) of one user, or of
++// everybody when userID is empty. Requests in any other status are left alone, and the
++// music files stay where they are: only the request records go. It returns how many went.
++func (s *Service) ClearFinished(ctx context.Context, userID string, statuses ...Status) (int, error) {
++	reqs, err := s.store.List(ctx, userID)
++	if err != nil {
++		return 0, err
++	}
++	removed := 0
++	for _, r := range reqs {
++		if r.Status != StatusAvailable && r.Status != StatusFailed {
++			continue
++		}
++		if !contains(statuses, r.Status) {
++			continue
++		}
++		if err := s.store.Delete(ctx, r.ID); err != nil {
++			return removed, err
++		}
++		removed++
++	}
++	return removed, nil
++}
++
++func contains(list []Status, want Status) bool {
++	for _, s := range list {
++		if s == want {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/core/acquire/clear_test.go b/core/acquire/clear_test.go
+new file mode 100644
+index 0000000..a6c472a
+--- /dev/null
++++ b/core/acquire/clear_test.go
+@@ -0,0 +1,45 @@
++package acquire
++
++import (
++	"context"
++	"errors"
++	"testing"
++)
++
++func TestClearFinishedKeepsActiveRequests(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	svc := NewService(fastConfig(false), fakeCatalog{}, nil, st, lib)
++	ctx := context.Background()
++	add := func(id, user string, status Status) {
++		if err := st.Create(ctx, &Request{ID: id, UserID: user, Kind: KindTrack, MBID: id, Status: status}); err != nil {
++			t.Fatal(err)
++		}
++	}
++	add("ok", "u1", StatusAvailable)
++	add("bad", "u1", StatusFailed)
++	add("busy", "u1", StatusDownloading)
++	add("other", "u2", StatusFailed)
++
++	if n, err := svc.ClearFinished(ctx, "u1", StatusAvailable, StatusFailed); err != nil || n != 2 {
++		t.Fatalf("user clear removed %d (%v), want 2", n, err)
++	}
++	if _, err := st.Get(ctx, "ok"); !errors.Is(err, ErrNotFound) {
++		t.Errorf("available request should be gone, got %v", err)
++	}
++	if _, err := st.Get(ctx, "busy"); err != nil {
++		t.Errorf("a request in progress must stay: %v", err)
++	}
++	if _, err := st.Get(ctx, "other"); err != nil {
++		t.Errorf("another user's request must stay: %v", err)
++	}
++	if n, _ := svc.ClearFinished(ctx, "", StatusFailed); n != 1 {
++		t.Errorf("admin clear of failed removed %d, want 1 (only other's)", n)
++	}
++	if n, _ := svc.ClearFinished(ctx, "", StatusDownloading); n != 0 {
++		t.Errorf("only finished requests can be cleared, removed %d", n)
++	}
++	if _, err := st.Get(ctx, "busy"); err != nil {
++		t.Errorf("the request in progress was removed: %v", err)
++	}
++}
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index 70c43ad..762ed11 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -50,6 +50,8 @@ type Source interface {
+ type Store interface {
+ 	Create(ctx context.Context, r *Request) error
+ 	Update(ctx context.Context, r *Request) error
++	// Delete removes a request record; it never touches the music files.
++	Delete(ctx context.Context, id string) error
+ 	// Get returns ErrNotFound when the request does not exist.
+ 	Get(ctx context.Context, id string) (*Request, error)
+ 	// List returns the requests of one user, or of everybody when userID is empty, newest first.
+diff --git a/core/acquire/store_memory.go b/core/acquire/store_memory.go
+index 06a3d7e..bfce1bc 100644
+--- a/core/acquire/store_memory.go
++++ b/core/acquire/store_memory.go
+@@ -32,6 +32,16 @@ func (m *MemoryStore) Update(_ context.Context, r *Request) error {
+ 	return nil
+ }
+ 
++func (m *MemoryStore) Delete(_ context.Context, id string) error {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if _, ok := m.data[id]; !ok {
++		return ErrNotFound
++	}
++	delete(m.data, id)
++	return nil
++}
++
+ func (m *MemoryStore) Get(_ context.Context, id string) (*Request, error) {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+diff --git a/core/acquire/store_sql.go b/core/acquire/store_sql.go
+index e694c5b..0a711a0 100644
+--- a/core/acquire/store_sql.go
++++ b/core/acquire/store_sql.go
+@@ -45,6 +45,17 @@ func (s *SQLStore) Update(ctx context.Context, r *Request) error {
+ 	return nil
+ }
+ 
++func (s *SQLStore) Delete(ctx context.Context, id string) error {
++	res, err := s.DB.ExecContext(ctx, `DELETE FROM acquire_request WHERE id = ?`, id)
++	if err != nil {
++		return err
++	}
++	if n, _ := res.RowsAffected(); n == 0 {
++		return ErrNotFound
++	}
++	return nil
++}
++
+ func (s *SQLStore) Get(ctx context.Context, id string) (*Request, error) {
+ 	row := s.DB.QueryRowContext(ctx, `SELECT `+requestColumns+` FROM acquire_request WHERE id = ?`, id)
+ 	r, err := scanRequest(row)
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 3890ee4..130eae9 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -28,6 +28,7 @@ type Service interface {
+ 	Approve(ctx context.Context, id string) (*acquire.Request, error)
+ 	Get(ctx context.Context, id string) (*acquire.Request, error)
+ 	List(ctx context.Context, userID string) ([]acquire.Request, error)
++	ClearFinished(ctx context.Context, userID string, statuses ...acquire.Status) (int, error)
+ }
+ 
+ // Imports is the playlist importer used by the API.
+@@ -146,6 +147,7 @@ func (api *Router) routes() http.Handler {
+ 		r.Route("/requests", func(r chi.Router) {
+ 			r.Get("/", api.listRequests)
+ 			r.Post("/", api.createRequest)
++			r.Delete("/", api.clearRequests)
+ 			r.Get("/{id}", api.getRequest)
+ 			r.With(adminOnly).Post("/{id}/approve", api.approveRequest)
+ 		})
+@@ -342,6 +344,32 @@ func (api *Router) getRequest(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, http.StatusOK, req)
+ }
+ 
++// clearRequests forgets the finished requests named in ?status=available,failed.
++// Like the list, admins clear everybody's unless ?mine=true. The music stays.
++func (api *Router) clearRequests(w http.ResponseWriter, r *http.Request) {
++	q := r.URL.Query().Get("status")
++	if q == "" {
++		http.Error(w, "status is required (available, failed)", http.StatusBadRequest)
++		return
++	}
++	user, _ := request.UserFrom(r.Context())
++	userID := user.ID
++	if user.IsAdmin && r.URL.Query().Get("mine") != "true" {
++		userID = ""
++	}
++	var statuses []acquire.Status
++	for _, s := range strings.Split(q, ",") {
++		statuses = append(statuses, acquire.Status(strings.TrimSpace(s)))
++	}
++	n, err := api.svc.ClearFinished(r.Context(), userID, statuses...)
++	if err != nil {
++		log.Error(r.Context(), "Seer: clearing requests failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	writeJSON(w, http.StatusOK, map[string]int{"removed": n})
++}
++
+ func (api *Router) approveRequest(w http.ResponseWriter, r *http.Request) {
+ 	req, err := api.svc.Approve(r.Context(), chi.URLParam(r, "id"))
+ 	switch {
+diff --git a/server/seerapi/seerapi_test.go b/server/seerapi/seerapi_test.go
+index 3862130..5450875 100644
+--- a/server/seerapi/seerapi_test.go
++++ b/server/seerapi/seerapi_test.go
+@@ -50,6 +50,9 @@ func (f *fakeService) Approve(_ context.Context, id string) (*acquire.Request, e
+ 	r.Status = acquire.StatusQueued
+ 	return r, nil
+ }
++func (f *fakeService) ClearFinished(_ context.Context, _ string, statuses ...acquire.Status) (int, error) {
++	return len(statuses), nil
++}
+ func (f *fakeService) Get(_ context.Context, id string) (*acquire.Request, error) {
+ 	if r, ok := f.reqs[id]; ok {
+ 		return r, nil

@@ -1,0 +1,89 @@
+diff --git a/core/seer/podcast_feed.go b/core/seer/podcast_feed.go
+index b6c1b47..078dc07 100644
+--- a/core/seer/podcast_feed.go
++++ b/core/seer/podcast_feed.go
+@@ -52,14 +52,18 @@ type rssFeed struct {
+ }
+ 
+ type rssChannel struct {
+-	Title        string         `xml:"title"`
+-	Link         string         `xml:"link"`
+-	Description  string         `xml:"description"`
+-	Author       string         `xml:"author"`
+-	ItunesAuthor string         `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd author"`
+-	Image        rssImage       `xml:"image"`
+-	ItunesImage  rssItunesImage `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd image"`
+-	Items        []rssItem      `xml:"item"`
++	Title        string `xml:"title"`
++	Link         string `xml:"link"`
++	Description  string `xml:"description"`
++	Author       string `xml:"author"`
++	ItunesAuthor string `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd author"`
++
++	// ItunesImage must come first: encoding/xml gives an element to the first field that matches,
++	// and a plain `image` tag also matches <itunes:image>, which would swallow the href (Anchor feeds).
++	ItunesImage rssItunesImage `xml:"http://www.itunes.com/dtds/podcast-1.0.dtd image"`
++	Image       rssImage       `xml:"image"`
++
++	Items []rssItem `xml:"item"`
+ }
+ 
+ type rssImage struct {
+@@ -125,6 +129,10 @@ func fetchRSSFeed(ctx context.Context, feedURL string) (*ParsedFeed, error) {
+ 		return nil, fmt.Errorf("reading feed body failed: %w", err)
+ 	}
+ 
++	return parseRSSFeed(body, feedURL)
++}
++
++func parseRSSFeed(body []byte, feedURL string) (*ParsedFeed, error) {
+ 	var rss rssFeed
+ 	if err := xml.Unmarshal(body, &rss); err != nil {
+ 		return nil, fmt.Errorf("parsing RSS XML: %w", err)
+@@ -144,6 +152,15 @@ func fetchRSSFeed(ctx context.Context, feedURL string) (*ParsedFeed, error) {
+ 		SourceType:  "rss",
+ 	}
+ 
++	if feed.ImageURL == "" {
++		for _, it := range ch.Items {
++			if h := strings.TrimSpace(it.ItunesImage.Href); h != "" {
++				feed.ImageURL = h // feed has no channel art: borrow the newest episode art
++				break
++			}
++		}
++	}
++
+ 	for _, it := range ch.Items {
+ 		audioURL := strings.TrimSpace(it.Enclosure.URL)
+ 		if audioURL == "" {
+diff --git a/core/seer/podcast_test.go b/core/seer/podcast_test.go
+index 8df0229..da09c15 100644
+--- a/core/seer/podcast_test.go
++++ b/core/seer/podcast_test.go
+@@ -216,3 +216,26 @@ func TestPodcastStoreAndRetention(t *testing.T) {
+ 		t.Errorf("expected 5th file %s to be deleted, got err: %v", files[4], err)
+ 	}
+ }
++
++func TestParseRSSFeedChannelImage(t *testing.T) {
++	const ns = `xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"`
++	cases := []struct{ name, xml, want string }{
++		{"itunes only (Anchor)", `<rss ` + ns + `><channel><title>A</title><itunes:image href="https://x/a.jpg"/>` +
++			`<item><enclosure url="https://x/1.mp3"/></item></channel></rss>`, "https://x/a.jpg"},
++		{"plain image only", `<rss ` + ns + `><channel><title>A</title><image><url>https://x/b.jpg</url></image>` +
++			`<item><enclosure url="https://x/1.mp3"/></item></channel></rss>`, "https://x/b.jpg"},
++		{"both prefers itunes", `<rss ` + ns + `><channel><image><url>https://x/b.jpg</url></image><itunes:image href="https://x/a.jpg"/>` +
++			`</channel></rss>`, "https://x/a.jpg"},
++		{"episode art fallback", `<rss ` + ns + `><channel><title>A</title>` +
++			`<item><enclosure url="https://x/1.mp3"/><itunes:image href="https://x/e.jpg"/></item></channel></rss>`, "https://x/e.jpg"},
++	}
++	for _, c := range cases {
++		f, err := parseRSSFeed([]byte(c.xml), "https://x/feed")
++		if err != nil {
++			t.Fatalf("%s: %v", c.name, err)
++		}
++		if f.ImageURL != c.want {
++			t.Errorf("%s: ImageURL = %q, want %q", c.name, f.ImageURL, c.want)
++		}
++	}
++}

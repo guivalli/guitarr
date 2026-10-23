@@ -1,0 +1,772 @@
+diff --git a/core/acquire/catalog_musicbrainz.go b/core/acquire/catalog_musicbrainz.go
+index 5323b3c..2ac7b3b 100644
+--- a/core/acquire/catalog_musicbrainz.go
++++ b/core/acquire/catalog_musicbrainz.go
+@@ -497,6 +497,7 @@ func (m *MusicBrainz) Album(ctx context.Context, mbid string) (*AlbumDetail, err
+ 	}
+ 	var rels struct {
+ 		Releases []struct {
++			ID     string `json:"id"`
+ 			Status string `json:"status"`
+ 			Date   string `json:"date"`
+ 			Media  []struct {
+@@ -542,6 +543,7 @@ func (m *MusicBrainz) Album(ctx context.Context, mbid string) (*AlbumDetail, err
+ 	if best < 0 {
+ 		return detail, nil
+ 	}
++	detail.Album.ReleaseID = rels.Releases[best].ID
+ 	num := 0
+ 	for _, md := range rels.Releases[best].Media {
+ 		for _, t := range md.Tracks {
+diff --git a/core/acquire/model.go b/core/acquire/model.go
+index 23209a4..7becf92 100644
+--- a/core/acquire/model.go
++++ b/core/acquire/model.go
+@@ -44,6 +44,8 @@ type CatalogItem struct {
+ 	Disambiguation string `json:"disambiguation,omitempty"`
+ 	Country        string `json:"country,omitempty"`
+ 	TrackNumber    int    `json:"trackNumber,omitempty"`
++	// ReleaseID is the MBID of the release (edition) whose tracklist an album detail shows.
++	ReleaseID string `json:"releaseId,omitempty"`
+ 	// InLibrary is filled by the Service after matching against the local library.
+ 	InLibrary bool `json:"inLibrary"`
+ 	// LibraryID is the local media_file/album ID when InLibrary is true.
+@@ -98,6 +100,9 @@ type Result struct {
+ 	// (Lidarr) that will import the files on its own; the Service then waits
+ 	// for the library scan to find the item instead of triggering one itself.
+ 	Async bool
++	// Tagged is true when the source already wrote the MusicBrainz tags itself
++	// (the web sources do); otherwise the Service retags the files.
++	Tagged bool
+ 	// Warning is shown on the request when it succeeded only in part
+ 	// (e.g. an album with tracks that could not be downloaded).
+ 	Warning string
+diff --git a/core/acquire/retag.go b/core/acquire/retag.go
+new file mode 100644
+index 0000000..b45ab5f
+--- /dev/null
++++ b/core/acquire/retag.go
+@@ -0,0 +1,190 @@
++package acquire
++
++import (
++	"context"
++	"fmt"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"unicode"
++
++	"golang.org/x/text/unicode/norm"
++)
++
++// tagPlan is the set of tags to write into one downloaded file.
++type tagPlan struct {
++	path string
++	tags []string
++}
++
++// retag writes the MusicBrainz names and ids into files that a source downloaded with the
++// uploader's own tags (Soulseek). Without this the same album arrives as "Greatest Hits",
++// "greatest hits" or "Greatest Hits (Explicit)" and the library fills with near duplicates.
++// A failure never fails the request: it only adds a warning.
++func (s *Service) retag(ctx context.Context, req *Request, res Result) Result {
++	if res.Tagged || len(res.Paths) == 0 || !ValidMBID(req.MBID) {
++		return res
++	}
++	var plans []tagPlan
++	switch req.Kind {
++	case KindTrack:
++		plans = []tagPlan{{path: res.Paths[0], tags: requestTags(*req)}}
++	case KindAlbum:
++		detail, err := s.catalog.Album(ctx, req.MBID)
++		if err != nil || detail == nil {
++			return addWarning(res, "tags were not normalized (MusicBrainz did not answer)")
++		}
++		plans = albumTagPlans(detail, res.Paths)
++	}
++	ffmpeg := cmp(s.cfg.FFmpeg, "ffmpeg")
++	failed := 0
++	for _, p := range plans {
++		if err := writeTags(ctx, ffmpeg, p.path, p.tags); err != nil {
++			failed++
++		}
++	}
++	if failed > 0 {
++		res = addWarning(res, fmt.Sprintf("%d file(s) kept the original tags", failed))
++	}
++	return res
++}
++
++func addWarning(res Result, w string) Result {
++	if res.Warning == "" {
++		res.Warning = w
++	} else {
++		res.Warning += "; " + w
++	}
++	return res
++}
++
++// requestTags are the tags of a single requested track.
++func requestTags(req Request) []string {
++	tags := []string{"title=" + req.Title, "artist=" + req.Artist, "album_artist=" + cmp(req.AlbumArtist, req.Artist)}
++	if req.Album != "" {
++		tags = append(tags, "album="+req.Album)
++	}
++	if req.TrackNumber > 0 {
++		tags = append(tags, fmt.Sprintf("track=%d", req.TrackNumber))
++	}
++	if req.Kind == KindTrack && ValidMBID(req.MBID) {
++		tags = append(tags, "MUSICBRAINZ_TRACKID="+req.MBID)
++	}
++	return tags
++}
++
++// albumTagPlans pairs each downloaded file with a track of the release and builds its tags. Files
++// that match no track still get the album-level tags, so they land in the same album.
++func albumTagPlans(d *AlbumDetail, paths []string) []tagPlan {
++	al := d.Album
++	common := []string{"album=" + al.Title, "album_artist=" + al.Artist}
++	if al.Year > 0 {
++		common = append(common, "date="+strconv.Itoa(al.Year))
++	}
++	if ValidMBID(al.MBID) {
++		common = append(common, "MUSICBRAINZ_RELEASEGROUPID="+al.MBID)
++	}
++	if ValidMBID(al.ReleaseID) {
++		common = append(common, "MUSICBRAINZ_ALBUMID="+al.ReleaseID)
++	}
++	if ValidMBID(al.ArtistMBID) {
++		common = append(common, "MUSICBRAINZ_ALBUMARTISTID="+al.ArtistMBID)
++	}
++	match := matchTracks(paths, d.Tracks)
++	plans := make([]tagPlan, 0, len(paths))
++	for i, p := range paths {
++		tags := append([]string{}, common...)
++		if ti, ok := match[i]; ok {
++			t := d.Tracks[ti]
++			tags = append(tags, "title="+t.Title, "artist="+cmp(t.Artist, al.Artist), fmt.Sprintf("track=%d", cmp0(t.TrackNumber, ti+1)))
++			if ValidMBID(t.MBID) {
++				tags = append(tags, "MUSICBRAINZ_TRACKID="+t.MBID)
++			}
++			if ValidMBID(t.ArtistMBID) {
++				tags = append(tags, "MUSICBRAINZ_ARTISTID="+t.ArtistMBID)
++			}
++		}
++		plans = append(plans, tagPlan{path: p, tags: tags})
++	}
++	return plans
++}
++
++func cmp0(v, def int) int {
++	if v == 0 {
++		return def
++	}
++	return v
++}
++
++var leadingTrackNo = regexp.MustCompile(`^\s*(?:\d{1,2}\s*[-.]\s*)?(\d{1,3})\b`)
++
++// matchTracks maps the index of each file to the index of its track in the tracklist. Titles are
++// compared first (a file name is often "03 - Title.flac"), then the track number in the name.
++func matchTracks(paths []string, tracks []CatalogItem) map[int]int {
++	out := map[int]int{}
++	claimed := map[int]bool{}
++	titles := make([]string, len(tracks))
++	for i, t := range tracks {
++		titles[i] = looseKey(t.Title)
++	}
++	names := make([]string, len(paths))
++	for i, p := range paths {
++		base := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
++		names[i] = base
++		k := looseKey(leadingTrackNo.ReplaceAllString(base, ""))
++		if k == "" {
++			continue
++		}
++		for ti, tk := range titles {
++			if !claimed[ti] && tk != "" && tk == k {
++				out[i], claimed[ti] = ti, true
++				break
++			}
++		}
++	}
++	for i := range paths {
++		if _, ok := out[i]; ok {
++			continue
++		}
++		k := looseKey(leadingTrackNo.ReplaceAllString(names[i], ""))
++		if len(k) < 4 {
++			continue
++		}
++		for ti, tk := range titles {
++			if !claimed[ti] && len(tk) >= 4 && (strings.Contains(k, tk) || strings.Contains(tk, k)) {
++				out[i], claimed[ti] = ti, true
++				break
++			}
++		}
++	}
++	for i := range paths {
++		if _, ok := out[i]; ok {
++			continue
++		}
++		m := leadingTrackNo.FindStringSubmatch(names[i])
++		if m == nil {
++			continue
++		}
++		n, _ := strconv.Atoi(m[1])
++		for ti, t := range tracks {
++			if !claimed[ti] && cmp0(t.TrackNumber, ti+1) == n {
++				out[i], claimed[ti] = ti, true
++				break
++			}
++		}
++	}
++	return out
++}
++
++// looseKey lowercases, drops accents and keeps only letters and digits, so "Lavô Tá Novo" and
++// "lavo ta novo" (or "blink‐182" and "blink-182") compare equal.
++func looseKey(s string) string {
++	var sb strings.Builder
++	for _, r := range norm.NFD.String(strings.ToLower(s)) {
++		if unicode.IsLetter(r) || unicode.IsDigit(r) {
++			sb.WriteRune(r)
++		}
++	}
++	return sb.String()
++}
+diff --git a/core/acquire/retag_test.go b/core/acquire/retag_test.go
+new file mode 100644
+index 0000000..e37e954
+--- /dev/null
++++ b/core/acquire/retag_test.go
+@@ -0,0 +1,65 @@
++package acquire
++
++import (
++	"reflect"
++	"strings"
++	"testing"
++)
++
++const (
++	rgID   = "d40233d7-f8af-3daa-9c29-a96bac9b2a7c"
++	relID  = "fdde6a1a-8559-4c90-9ed0-e4f040a9e6ca"
++	artID  = "0743b15a-3c32-48c8-ad58-cb325350befa"
++	recID1 = "11111111-1111-4111-8111-111111111111"
++	recID2 = "22222222-2222-4222-8222-222222222222"
++)
++
++func sampleAlbum() *AlbumDetail {
++	return &AlbumDetail{
++		Album: CatalogItem{Kind: KindAlbum, MBID: rgID, ReleaseID: relID, Title: "Greatest Hits", Artist: "blink\u2010182", ArtistMBID: artID, Year: 2005},
++		Tracks: []CatalogItem{
++			{Kind: KindTrack, MBID: recID1, Title: "Dammit", Artist: "blink\u2010182", ArtistMBID: artID, TrackNumber: 1},
++			{Kind: KindTrack, MBID: recID2, Title: "What\u2019s My Age Again?", Artist: "blink\u2010182", ArtistMBID: artID, TrackNumber: 2},
++		},
++	}
++}
++
++func TestMatchTracksByTitleThenNumber(t *testing.T) {
++	paths := []string{"/m/01 - dammit.flac", "/m/02 whats my age again.flac", "/m/09 - Faixa Estranha.flac"}
++	got := matchTracks(paths, sampleAlbum().Tracks)
++	want := map[int]int{0: 0, 1: 1}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("matchTracks = %v, want %v", got, want)
++	}
++	// só o número no nome: cai no número da faixa
++	got = matchTracks([]string{"/m/02.flac"}, sampleAlbum().Tracks)
++	if got[0] != 1 {
++		t.Errorf("number-only name should map to track 2, got %v", got)
++	}
++}
++
++func TestAlbumTagPlansNormalizeNamesAndIds(t *testing.T) {
++	plans := albumTagPlans(sampleAlbum(), []string{"/m/01 - dammit.flac", "/m/bonus.flac"})
++	if len(plans) != 2 {
++		t.Fatalf("plans = %d", len(plans))
++	}
++	first := strings.Join(plans[0].tags, "|")
++	for _, want := range []string{"album=Greatest Hits", "album_artist=blink\u2010182", "date=2005", "title=Dammit", "track=1",
++		"MUSICBRAINZ_RELEASEGROUPID=" + rgID, "MUSICBRAINZ_ALBUMID=" + relID, "MUSICBRAINZ_ALBUMARTISTID=" + artID,
++		"MUSICBRAINZ_TRACKID=" + recID1, "MUSICBRAINZ_ARTISTID=" + artID} {
++		if !strings.Contains(first, want) {
++			t.Errorf("tags missing %q in %s", want, first)
++		}
++	}
++	// arquivo sem faixa correspondente: só os dados do álbum, sem título inventado
++	second := strings.Join(plans[1].tags, "|")
++	if strings.Contains(second, "title=") || !strings.Contains(second, "album=Greatest Hits") {
++		t.Errorf("unmatched file tags = %s", second)
++	}
++}
++
++func TestLooseKey(t *testing.T) {
++	if looseKey("Lavô Tá Novo") != looseKey("lavo ta novo") || looseKey("blink\u2010182") != looseKey("blink-182") {
++		t.Error("looseKey should ignore case, accents and punctuation")
++	}
++}
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index bba4424..70c43ad 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -81,6 +81,8 @@ type Config struct {
+ 	RescanInterval time.Duration
+ 	// OnChange, when set, is called after a request is created or changes status.
+ 	OnChange func(Request)
++	// FFmpeg is the ffmpeg binary used to retag files; default "ffmpeg" from PATH.
++	FFmpeg string
+ 	// CheckSpace, when set, is asked before a request is created and before it is
+ 	// downloaded. Returning an error (wrapping ErrStorageFull) stops the download.
+ 	CheckSpace func(ctx context.Context) error
+@@ -382,6 +384,7 @@ func (s *Service) process(ctx context.Context, id string) {
+ 			errs = append(errs, fmt.Sprintf("%s: %v", src.Name(), err))
+ 			continue // fall through to the next source
+ 		}
++		res = s.retag(ctx, req, res)
+ 		s.setStatus(ctx, req, StatusImporting, res.Warning)
+ 		if !res.Async {
+ 			go s.rescan(ctx)
+diff --git a/core/acquire/source_web.go b/core/acquire/source_web.go
+index 0530e98..d63aec4 100644
+--- a/core/acquire/source_web.go
++++ b/core/acquire/source_web.go
+@@ -364,6 +364,7 @@ func (y *YouTube) Supports(k Kind) bool { return k == KindTrack }
+ func (y *YouTube) Fetch(ctx context.Context, req Request, destDir string) (Result, error) {
+ 	d := &ytdlp{Binary: y.Binary, FFmpeg: y.FFmpeg, Format: y.Format, Cookies: y.Cookies, AttemptTimeout: y.AttemptTimeout}
+ 	res, _, err := d.fetch(ctx, []webSite{siteYouTubeMusic, siteYouTube}, req, destDir)
++	res.Tagged = err == nil
+ 	return res, err
+ }
+ 
+@@ -383,5 +384,6 @@ func (s *SoundCloud) Supports(k Kind) bool { return k == KindTrack }
+ func (s *SoundCloud) Fetch(ctx context.Context, req Request, destDir string) (Result, error) {
+ 	d := &ytdlp{Binary: s.Binary, FFmpeg: s.FFmpeg, Format: s.Format, AttemptTimeout: s.AttemptTimeout}
+ 	res, _, err := d.fetch(ctx, []webSite{siteSoundCloud}, req, destDir)
++	res.Tagged = err == nil
+ 	return res, err
+ }
+diff --git a/core/acquire/source_youtube.go b/core/acquire/source_youtube.go
+index 8b155d0..24b8bdc 100644
+--- a/core/acquire/source_youtube.go
++++ b/core/acquire/source_youtube.go
+@@ -12,7 +12,6 @@ import (
+ // tagFile rewrites the file's tags with the MusicBrainz data of the request,
+ // so Navidrome's scanner fills artist/title/album and the recording MBID.
+ func tagFile(ctx context.Context, ffmpeg, path string, req Request) error {
+-	tmp := strings.TrimSuffix(path, filepath.Ext(path)) + ".tagging" + filepath.Ext(path)
+ 	tags := []string{"title=" + req.Title, "artist=" + req.Artist, "album_artist=" + cmp(req.AlbumArtist, req.Artist)}
+ 	if req.Album != "" {
+ 		tags = append(tags, "album="+req.Album)
+@@ -26,6 +25,12 @@ func tagFile(ctx context.Context, ffmpeg, path string, req Request) error {
+ 	if req.ReleaseGroupID != "" {
+ 		tags = append(tags, "MUSICBRAINZ_RELEASEGROUPID="+req.ReleaseGroupID)
+ 	}
++	return writeTags(ctx, ffmpeg, path, tags)
++}
++
++// writeTags rewrites the file's tags with ffmpeg ("key=value" pairs), keeping the audio and cover art as they are.
++func writeTags(ctx context.Context, ffmpeg, path string, tags []string) error {
++	tmp := strings.TrimSuffix(path, filepath.Ext(path)) + ".tagging" + filepath.Ext(path)
+ 	args := []string{"-y", "-v", "error", "-i", path, "-map", "0", "-c", "copy"}
+ 	for _, t := range tags {
+ 		// Ogg/Opus keep tags on the audio stream, MP4/MP3 on the container: set both,
+diff --git a/core/seer/editor.go b/core/seer/editor.go
+index a252d33..ceef6d6 100644
+--- a/core/seer/editor.go
++++ b/core/seer/editor.go
+@@ -34,11 +34,16 @@ type TagChanges struct {
+ 	Year        *string `json:"year,omitempty"`
+ 	TrackNumber *string `json:"trackNumber,omitempty"`
+ 	DiscNumber  *string `json:"discNumber,omitempty"`
++	// MusicBrainz ids (album level): the release, its release group and the album artist.
++	MbzAlbumID        *string `json:"mbzAlbumId,omitempty"`
++	MbzReleaseGroupID *string `json:"mbzReleaseGroupId,omitempty"`
++	MbzAlbumArtistID  *string `json:"mbzAlbumArtistId,omitempty"`
+ }
+ 
+ // albumOnly keeps the fields that make sense for every track of an album.
+ func (c TagChanges) albumOnly() TagChanges {
+-	return TagChanges{Album: c.Album, AlbumArtist: c.AlbumArtist, Genre: c.Genre, Year: c.Year}
++	return TagChanges{Album: c.Album, AlbumArtist: c.AlbumArtist, Genre: c.Genre, Year: c.Year,
++		MbzAlbumID: c.MbzAlbumID, MbzReleaseGroupID: c.MbzReleaseGroupID, MbzAlbumArtistID: c.MbzAlbumArtistID}
+ }
+ 
+ func (c TagChanges) empty() bool {
+@@ -48,11 +53,13 @@ func (c TagChanges) empty() bool {
+ var (
+ 	positiveNumber = regexp.MustCompile(`^[1-9][0-9]{0,3}$`)
+ 	yearOrDate     = regexp.MustCompile(`^[0-9]{4}(-[0-9]{2}(-[0-9]{2})?)?$`)
++	mbidPattern    = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+ )
+ 
+ // validate trims every value and rejects numbers and dates the scanner could not read back.
+ func (c *TagChanges) validate() error {
+-	for _, f := range []**string{&c.Title, &c.Artist, &c.Album, &c.AlbumArtist, &c.Genre, &c.Year, &c.TrackNumber, &c.DiscNumber} {
++	for _, f := range []**string{&c.Title, &c.Artist, &c.Album, &c.AlbumArtist, &c.Genre, &c.Year, &c.TrackNumber, &c.DiscNumber,
++		&c.MbzAlbumID, &c.MbzReleaseGroupID, &c.MbzAlbumArtistID} {
+ 		if *f != nil {
+ 			v := strings.TrimSpace(**f)
+ 			*f = &v
+@@ -69,6 +76,14 @@ func (c *TagChanges) validate() error {
+ 			return fmt.Errorf("%w: %s must be a positive number", ErrInvalidTags, name)
+ 		}
+ 	}
++	for name, v := range map[string]*string{"album id": c.MbzAlbumID, "release group id": c.MbzReleaseGroupID, "album artist id": c.MbzAlbumArtistID} {
++		if v != nil {
++			*v = strings.ToLower(*v)
++			if *v != "" && !mbidPattern.MatchString(*v) {
++				return fmt.Errorf("%w: the MusicBrainz %s is not a valid id", ErrInvalidTags, name)
++			}
++		}
++	}
+ 	if c.Year != nil && *c.Year != "" && !yearOrDate.MatchString(*c.Year) {
+ 		return fmt.Errorf("%w: use a year (2001) or a date (2001-09-11)", ErrInvalidTags)
+ 	}
+@@ -100,6 +115,9 @@ func (c TagChanges) tagMap(current map[string][]string) map[string][]string {
+ 	set(c.Album, taglib.Album, taglib.AlbumSort)
+ 	set(c.AlbumArtist, taglib.AlbumArtist, "ALBUMARTISTS", taglib.AlbumArtistSort, "ALBUMARTISTSSORT")
+ 	set(c.Genre, taglib.Genre)
++	set(c.MbzAlbumID, "MUSICBRAINZ_ALBUMID")
++	set(c.MbzReleaseGroupID, "MUSICBRAINZ_RELEASEGROUPID")
++	set(c.MbzAlbumArtistID, "MUSICBRAINZ_ALBUMARTISTID")
+ 	set(c.TrackNumber, taglib.TrackNumber)
+ 	set(c.DiscNumber, taglib.DiscNumber)
+ 	if c.Year != nil {
+diff --git a/core/seer/report.go b/core/seer/report.go
+new file mode 100644
+index 0000000..cde6cb5
+--- /dev/null
++++ b/core/seer/report.go
+@@ -0,0 +1,211 @@
++package seer
++
++import (
++	"context"
++	"sort"
++	"strings"
++	"unicode"
++
++	. "github.com/Masterminds/squirrel"
++	"github.com/navidrome/navidrome/model"
++	"golang.org/x/text/unicode/norm"
++)
++
++// MetaReport tells what is messy in the library tags: albums and artists that only differ by
++// case, accents or punctuation, albums without MusicBrainz ids and tracks without tags.
++type MetaReport struct {
++	Songs        int            `json:"songs"`
++	Albums       int            `json:"albums"`
++	Artists      int            `json:"artists"`
++	WithMBID     int            `json:"songsWithAlbumMbid"`
++	AlbumGroups  []AlbumGroup   `json:"albumGroups"`
++	ArtistGroups []ArtistGroup  `json:"artistGroups"`
++	NoMBID       []AlbumVariant `json:"noMbid"`
++	Unknown      []UnknownTrack `json:"unknown"`
++}
++
++// AlbumVariant is one album record of the library.
++type AlbumVariant struct {
++	ID                string `json:"id"`
++	Name              string `json:"name"`
++	Artist            string `json:"artist"`
++	Songs             int    `json:"songs"`
++	Year              int    `json:"year,omitempty"`
++	MbzAlbumID        string `json:"mbzAlbumId,omitempty"`
++	MbzReleaseGroupID string `json:"mbzReleaseGroupId,omitempty"`
++	MbzAlbumArtistID  string `json:"mbzAlbumArtistId,omitempty"`
++}
++
++// AlbumGroup is a set of albums that are the same album written differently.
++type AlbumGroup struct {
++	Variants []AlbumVariant `json:"variants"`
++	// SameReleaseGroup: they are editions of one MusicBrainz release group (e.g. clean and explicit).
++	SameReleaseGroup bool `json:"sameReleaseGroup"`
++}
++
++// ArtistVariant is one spelling of an artist, with the albums and tracks that carry it.
++type ArtistVariant struct {
++	Name    string   `json:"name"`
++	Tracks  int      `json:"tracks"`
++	Albums  []string `json:"albums"`  // albums whose album artist is this spelling
++	SongIDs []string `json:"songIds"` // tracks whose artist is this spelling
++}
++
++// ArtistGroup is a set of artist names that are the same artist written differently.
++type ArtistGroup struct {
++	Variants []ArtistVariant `json:"variants"`
++}
++
++// UnknownTrack is a track whose album or artist tag is missing.
++type UnknownTrack struct {
++	ID     string `json:"id"`
++	Title  string `json:"title"`
++	Artist string `json:"artist"`
++	Album  string `json:"album"`
++	Path   string `json:"path"`
++}
++
++// looseKey lowercases and keeps only letters and digits (accents dropped), so "Lavô Tá Novo",
++// "lavo ta novo" and "blink‐182" / "blink-182" are the same key.
++func looseKey(s string) string {
++	var sb strings.Builder
++	for _, r := range norm.NFD.String(strings.ToLower(s)) {
++		if unicode.IsLetter(r) || unicode.IsDigit(r) {
++			sb.WriteRune(r)
++		}
++	}
++	return sb.String()
++}
++
++const maxReportRows = 300
++
++func isUnknown(s string) bool {
++	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(s)), "[unknown")
++}
++
++// Report analyzes the whole library; it does not change anything.
++func (e *Editor) Report(ctx context.Context) (*MetaReport, error) {
++	albums, err := e.ds.Album().GetAll(ctx, model.QueryOptions{Filters: Eq{"album.missing": false}})
++	if err != nil {
++		return nil, err
++	}
++	files, err := e.ds.MediaFile().GetAll(ctx, model.QueryOptions{Filters: Eq{"media_file.missing": false}})
++	if err != nil {
++		return nil, err
++	}
++	return buildMetaReport(albums, files), nil
++}
++
++func buildMetaReport(albums model.Albums, files model.MediaFiles) *MetaReport {
++	r := &MetaReport{Songs: len(files), Albums: len(albums),
++		AlbumGroups: []AlbumGroup{}, ArtistGroups: []ArtistGroup{}, NoMBID: []AlbumVariant{}, Unknown: []UnknownTrack{}}
++
++	// --- albums that are the same once case, accents and punctuation are ignored
++	byKey := map[string][]AlbumVariant{}
++	var keys []string
++	for _, a := range albums {
++		v := AlbumVariant{ID: a.ID, Name: a.Name, Artist: a.AlbumArtist, Songs: a.SongCount, Year: a.MinYear,
++			MbzAlbumID: a.MbzAlbumID, MbzReleaseGroupID: a.MbzReleaseGroupID, MbzAlbumArtistID: a.MbzAlbumArtistID}
++		if isUnknown(a.Name) {
++			continue
++		}
++		k := looseKey(a.AlbumArtist) + "|" + looseKey(a.Name)
++		if _, ok := byKey[k]; !ok {
++			keys = append(keys, k)
++		}
++		byKey[k] = append(byKey[k], v)
++		if a.MbzAlbumID == "" && len(r.NoMBID) < maxReportRows {
++			r.NoMBID = append(r.NoMBID, v)
++		}
++	}
++	sort.Strings(keys)
++	for _, k := range keys {
++		vs := byKey[k]
++		if len(vs) < 2 {
++			continue
++		}
++		sort.SliceStable(vs, func(i, j int) bool { return vs[i].Songs > vs[j].Songs })
++		same := vs[0].MbzReleaseGroupID != ""
++		for _, v := range vs[1:] {
++			if v.MbzReleaseGroupID != vs[0].MbzReleaseGroupID {
++				same = false
++			}
++		}
++		r.AlbumGroups = append(r.AlbumGroups, AlbumGroup{Variants: vs, SameReleaseGroup: same})
++	}
++
++	// --- artists spelled differently (track artist and album artist both count)
++	type spelling struct {
++		tracks int
++		albums map[string]bool
++		songs  []string
++	}
++	byArtist := map[string]map[string]*spelling{}
++	add := func(name, albumID, songID string) {
++		name = strings.TrimSpace(name)
++		k := looseKey(name)
++		if name == "" || k == "" || isUnknown(name) {
++			return
++		}
++		m := byArtist[k]
++		if m == nil {
++			m = map[string]*spelling{}
++			byArtist[k] = m
++		}
++		sp := m[name]
++		if sp == nil {
++			sp = &spelling{albums: map[string]bool{}}
++			m[name] = sp
++		}
++		if albumID != "" {
++			sp.albums[albumID] = true
++		}
++		if songID != "" {
++			sp.tracks++
++			if len(sp.songs) < 500 {
++				sp.songs = append(sp.songs, songID)
++			}
++		}
++	}
++	for _, a := range albums {
++		add(a.AlbumArtist, a.ID, "")
++	}
++	artists := map[string]bool{}
++	for _, f := range files {
++		add(f.Artist, "", f.ID)
++		artists[looseKey(f.Artist)] = true
++		if f.MbzAlbumID != "" {
++			r.WithMBID++
++		}
++		if (isUnknown(f.Album) || isUnknown(f.Artist)) && len(r.Unknown) < maxReportRows {
++			r.Unknown = append(r.Unknown, UnknownTrack{ID: f.ID, Title: f.Title, Artist: f.Artist, Album: f.Album, Path: f.Path})
++		}
++	}
++	r.Artists = len(artists)
++	var akeys []string
++	for k, m := range byArtist {
++		if len(m) > 1 {
++			akeys = append(akeys, k)
++		}
++	}
++	sort.Strings(akeys)
++	for _, k := range akeys {
++		var g ArtistGroup
++		for name, sp := range byArtist[k] {
++			ids := make([]string, 0, len(sp.albums))
++			for id := range sp.albums {
++				ids = append(ids, id)
++			}
++			sort.Strings(ids)
++			g.Variants = append(g.Variants, ArtistVariant{Name: name, Tracks: sp.tracks, Albums: ids, SongIDs: sp.songs})
++		}
++		sort.SliceStable(g.Variants, func(i, j int) bool {
++			if g.Variants[i].Tracks != g.Variants[j].Tracks {
++				return g.Variants[i].Tracks > g.Variants[j].Tracks
++			}
++			return g.Variants[i].Name < g.Variants[j].Name
++		})
++		r.ArtistGroups = append(r.ArtistGroups, g)
++	}
++	return r
++}
+diff --git a/core/seer/report_test.go b/core/seer/report_test.go
+new file mode 100644
+index 0000000..4e699b6
+--- /dev/null
++++ b/core/seer/report_test.go
+@@ -0,0 +1,45 @@
++package seer
++
++import (
++	"testing"
++
++	"github.com/navidrome/navidrome/model"
++)
++
++func TestBuildReportFindsNearDuplicates(t *testing.T) {
++	albums := model.Albums{
++		{ID: "a1", Name: "Cantigas de Roda", AlbumArtist: "Raimundos", SongCount: 1, MbzAlbumID: "x"},
++		{ID: "a2", Name: "Cantigas de roda", AlbumArtist: "Raimundos", SongCount: 3},
++		{ID: "a3", Name: "Dude Ranch", AlbumArtist: "blink\u2010182", SongCount: 16},
++		{ID: "a4", Name: "Dude Ranch", AlbumArtist: "blink-182", SongCount: 2},
++		{ID: "a5", Name: "[Unknown Album]", AlbumArtist: "[Unknown Artist]", SongCount: 1},
++	}
++	files := model.MediaFiles{
++		{ID: "s1", Title: "Faixa", Artist: "Charlie Brown Jr.", Album: "X"},
++		{ID: "s2", Title: "Faixa 2", Artist: "Charlie Brown Jr", Album: "X", MbzAlbumID: "m"},
++		{ID: "s3", Title: "?", Artist: "[Unknown Artist]", Album: "[Unknown Album]"},
++	}
++	r := buildMetaReport(albums, files)
++	if len(r.AlbumGroups) != 2 {
++		t.Fatalf("album groups = %d, want 2 (%+v)", len(r.AlbumGroups), r.AlbumGroups)
++	}
++	for _, g := range r.AlbumGroups {
++		if g.Variants[0].Songs < g.Variants[1].Songs {
++			t.Errorf("variants should start with the biggest: %+v", g.Variants)
++		}
++	}
++	if len(r.ArtistGroups) != 2 {
++		t.Fatalf("artist groups = %d, want 2 (blink-182 and Charlie Brown Jr): %+v", len(r.ArtistGroups), r.ArtistGroups)
++	}
++	if len(r.Unknown) != 1 || r.Unknown[0].ID != "s3" {
++		t.Errorf("unknown = %+v", r.Unknown)
++	}
++	if r.WithMBID != 1 || r.Songs != 3 {
++		t.Errorf("counts: %+v", r)
++	}
++	for _, v := range r.NoMBID {
++		if isUnknown(v.Name) {
++			t.Errorf("[Unknown Album] must not be listed as a match candidate")
++		}
++	}
++}
+diff --git a/server/seerapi/library.go b/server/seerapi/library.go
+index 4d7df70..aa6af4a 100644
+--- a/server/seerapi/library.go
++++ b/server/seerapi/library.go
+@@ -62,3 +62,15 @@ func writeEditResult(w http.ResponseWriter, r *http.Request, res *seer.EditResul
+ 		writeJSON(w, http.StatusOK, res)
+ 	}
+ }
++
++// metadataReport lists the albums and artists that are the same thing written differently,
++// the albums without MusicBrainz ids and the tracks without tags (it changes nothing).
++func (api *Router) metadataReport(w http.ResponseWriter, r *http.Request) {
++	rep, err := api.editor.Report(r.Context())
++	if err != nil {
++		log.Error(r.Context(), "Seer: metadata report failed", err)
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	writeJSON(w, http.StatusOK, rep)
++}
+diff --git a/server/seerapi/library_test.go b/server/seerapi/library_test.go
+index 4f9ac6c..e9e042f 100644
+--- a/server/seerapi/library_test.go
++++ b/server/seerapi/library_test.go
+@@ -30,6 +30,9 @@ func (f *fakeEditor) DeleteSong(_ context.Context, id string) error {
+ 	f.calls = append(f.calls, "deleteSong:"+id)
+ 	return nil
+ }
++func (f *fakeEditor) Report(context.Context) (*seer.MetaReport, error) {
++	return &seer.MetaReport{Songs: 3, AlbumGroups: []seer.AlbumGroup{}}, nil
++}
+ func (f *fakeEditor) DeleteAlbum(_ context.Context, id string) error {
+ 	f.calls = append(f.calls, "deleteAlbum:"+id)
+ 	return nil
+@@ -59,6 +62,12 @@ func TestLibraryAPI(t *testing.T) {
+ 	if w := do(t, api, admin, "PUT", "/library/album/al1", `{"album":"A"}`); w.Code != 200 {
+ 		t.Errorf("edit album: %d %s", w.Code, w.Body)
+ 	}
++	if w := do(t, api, user, "GET", "/library/metadata-report", ""); w.Code != 403 {
++		t.Errorf("non-admin report: %d", w.Code)
++	}
++	if w := do(t, api, admin, "GET", "/library/metadata-report", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"songs":3`) {
++		t.Errorf("report: %d %s", w.Code, w.Body)
++	}
+ 	if w := do(t, api, admin, "DELETE", "/library/song/s1", ""); w.Code != 204 {
+ 		t.Errorf("delete song: %d", w.Code)
+ 	}
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index f06a801..8f20f5c 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -59,6 +59,7 @@ type Editor interface {
+ 	EditAlbum(ctx context.Context, id string, changes seer.TagChanges) (*seer.EditResult, error)
+ 	DeleteSong(ctx context.Context, id string) error
+ 	DeleteAlbum(ctx context.Context, id string) error
++	Report(ctx context.Context) (*seer.MetaReport, error)
+ }
+ 
+ type Router struct {
+@@ -165,6 +166,7 @@ func (api *Router) routes() http.Handler {
+ 				r.Put("/song/{id}", api.editSong)
+ 				r.Delete("/song/{id}", api.deleteSong)
+ 				r.Put("/album/{id}", api.editAlbum)
++				r.Get("/metadata-report", api.metadataReport)
+ 				r.Delete("/album/{id}", api.deleteAlbum)
+ 			})
+ 		}

@@ -1,0 +1,71 @@
+# Guitarr: first run ./setup.sh, then docker compose up -d --build.
+# Passwords and keys are edited in Settings in the web UI (encrypted in the database; the Soulseek/slskd
+# ones go to slskd.yml). The .env needs no secrets. Optional .env variables:
+#   GUITARR_DATA  folder for the data (database, slskd and downloads)       default ./data
+#   MUSIC_DIR     folder of the music library                               default ./music
+#   PUBLIC_URL    public address (goes in the User-Agent of the queries)    default https://guitarr.example.com
+#   TZ            time zone                                                 default UTC
+#   PUID/PGID     owner of the files                                        default 1000/1000
+
+name: ${COMPOSE_PROJECT_NAME:-guitarr}
+
+services:
+  guitarr:
+    build:
+      context: .
+    image: guitarr:latest
+    container_name: guitarr
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "4533:4533"
+    environment:
+      TZ: ${TZ:-UTC}
+      ND_LOGLEVEL: info
+      # --- Guitarr ---
+      ND_SEER_ENABLED: "true"
+      ND_SEER_AUTOAPPROVE: "true"               # requests download right away
+      ND_SEER_SOURCES: soulseek,youtube,soundcloud  # tries Soulseek, then YouTube, then SoundCloud
+      ND_SEER_DESTFOLDER: /music/Seer
+      ND_SEER_USERAGENT: Guitarr/0.1 ( ${PUBLIC_URL:-https://guitarr.example.com} )
+      ND_SEER_YOUTUBE_ENABLED: "true"
+      ND_SEER_SOUNDCLOUD_ENABLED: "true"
+      ND_SEER_YOUTUBE_COOKIES: ${YOUTUBE_COOKIES:-}            # optional, see README
+      ND_SEER_SPOTIFY_CLIENTID: ${SPOTIFY_CLIENT_ID:-}         # optional, see README
+      ND_SEER_SPOTIFY_CLIENTSECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      ND_SEER_MINFREESPACE: 5GB                    # stops downloading if the disk has less than 5 GB free
+      ND_SEER_SOULSEEK_ENABLED: "true"
+      ND_SEER_SOULSEEK_URL: http://slskd:5030
+      ND_SEER_SOULSEEK_APIKEY: ${SLSKD_API_KEY:-}               # first run only: afterwards it is stored encrypted in the database
+      ND_SEER_SOULSEEK_CONFIGFILE: /slskd/slskd.yml          # Soulseek/slskd logins, edited in Settings
+      ND_SEER_SOULSEEK_DOWNLOADFOLDER: /downloads
+      ND_SEER_LIDARR_ENABLED: "false"
+    volumes:
+      - ${GUITARR_DATA:-./data}/guitarr:/data
+      - ${MUSIC_DIR:-./music}:/music
+      - ${GUITARR_DATA:-./data}/slskd/downloads:/downloads
+      - ${GUITARR_DATA:-./data}/slskd/slskd.yml:/slskd/slskd.yml
+    depends_on:
+      - slskd
+
+  slskd:
+    image: slskd/slskd:latest
+    container_name: slskd
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "5030:5030"     # slskd web UI (keep it on your local network)
+      - "50300:50300"   # Soulseek port: open it on your router to find more files
+    environment:
+      TZ: ${TZ:-UTC}
+      # Soulseek and panel logins and the API key live in slskd.yml (edited by Guitarr)
+      SLSKD_SLSK_LISTEN_PORT: 50300
+      SLSKD_HTTP_IP_ADDRESS: 0.0.0.0
+      SLSKD_NO_HTTPS: "true"
+      SLSKD_DOWNLOADS_DIR: /downloads
+      SLSKD_SHARED_DIR: /music
+    volumes:
+      - ${GUITARR_DATA:-./data}/slskd:/app
+      - ${GUITARR_DATA:-./data}/slskd/downloads:/downloads
+      - ${MUSIC_DIR:-./music}:/music:ro    # shares your library (Soulseek requires sharing something)
+

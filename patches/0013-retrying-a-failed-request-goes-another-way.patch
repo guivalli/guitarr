@@ -1,0 +1,339 @@
+diff --git a/core/acquire/model.go b/core/acquire/model.go
+index 77b1423..23209a4 100644
+--- a/core/acquire/model.go
++++ b/core/acquire/model.go
+@@ -80,6 +80,10 @@ type Request struct {
+ 	CreatedAt  time.Time `json:"createdAt"`
+ 	UpdatedAt  time.Time `json:"updatedAt"`
+ 
++	// Attempt is 0 on the first try and counts the retries of a failed request
++	// (kept in memory only). Sources use it to try something different.
++	Attempt int `json:"-"`
++
+ 	// Set only on the per-track requests of an album fetched track by track.
+ 	TrackNumber    int    `json:"-"`
+ 	AlbumArtist    string `json:"-"`
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index c5f0bf6..bba4424 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -96,6 +96,7 @@ type Service struct {
+ 	queue      chan string
+ 	mu         sync.Mutex
+ 	inflight   map[string]bool // queued or being processed, to avoid double processing
++	retries    map[string]*retryState
+ 	scanning   atomic.Bool
+ 	lastRescan time.Time
+ 	wg         sync.WaitGroup
+@@ -118,9 +119,55 @@ func NewService(cfg Config, catalog Catalog, sources []Source, store Store, lib
+ 		cfg: cfg, catalog: catalog, sources: sources, store: store, lib: lib,
+ 		queue:    make(chan string, 256),
+ 		inflight: map[string]bool{},
++		retries:  map[string]*retryState{},
+ 	}
+ }
+ 
++// retryState remembers, in memory, how a failed request has been retried: how
++// many times and which sources already failed, so the next try goes another way.
++type retryState struct {
++	attempt int
++	failed  map[string]bool
++}
++
++// noteRetry records a retry of a failed request. The sources that failed are
++// read from the request's error ("youtube: ...; soulseek: ...").
++func (s *Service) noteRetry(id, lastError string) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	rs := s.retries[id]
++	if rs == nil {
++		rs = &retryState{failed: map[string]bool{}}
++		s.retries[id] = rs
++	}
++	rs.attempt++
++	for _, src := range s.sources {
++		if strings.Contains(lastError, src.Name()+": ") {
++			rs.failed[src.Name()] = true
++		}
++	}
++}
++
++// retryOrder returns the attempt number and the sources in the order to try
++// them: the ones that did not fail last time first, the failed ones after.
++func (s *Service) retryOrder(id string) (int, []Source) {
++	s.mu.Lock()
++	rs := s.retries[id]
++	s.mu.Unlock()
++	if rs == nil {
++		return 0, s.sources
++	}
++	var first, last []Source
++	for _, src := range s.sources {
++		if rs.failed[src.Name()] {
++			last = append(last, src)
++		} else {
++			first = append(first, src)
++		}
++	}
++	return rs.attempt, append(first, last...)
++}
++
+ // Start launches the workers and the import watcher; they stop when ctx is cancelled.
+ // Requests that were queued or in progress when the server stopped are picked up again.
+ func (s *Service) Start(ctx context.Context) {
+@@ -255,6 +302,9 @@ func (s *Service) Approve(ctx context.Context, id string) (*Request, error) {
+ 	if req.Status != StatusPending && req.Status != StatusFailed {
+ 		return nil, fmt.Errorf("%w (%s)", ErrBadState, req.Status)
+ 	}
++	if req.Status == StatusFailed {
++		s.noteRetry(req.ID, req.Error) // the retry avoids what just failed
++	}
+ 	s.setStatus(ctx, req, StatusQueued, "")
+ 	s.enqueue(ctx, req.ID)
+ 	return req, nil
+@@ -315,8 +365,10 @@ func (s *Service) process(ctx context.Context, id string) {
+ 	}
+ 	s.setStatus(ctx, req, StatusSearching, "")
+ 
++	attempt, order := s.retryOrder(id)
++	req.Attempt = attempt
+ 	var errs []string
+-	for _, src := range s.sources {
++	for _, src := range order {
+ 		if !src.Enabled() || !src.Supports(req.Kind) {
+ 			continue
+ 		}
+@@ -417,7 +469,7 @@ func (s *Service) fetchAlbumTracks(ctx context.Context, req *Request) (Result, e
+ 			ID: req.ID, UserID: req.UserID, Kind: KindTrack, MBID: t.MBID,
+ 			Artist: cmp(t.Artist, req.Artist), Album: album, Title: t.Title,
+ 			DurationMs: t.DurationMs, TrackNumber: num, AlbumArtist: req.Artist,
+-			ReleaseGroupID: req.MBID,
++			ReleaseGroupID: req.MBID, Attempt: req.Attempt,
+ 		}
+ 		got := false
+ 		for _, src := range s.trackSources() {
+diff --git a/core/acquire/service_test.go b/core/acquire/service_test.go
+index b087bd9..f089a95 100644
+--- a/core/acquire/service_test.go
++++ b/core/acquire/service_test.go
+@@ -393,3 +393,88 @@ func TestRetryDoesNotDownloadAnAlbumTwice(t *testing.T) {
+ 		t.Errorf("downloaded again (%d calls) although the album is on disk", n)
+ 	}
+ }
++
++// orderSource records the order in which sources are asked and the attempt number.
++type orderSource struct {
++	name  string
++	kind  Kind
++	fail  bool
++	lib   *fakeLib
++	log   *[]string
++	mu    *sync.Mutex
++	tries *[]int
++}
++
++func (s *orderSource) Name() string         { return s.name }
++func (s *orderSource) Enabled() bool        { return true }
++func (s *orderSource) Supports(k Kind) bool { return k == s.kind }
++func (s *orderSource) Fetch(_ context.Context, r Request, _ string) (Result, error) {
++	s.mu.Lock()
++	*s.log = append(*s.log, s.name)
++	*s.tries = append(*s.tries, r.Attempt)
++	s.mu.Unlock()
++	if s.fail {
++		return Result{}, errors.New("boom")
++	}
++	s.lib.mu.Lock()
++	s.lib.have[r.MBID] = true
++	s.lib.mu.Unlock()
++	return Result{Paths: []string{"/music/x.opus"}}, nil
++}
++
++func TestRetryAvoidsTheSourceThatFailed(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	var mu sync.Mutex
++	var log []string
++	var tries []int
++	srcs := []Source{
++		&orderSource{name: "youtube", kind: KindTrack, fail: true, lib: lib, log: &log, mu: &mu, tries: &tries},
++		&orderSource{name: "soundcloud", kind: KindTrack, lib: lib, log: &log, mu: &mu, tries: &tries},
++	}
++	svc := NewService(fastConfig(false), fakeCatalog{}, srcs, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++
++	req, _ := svc.Submit(ctx, "u", CatalogItem{Kind: KindTrack, MBID: "m9", Artist: "A", Title: "T"})
++	// a request that failed on youtube only (soundcloud was never reached)
++	r, _ := st.Get(ctx, req.ID)
++	r.Status, r.Error = StatusFailed, "youtube: boom"
++	if err := st.Update(ctx, r); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := svc.Approve(ctx, req.ID); err != nil {
++		t.Fatal(err)
++	}
++	waitStatus(t, st, req.ID, StatusAvailable)
++
++	mu.Lock()
++	defer mu.Unlock()
++	if len(log) == 0 || log[0] != "soundcloud" {
++		t.Errorf("a retry should start with the source that did not fail, got order %v", log)
++	}
++	if len(tries) == 0 || tries[0] != 1 {
++		t.Errorf("the first retry should be attempt 1, got %v", tries)
++	}
++}
++
++func TestRotateCandidatesMovesOnPerAttempt(t *testing.T) {
++	c := []slskCandidate{{User: "a", matchesAlbum: true}, {User: "b", matchesAlbum: true}, {User: "c", matchesAlbum: true}, {User: "d"}}
++	users := func(l []slskCandidate) string {
++		var s []string
++		for _, x := range l {
++			s = append(s, x.User)
++		}
++		return strings.Join(s, "")
++	}
++	if got := users(rotateCandidates(c, 0)); got != "abcd" {
++		t.Errorf("attempt 0 keeps the order, got %s", got)
++	}
++	if got := users(rotateCandidates(c, 1)); got != "bcad" {
++		t.Errorf("attempt 1, got %s", got)
++	}
++	if got := users(rotateCandidates(c, 2)); got != "cabd" {
++		t.Errorf("attempt 2, got %s", got)
++	}
++}
+diff --git a/core/acquire/source_soulseek.go b/core/acquire/source_soulseek.go
+index d2638f7..f9e81f1 100644
+--- a/core/acquire/source_soulseek.go
++++ b/core/acquire/source_soulseek.go
+@@ -135,12 +135,34 @@ func (s *Soulseek) Fetch(ctx context.Context, req Request, destDir string) (Resu
+ 	if len(cands) == 0 {
+ 		return Result{}, errors.New("no matching files on Soulseek")
+ 	}
++	cands = rotateCandidates(cands, req.Attempt)
+ 	if req.Kind == KindTrack {
+ 		return s.fetchTrack(ctx, req, cands, destDir)
+ 	}
+ 	return s.fetchAlbum(ctx, req, cands, destDir)
+ }
+ 
++// rotateCandidates makes a retry start from another peer: among the leading
++// candidates of the same kind (album folders, or loose files) the one tried
++// first moves on by one per attempt.
++func rotateCandidates(c []slskCandidate, attempt int) []slskCandidate {
++	if attempt <= 0 || len(c) < 2 {
++		return c
++	}
++	n := 0
++	for n < len(c) && n < 5 && c[n].matchesAlbum == c[0].matchesAlbum {
++		n++
++	}
++	if n < 2 {
++		return c
++	}
++	k := attempt % n
++	out := make([]slskCandidate, 0, len(c))
++	out = append(out, c[k:n]...)
++	out = append(out, c[:k]...)
++	return append(out, c[n:]...)
++}
++
+ // fetchTrack tries the best peers in turn until one delivers the file.
+ func (s *Soulseek) fetchTrack(ctx context.Context, req Request, cands []slskCandidate, destDir string) (Result, error) {
+ 	var errs []string
+diff --git a/core/acquire/source_web.go b/core/acquire/source_web.go
+index 0ec7410..0530e98 100644
+--- a/core/acquire/source_web.go
++++ b/core/acquire/source_web.go
+@@ -38,6 +38,9 @@ type ytdlp struct {
+ type webSite struct {
+ 	name  string
+ 	query func(artist, title string) string
++	// alt is another phrasing of the search, used when a request is retried
++	// (the first phrasing already found nothing that could be downloaded).
++	alt func(artist, title string) string
+ 	// variants are extra yt-dlp arguments tried in order for each candidate
+ 	// (YouTube changes often; another player client usually still works).
+ 	variants [][]string
+@@ -50,18 +53,23 @@ var (
+ 		query: func(artist, title string) string {
+ 			return "https://music.youtube.com/search?q=" + url.QueryEscape(artist+" "+title) + "#songs"
+ 		},
++		alt: func(artist, title string) string {
++			return "https://music.youtube.com/search?q=" + url.QueryEscape(title+" "+artist+" official audio") + "#songs"
++		},
+ 		variants: youtubeVariants,
+ 		cookies:  true,
+ 	}
+ 	siteYouTube = webSite{
+ 		name:     "YouTube",
+ 		query:    func(artist, title string) string { return "ytsearch6:" + artist + " - " + title },
++		alt:      func(artist, title string) string { return "ytsearch6:" + title + " " + artist + " audio" },
+ 		variants: youtubeVariants,
+ 		cookies:  true,
+ 	}
+ 	siteSoundCloud = webSite{
+ 		name:     "SoundCloud",
+ 		query:    func(artist, title string) string { return "scsearch6:" + artist + " " + title },
++		alt:      func(artist, title string) string { return "scsearch6:" + title + " " + artist },
+ 		variants: [][]string{nil},
+ 	}
+ 	youtubeVariants = [][]string{
+@@ -107,7 +115,7 @@ func (y *ytdlp) fetch(ctx context.Context, sites []webSite, req Request, destDir
+ 			errs = append(errs, site.name+": nothing that matches")
+ 			continue
+ 		}
+-		path, err := y.downloadFirst(ctx, site, cands, outTpl)
++		path, err := y.downloadFirst(ctx, site, cands, outTpl, req.Attempt)
+ 		if err != nil {
+ 			errs = append(errs, fmt.Sprintf("%s: %v", site.name, err))
+ 			continue
+@@ -132,7 +140,11 @@ func (y *ytdlp) search(ctx context.Context, site webSite, req Request) ([]webCan
+ 		args = append(args, "--cookies", y.Cookies)
+ 	}
+ 	// The query is one argv element after "--": user text is never an option.
+-	args = append(args, "--", site.query(strings.TrimSpace(req.Artist), strings.TrimSpace(req.Title)))
++	query := site.query
++	if req.Attempt > 0 && site.alt != nil {
++		query = site.alt
++	}
++	args = append(args, "--", query(strings.TrimSpace(req.Artist), strings.TrimSpace(req.Title)))
+ 	var stdout, stderr bytes.Buffer
+ 	cmd := exec.CommandContext(ctx, cmp(y.Binary, "yt-dlp"), args...)
+ 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+@@ -175,6 +187,11 @@ func (y *ytdlp) search(ctx context.Context, site webSite, req Request) ([]webCan
+ 	if n <= 0 {
+ 		n = 3
+ 	}
++	if req.Attempt > 0 && len(cands) > n {
++		// a retry starts from other uploads than the ones that just failed
++		k := (req.Attempt * n) % len(cands)
++		cands = append(append([]webCandidate{}, cands[k:]...), cands[:k]...)
++	}
+ 	if len(cands) > n {
+ 		cands = cands[:n]
+ 	}
+@@ -252,10 +269,18 @@ func scoreCandidate(req Request, c webCandidate) int {
+ }
+ 
+ // downloadFirst tries the candidates in order, each with the site's variants.
+-func (y *ytdlp) downloadFirst(ctx context.Context, site webSite, cands []webCandidate, outTpl string) (string, error) {
++// On a retry (attempt > 0) the yt-dlp settings are tried in reverse order.
++func (y *ytdlp) downloadFirst(ctx context.Context, site webSite, cands []webCandidate, outTpl string, attempt int) (string, error) {
++	variants := site.variants
++	if attempt > 0 {
++		variants = make([][]string, len(site.variants))
++		for i, v := range site.variants {
++			variants[len(variants)-1-i] = v
++		}
++	}
+ 	var last error
+ 	for _, c := range cands {
+-		for _, extra := range site.variants {
++		for _, extra := range variants {
+ 			if ctx.Err() != nil {
+ 				return "", ctx.Err()
+ 			}

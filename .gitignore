@@ -1,0 +1,6 @@
+.env
+data/
+music/
+NotInGit/
+__pycache__/
+*.pyc

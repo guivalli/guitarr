@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#050507">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Guitarr</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="../favicon.ico">
+<link rel="apple-touch-icon" href="../apple-touch-icon.png">
+<script>try{var t=localStorage.getItem('seer_theme');document.documentElement.setAttribute('data-theme',t==='oled'||t==='light'?t:'dark')}catch(e){}</script>
+<style>
+/*CSS*/
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view"></div>
+  <div id="dock">
+    <div id="mini" class="hidden"></div>
+    <nav id="nav">
+      <button data-act="tab" data-tab="home" class="on"><svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10"/></svg>Início</button>
+      <button data-act="tab" data-tab="seer"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M11 8v6M8 11h6"/></svg>Pedidos<span class="dot hidden" id="seer-dot"></span></button>
+      <button data-act="tab" data-tab="library"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="7" height="7" rx="1.5"/><rect x="14" y="4" width="7" height="7" rx="1.5"/><rect x="3" y="15" width="7" height="5" rx="1.5"/><rect x="14" y="15" width="7" height="5" rx="1.5"/></svg>Biblioteca</button>
+      <button data-act="tab" data-tab="podcasts"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3M8 21h8"/></svg>Podcasts</button>
+      <button data-act="tab" data-tab="car"><svg viewBox="0 0 24 24"><path d="M13 3L4 14h7l-1 7 9-11h-7z"/></svg>Auto</button>
+    </nav>
+  </div>
+  <div id="np"></div>
+  <div id="lyr-full" class="hidden"></div>
+  <div id="sheet-bd" class="sheet-bd" data-act="sheet-close"><div id="sheet" class="sheet" data-stop="1"></div></div>
+  <div id="toast"></div>
+  <div id="login" class="hidden"></div>
+</div>
+<script>
+/*JS*/
+</script>
+</body>
+</html>

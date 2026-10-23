@@ -1,0 +1,1130 @@
+From 2fccfdcf9db31fc0e9e80268b6068040fec13168 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 11 Oct 2026 03:25:44 +0000
+Subject: [PATCH 10/10] Seer: find and clean duplicate songs, and stop making
+ them
+
+Album requests that already have files on disk are not downloaded again,
+Soulseek imports replace earlier copies of a track, and library matching
+ignores punctuation (MusicBrainz's Unicode hyphens). Admins get a
+"Clean up duplicates" button that moves extra Seer copies to a trash
+folder kept for 7 days.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ SEER.md                              |  18 +++
+ core/acquire/catalog_musicbrainz.go  |   4 +
+ core/acquire/service.go              |  28 ++++
+ core/acquire/service_test.go         |  22 +++
+ core/acquire/source_soulseek.go      |  22 ++-
+ core/acquire/source_soulseek_test.go |  31 ++++
+ core/seer/duplicates.go              | 227 +++++++++++++++++++++++++++
+ core/seer/duplicates_test.go         | 102 ++++++++++++
+ core/seer/library.go                 |  35 +++++
+ core/seer/seer.go                    |   6 +-
+ resources/i18n/pt-br.json            |  14 +-
+ server/seerapi/seerapi.go            |  40 ++++-
+ server/seerapi/seerapi_test.go       |  35 +++++
+ ui/src/i18n/en.json                  |  14 +-
+ ui/src/seer/DuplicatesPanel.jsx      | 140 +++++++++++++++++
+ ui/src/seer/DuplicatesPanel.test.jsx |  75 +++++++++
+ ui/src/seer/StorageWidget.jsx        |   8 +
+ ui/src/seer/api.js                   |   8 +
+ 18 files changed, 824 insertions(+), 5 deletions(-)
+ create mode 100644 core/seer/duplicates.go
+ create mode 100644 core/seer/duplicates_test.go
+ create mode 100644 ui/src/seer/DuplicatesPanel.jsx
+ create mode 100644 ui/src/seer/DuplicatesPanel.test.jsx
+
+diff --git a/SEER.md b/SEER.md
+index 9807869..b2ea529 100644
+--- a/SEER.md
++++ b/SEER.md
+@@ -48,6 +48,22 @@ answer 507 and queued ones fail with "storage limit reached"; retry them after
+ freeing space or raising the limit. Nothing is ever deleted. The limit set in
+ the UI is stored in the database and wins over `Seer.StorageLimit`.
+ 
++## Duplicate songs
++
++The same dialog lists songs that are in the library more than once (same
++album, disc and title, lengths within 3 seconds) and, for admins, has a
++"Clean up duplicates" button. The best copy of each song stays: a file outside
++`DestFolder` (the user's own) always wins, then lossless, then bitrate. Only
++copies inside `DestFolder` are removed; they are moved to
++`<DataFolder>/seer-trash/<date>/` and purged after 7 days, then the library is
++rescanned.
++
++Seer also avoids making duplicates: a retried album request whose folder
++already has audio files is not downloaded again (it just waits for the scan),
++a Soulseek import replaces earlier copies of the same track in the folder, and
++the library match ignores case, accents and punctuation in artist and album
++names (MusicBrainz writes "blink‐182" with a Unicode hyphen).
++
+ ## Look and apps
+ 
+ The `Seer` theme (`ui/src/themes/seer.js`) is the default: browsers that were on
+@@ -118,6 +134,8 @@ Environment variables work as usual, e.g. `ND_SEER_ENABLED=true`,
+ | POST | `/imports/{id}/items/{pos}/resolve` | owner or admin | body: the catalog track picked for an unmatched song |
+ | GET | `/storage` | any user | `used`, `limit`, `diskTotal`, `diskFree`, `minFree`, `full`, `reason` (bytes) |
+ | PUT | `/storage` | admin | body: `{"limit": bytes}`, 0 removes the limit |
++| GET | `/duplicates` | admin | `groups` (each with `files`, `remove` on the extra copies), `files`, `bytes` |
++| POST | `/duplicates/clean` | admin | move the extra copies to the trash; same report plus `trash` |
+ 
+ Statuses: `pending` → `queued` → `searching` → `downloading` → `importing` →
+ `available`, or `failed` with `error`.
+diff --git a/core/acquire/catalog_musicbrainz.go b/core/acquire/catalog_musicbrainz.go
+index 294baa0..5323b3c 100644
+--- a/core/acquire/catalog_musicbrainz.go
++++ b/core/acquire/catalog_musicbrainz.go
+@@ -304,6 +304,10 @@ func yearOf(date string) int {
+ }
+ 
+ // fold lowercases, strips accents and drops punctuation: "Charlie Brown Jr." == "charlie brown jr".
++// Fold is fold for other packages: names compared this way ignore case,
++// accents, punctuation and spaces ("blink‐182" with a Unicode hyphen equals "Blink-182").
++func Fold(s string) string { return fold(s) }
++
+ func fold(s string) string {
+ 	var sb strings.Builder
+ 	for _, r := range norm.NFD.String(strings.ToLower(s)) {
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index 400b71a..c5f0bf6 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -7,6 +7,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -305,6 +306,13 @@ func (s *Service) process(ctx context.Context, id string) {
+ 		s.setStatus(ctx, req, StatusFailed, err.Error())
+ 		return
+ 	}
++	// Already on disk (an earlier attempt downloaded it but the scan had not
++	// recognized it yet): wait for the library instead of downloading a second copy.
++	if s.filesOnDisk(req) > 0 {
++		s.setStatus(ctx, req, StatusImporting, "")
++		go s.rescan(ctx)
++		return
++	}
+ 	s.setStatus(ctx, req, StatusSearching, "")
+ 
+ 	var errs []string
+@@ -350,6 +358,26 @@ func (s *Service) process(ctx context.Context, id string) {
+ 	s.setStatus(ctx, req, StatusFailed, msg)
+ }
+ 
++// filesOnDisk counts the audio files a source would have written for an album
++// request (DestDir/Artist/Album, the folder every source uses).
++func (s *Service) filesOnDisk(req *Request) int {
++	if req.Kind != KindAlbum || s.cfg.DestDir == "" {
++		return 0
++	}
++	dir := filepath.Join(s.cfg.DestDir, sanitize(req.Artist), sanitize(cmp(req.Album, req.Title)))
++	entries, err := os.ReadDir(dir)
++	if err != nil {
++		return 0
++	}
++	n := 0
++	for _, e := range entries {
++		if !e.IsDir() && audioExts[strings.ToLower(filepath.Ext(e.Name()))] {
++			n++
++		}
++	}
++	return n
++}
++
+ // trackSources are the sources used to build an album track by track: the
+ // track-only ones (web). Album-capable ones (Soulseek) already had their go at
+ // the whole album, and searching them again per track is slow.
+diff --git a/core/acquire/service_test.go b/core/acquire/service_test.go
+index c11791b..b087bd9 100644
+--- a/core/acquire/service_test.go
++++ b/core/acquire/service_test.go
+@@ -371,3 +371,25 @@ func TestAlbumFallsBackToTrackByTrack(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestRetryDoesNotDownloadAnAlbumTwice(t *testing.T) {
++	dest := t.TempDir()
++	dir := filepath.Join(dest, "blink‐182", "NINE")
++	_ = os.MkdirAll(dir, 0o755)
++	_ = os.WriteFile(filepath.Join(dir, "01 - The First Time.flac"), []byte("x"), 0o600)
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	src := &fakeSource{name: "soulseek", kind: KindAlbum, lib: lib}
++	cfg := fastConfig(true)
++	cfg.DestDir = dest
++	cfg.ImportTimeout = time.Hour
++	svc := NewService(cfg, fakeCatalog{}, []Source{src}, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++	req, _ := svc.Submit(ctx, "u", CatalogItem{Kind: KindAlbum, MBID: "rg", Title: "NINE", Artist: "blink‐182"})
++	waitStatus(t, st, req.ID, StatusImporting)
++	if n := src.calls.Load(); n != 0 {
++		t.Errorf("downloaded again (%d calls) although the album is on disk", n)
++	}
++}
+diff --git a/core/acquire/source_soulseek.go b/core/acquire/source_soulseek.go
+index 98d3180..d2638f7 100644
+--- a/core/acquire/source_soulseek.go
++++ b/core/acquire/source_soulseek.go
+@@ -353,6 +353,17 @@ func (s *Soulseek) importFiles(req Request, files []slskFile, destDir string) ([
+ 	if err := os.MkdirAll(dir, 0o755); err != nil {
+ 		return nil, err
+ 	}
++	// A track already in the folder under another name (an earlier attempt, a
++	// different peer's naming) is replaced, never kept twice.
++	existing := map[string][]string{}
++	if entries, err := os.ReadDir(dir); err == nil {
++		for _, e := range entries {
++			if !e.IsDir() && audioExts[strings.ToLower(filepath.Ext(e.Name()))] {
++				k := trackKey(e.Name())
++				existing[k] = append(existing[k], filepath.Join(dir, e.Name()))
++			}
++		}
++	}
+ 	var paths []string
+ 	for _, f := range files {
+ 		src := filepath.Join(s.DownloadDir, sanitize(remoteParent(f.Filename)), remoteBase(f.Filename))
+@@ -362,7 +373,16 @@ func (s *Soulseek) importFiles(req Request, files []slskFile, destDir string) ([
+ 			}
+ 		}
+ 		dst := filepath.Join(dir, sanitize(remoteBase(f.Filename)))
+-		if err := moveFile(src, dst); err != nil {
++		tmp := dst + ".seer-part"
++		_ = os.Remove(tmp)
++		if err := moveFile(src, tmp); err != nil {
++			return paths, err
++		}
++		// only once the new file is in place: the new download wins
++		for _, old := range existing[trackKey(f.Filename)] {
++			_ = os.Remove(old)
++		}
++		if err := os.Rename(tmp, dst); err != nil {
+ 			return paths, err
+ 		}
+ 		paths = append(paths, dst)
+diff --git a/core/acquire/source_soulseek_test.go b/core/acquire/source_soulseek_test.go
+index 2fa0b56..d3ecfa0 100644
+--- a/core/acquire/source_soulseek_test.go
++++ b/core/acquire/source_soulseek_test.go
+@@ -239,3 +239,34 @@ func TestSanitizeAndEnsureInside(t *testing.T) {
+ 		t.Error("ensureInside misbehaves")
+ 	}
+ }
++
++func TestSoulseekImportReplacesEarlierCopies(t *testing.T) {
++	dl, dest := t.TempDir(), t.TempDir()
++	dir := filepath.Join(dest, "blink‐182", "NINE")
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	// an earlier attempt from another peer, named differently
++	for _, n := range []string{"01 - The First Time.flac", "02 - Happy Days.flac", "cover.jpg"} {
++		_ = os.WriteFile(filepath.Join(dir, n), []byte("old"), 0o600)
++	}
++	if err := os.MkdirAll(filepath.Join(dl, "NINE (2019)"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	files := []slskFile{{Filename: `@@music\NINE (2019)\blink-182 - NINE - 01 - The First Time.flac`}}
++	_ = os.WriteFile(filepath.Join(dl, "NINE (2019)", "blink-182 - NINE - 01 - The First Time.flac"), []byte("new"), 0o600)
++	s := &Soulseek{DownloadDir: dl}
++	paths, err := s.importFiles(Request{Kind: KindAlbum, Artist: "blink‐182", Title: "NINE"}, files, dest)
++	if err != nil || len(paths) != 1 {
++		t.Fatalf("import: %v %v", paths, err)
++	}
++	entries, _ := os.ReadDir(dir)
++	var names []string
++	for _, e := range entries {
++		names = append(names, e.Name())
++	}
++	want := "02 - Happy Days.flac,blink-182 - NINE - 01 - The First Time.flac,cover.jpg"
++	if strings.Join(names, ",") != want {
++		t.Errorf("folder = %v", names)
++	}
++}
+diff --git a/core/seer/duplicates.go b/core/seer/duplicates.go
+new file mode 100644
+index 0000000..0e56fba
+--- /dev/null
++++ b/core/seer/duplicates.go
+@@ -0,0 +1,227 @@
++package seer
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
++	"time"
++
++	. "github.com/Masterminds/squirrel"
++	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++)
++
++// trashKeep is how long cleaned-up duplicates stay in the trash folder.
++const trashKeep = 7 * 24 * time.Hour
++
++// DupFile is one copy of a duplicated song.
++type DupFile struct {
++	ID      string `json:"id"`
++	Path    string `json:"path"`
++	Suffix  string `json:"suffix"`
++	BitRate int    `json:"bitRate"`
++	Size    int64  `json:"size"`
++	Remove  bool   `json:"remove"` // a cleanup moves it to the trash
++}
++
++// DupGroup is a song that is in the library more than once.
++type DupGroup struct {
++	Artist string    `json:"artist"`
++	Album  string    `json:"album"`
++	Title  string    `json:"title"`
++	Files  []DupFile `json:"files"`
++}
++
++// DupReport lists the duplicates a cleanup would remove.
++type DupReport struct {
++	Groups []DupGroup `json:"groups"`
++	Files  int        `json:"files"` // copies to remove
++	Bytes  int64      `json:"bytes"`
++	Trash  string     `json:"trash,omitempty"` // where Clean moved them
++}
++
++// Duplicates finds songs that are in the library twice (same album, disc and
++// title, same length) and removes the extra copies that Seer downloaded.
++// Files outside the Seer folder are the user's own and are never touched; the
++// copy kept is the user's own, else the best quality one.
++type Duplicates struct {
++	ds      model.DataStore
++	lib     *library
++	destDir func() string
++	trash   string // trash root; defaults to <DataFolder>/seer-trash
++}
++
++// Find reports the duplicates without changing anything.
++func (d *Duplicates) Find(ctx context.Context) (*DupReport, error) {
++	mfs, err := d.ds.MediaFile().GetAll(ctx, model.QueryOptions{Filters: Expr(`media_file.id IN (
++		SELECT m.id FROM media_file m JOIN (
++			SELECT album_id, disc_number, lower(title) AS t FROM media_file WHERE missing = 0
++			GROUP BY album_id, disc_number, lower(title) HAVING count(*) > 1
++		) d ON m.album_id = d.album_id AND m.disc_number = d.disc_number AND lower(m.title) = d.t
++		WHERE m.missing = 0)`)})
++	if err != nil {
++		return nil, err
++	}
++	return buildReport(mfs, d.destDir()), nil
++}
++
++func buildReport(mfs model.MediaFiles, seerDir string) *DupReport {
++	byKey := map[string]model.MediaFiles{}
++	var keys []string
++	for _, mf := range mfs {
++		k := mf.AlbumID + "\x00" + strconv.Itoa(mf.DiscNumber) + "\x00" + strings.ToLower(mf.Title)
++		if _, ok := byKey[k]; !ok {
++			keys = append(keys, k)
++		}
++		byKey[k] = append(byKey[k], mf)
++	}
++	sort.Strings(keys)
++	rep := &DupReport{Groups: []DupGroup{}}
++	for _, k := range keys {
++		group := byKey[k]
++		sort.SliceStable(group, func(i, j int) bool { return group[i].Duration < group[j].Duration })
++		// split by length: same title but a different length is another recording
++		start := 0
++		for i := 1; i <= len(group); i++ {
++			if i < len(group) && group[i].Duration-group[i-1].Duration <= 3 {
++				continue
++			}
++			if g := group[start:i]; len(g) > 1 {
++				if dg, ok := dupGroup(g, seerDir); ok {
++					rep.Groups = append(rep.Groups, dg)
++					for _, f := range dg.Files {
++						if f.Remove {
++							rep.Files++
++							rep.Bytes += f.Size
++						}
++					}
++				}
++			}
++			start = i
++		}
++	}
++	return rep
++}
++
++var lossless = map[string]bool{"flac": true, "alac": true, "wav": true, "aiff": true, "ape": true, "wv": true}
++
++func dupGroup(g model.MediaFiles, seerDir string) (DupGroup, bool) {
++	inSeer := func(mf model.MediaFile) bool { return seerDir != "" && isInside(seerDir, mf.AbsolutePath()) }
++	rank := func(mf model.MediaFile) int64 {
++		r := int64(mf.BitRate)
++		if !inSeer(mf) {
++			r += 1 << 40 // the user's own copy always stays
++		}
++		if lossless[strings.ToLower(mf.Suffix)] {
++			r += 1 << 30
++		}
++		return r
++	}
++	keep := 0
++	for i := range g {
++		if rank(g[i]) > rank(g[keep]) || (rank(g[i]) == rank(g[keep]) && g[i].Size > g[keep].Size) {
++			keep = i
++		}
++	}
++	dg := DupGroup{Artist: g[keep].Artist, Album: g[keep].Album, Title: g[keep].Title}
++	removable := false
++	for i, mf := range g {
++		f := DupFile{ID: mf.ID, Path: mf.AbsolutePath(), Suffix: mf.Suffix, BitRate: mf.BitRate, Size: mf.Size}
++		if i != keep && inSeer(mf) {
++			f.Remove, removable = true, true
++		}
++		dg.Files = append(dg.Files, f)
++	}
++	return dg, removable
++}
++
++// Clean moves the extra copies to <DataFolder>/seer-trash/<time>/ (kept for a
++// week, then purged) and rescans the library.
++func (d *Duplicates) Clean(ctx context.Context) (*DupReport, error) {
++	rep, err := d.Find(ctx)
++	if err != nil {
++		return nil, err
++	}
++	seerDir := d.destDir()
++	if seerDir == "" {
++		return nil, errors.New("no Seer folder configured")
++	}
++	root := d.trash
++	if root == "" {
++		root = filepath.Join(conf.Server.DataFolder.String(), "seer-trash")
++	}
++	purgeTrash(ctx, root)
++	if rep.Files == 0 {
++		return rep, nil
++	}
++	trash := filepath.Join(root, time.Now().Format("2006-01-02_150405"))
++	moved := 0
++	for _, g := range rep.Groups {
++		for _, f := range g.Files {
++			if !f.Remove || !isInside(seerDir, f.Path) {
++				continue
++			}
++			rel, err := filepath.Rel(seerDir, f.Path)
++			if err != nil {
++				continue
++			}
++			dst := filepath.Join(trash, rel)
++			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
++				return nil, err
++			}
++			if err := move(f.Path, dst); err != nil {
++				log.Warn(ctx, "Seer: could not move duplicate to the trash", "path", f.Path, err)
++				continue
++			}
++			moved++
++		}
++	}
++	log.Info(ctx, "Seer: moved duplicate songs to the trash", "files", moved, "trash", trash)
++	rep.Trash = trash
++	if d.lib != nil {
++		go func() { _ = d.lib.Rescan(context.WithoutCancel(ctx)) }()
++	}
++	return rep, nil
++}
++
++func purgeTrash(ctx context.Context, root string) {
++	entries, err := os.ReadDir(root)
++	if err != nil {
++		return
++	}
++	for _, e := range entries {
++		info, err := e.Info()
++		if err != nil || !e.IsDir() || time.Since(info.ModTime()) < trashKeep {
++			continue
++		}
++		if err := os.RemoveAll(filepath.Join(root, e.Name())); err != nil {
++			log.Warn(ctx, "Seer: could not purge old trash", "dir", e.Name(), err)
++		}
++	}
++}
++
++// move renames, or copies and deletes across file systems (the trash is in
++// the data folder, usually another mount than the music).
++func move(src, dst string) error {
++	if err := os.Rename(src, dst); err == nil {
++		return nil
++	}
++	in, err := os.ReadFile(src) //nolint:gosec
++	if err != nil {
++		return err
++	}
++	if err := os.WriteFile(dst, in, 0o644); err != nil { //nolint:gosec
++		return err
++	}
++	return os.Remove(src)
++}
++
++func isInside(root, path string) bool {
++	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
++	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
++}
+diff --git a/core/seer/duplicates_test.go b/core/seer/duplicates_test.go
+new file mode 100644
+index 0000000..8a13d4a
+--- /dev/null
++++ b/core/seer/duplicates_test.go
+@@ -0,0 +1,102 @@
++package seer
++
++import (
++	"context"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/tests"
++)
++
++func TestDuplicatesReportAndClean(t *testing.T) {
++	lib := t.TempDir()
++	seerDir := filepath.Join(lib, "Seer")
++	song := func(id, path, suffix string, bitRate int, dur float32) model.MediaFile {
++		full := filepath.Join(lib, path)
++		_ = os.MkdirAll(filepath.Dir(full), 0o755)
++		_ = os.WriteFile(full, []byte(id), 0o600)
++		return model.MediaFile{ID: id, LibraryPath: lib, Path: path, AlbumID: "al", DiscNumber: 1, Title: "The First Time",
++			Artist: "blink-182", Album: "NINE", Suffix: suffix, BitRate: bitRate, Duration: dur, Size: int64(bitRate)}
++	}
++	mfs := model.MediaFiles{
++		// two Seer downloads of the same song: the FLAC stays
++		song("a", "Seer/blink-182/NINE/01 - The First Time.mp3", "mp3", 320, 180),
++		song("b", "Seer/blink-182/NINE/The First Time.flac", "flac", 900, 181),
++		// same title, much longer: another recording, not a duplicate
++		song("c", "Seer/blink-182/NINE/The First Time (live).flac", "flac", 900, 260),
++		// the user's own copy beats a Seer FLAC, and is never removed
++		func() model.MediaFile {
++			m := song("d", "Mine/Blink/Darkside.mp3", "mp3", 128, 200)
++			m.Title, m.AlbumID = "Darkside", "al2"
++			return m
++		}(),
++		func() model.MediaFile {
++			m := song("e", "Seer/blink-182/NINE/Darkside.flac", "flac", 900, 200)
++			m.Title, m.AlbumID = "darkside", "al2"
++			return m
++		}(),
++		// a lone song is ignored
++		func() model.MediaFile {
++			m := song("f", "Seer/x/y/Other.flac", "flac", 900, 100)
++			m.Title = "Other"
++			return m
++		}(),
++	}
++
++	rep := buildReport(mfs, seerDir)
++	if len(rep.Groups) != 2 || rep.Files != 2 {
++		t.Fatalf("groups=%d files=%d: %+v", len(rep.Groups), rep.Files, rep)
++	}
++	remove := map[string]bool{}
++	for _, g := range rep.Groups {
++		for _, f := range g.Files {
++			if f.Remove {
++				remove[f.ID] = true
++			}
++		}
++	}
++	if !remove["a"] || !remove["e"] || remove["b"] || remove["c"] || remove["d"] {
++		t.Errorf("remove = %v", remove)
++	}
++	if rep.Bytes != 320+900 {
++		t.Errorf("bytes = %d", rep.Bytes)
++	}
++
++	// without a Seer folder nothing is removed
++	if r := buildReport(mfs, ""); r.Files != 0 {
++		t.Errorf("removed %d files with no Seer folder", r.Files)
++	}
++
++	ds := &tests.MockDataStore{}
++	ds.MockedMediaFile = tests.CreateMockMediaFileRepo()
++	ds.MockedMediaFile.(*tests.MockMediaFileRepo).SetData(mfs)
++	trash := t.TempDir()
++	old := filepath.Join(trash, "2020-01-01_000000")
++	_ = os.MkdirAll(old, 0o755)
++	weekAgo := time.Now().Add(-8 * 24 * time.Hour)
++	_ = os.Chtimes(old, weekAgo, weekAgo)
++	d := &Duplicates{ds: ds, destDir: func() string { return seerDir }, trash: trash}
++	got, err := d.Clean(context.Background())
++	if err != nil || got.Files != 2 || got.Trash == "" {
++		t.Fatalf("clean: %+v %v", got, err)
++	}
++	for id, path := range map[string]string{"a": mfs[0].Path, "e": mfs[4].Path} {
++		if _, err := os.Stat(filepath.Join(lib, path)); !os.IsNotExist(err) {
++			t.Errorf("%s still in the library", id)
++		}
++		if _, err := os.Stat(filepath.Join(got.Trash, path[len("Seer/"):])); err != nil {
++			t.Errorf("%s not in the trash: %v", id, err)
++		}
++	}
++	for _, path := range []string{mfs[1].Path, mfs[2].Path, mfs[3].Path} {
++		if _, err := os.Stat(filepath.Join(lib, path)); err != nil {
++			t.Errorf("%s was removed", path)
++		}
++	}
++	if _, err := os.Stat(old); !os.IsNotExist(err) {
++		t.Error("week-old trash was not purged")
++	}
++}
+diff --git a/core/seer/library.go b/core/seer/library.go
+index c45403d..0a0fe6a 100644
+--- a/core/seer/library.go
++++ b/core/seer/library.go
+@@ -66,6 +66,20 @@ func (l *library) matchTrack(ctx context.Context, item acquire.CatalogItem) (str
+ 			return mfs[0].ID, true
+ 		}
+ 	}
++	// Same title, artist spelled differently (accents, "blink‐182" vs "blink-182").
++	if item.Title != "" && item.Artist != "" {
++		mfs, err := l.ds.MediaFile().GetAll(ctx, model.QueryOptions{Max: 50, Filters: And{
++			Expr("media_file.title = ? COLLATE NOCASE", item.Title), Eq{"media_file.missing": false},
++		}})
++		if err == nil {
++			want := acquire.Fold(item.Artist)
++			for _, mf := range mfs {
++				if acquire.Fold(mf.Artist) == want || acquire.Fold(mf.AlbumArtist) == want {
++					return mf.ID, true
++				}
++			}
++		}
++	}
+ 	return "", false
+ }
+ 
+@@ -91,6 +105,27 @@ func (l *library) matchAlbum(ctx context.Context, item acquire.CatalogItem) (str
+ 			return als[0].ID, true
+ 		}
+ 	}
++	// The catalog and the files often spell names differently: MusicBrainz
++	// writes "blink‐182" with a Unicode hyphen, files say "blink-182"; accents
++	// and capitals come and go. Compare folded names among likely candidates.
++	if name == "" || item.Artist == "" {
++		return "", false
++	}
++	wantName, wantArtist := acquire.Fold(name), acquire.Fold(item.Artist)
++	for _, f := range []Sqlizer{
++		Expr("album.name = ? COLLATE NOCASE", name),
++		Expr("album.album_artist = ? COLLATE NOCASE", item.Artist),
++	} {
++		als, err := l.ds.Album().GetAll(ctx, model.QueryOptions{Max: 500, Filters: And{f, Eq{"album.missing": false}}})
++		if err != nil {
++			return "", false
++		}
++		for _, al := range als {
++			if acquire.Fold(al.Name) == wantName && acquire.Fold(al.AlbumArtist) == wantArtist {
++				return al.ID, true
++			}
++		}
++	}
+ 	return "", false
+ }
+ 
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index 04f80bd..35a9243 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -21,6 +21,8 @@ type Seer struct {
+ 	*acquire.Service
+ 	Importer *acquire.Importer
+ 	Storage  *Storage
++	// Duplicates finds and cleans songs downloaded twice.
++	Duplicates *Duplicates
+ }
+ 
+ // Enabled reports whether the feature is turned on in the configuration.
+@@ -54,7 +56,9 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 	}
+ 	imp := acquire.NewImporter(svc, db, catalog, reader, &playlistWriter{ds: ds})
+ 	imp.OnChange = func() { refreshUI(broker) }
+-	return &Seer{Service: svc, Importer: imp, Storage: storage}
++	dest := cfg.DestDir
++	dups := &Duplicates{ds: ds, lib: lib, destDir: func() string { return dest }}
++	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups}
+ }
+ 
+ // refreshUI tells open pages to reload (useRefreshOnEvents(['seer'])).
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index 6aa2041..c3c0701 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -585,7 +585,7 @@
+         "fullShort": "Limite atingido, downloads pausados",
+         "unlimited": "Sem limite",
+         "limitLabel": "Limite da biblioteca de músicas",
+-        "help": "O Seer para de baixar quando a biblioteca chega nesse tamanho. Nada é apagado.",
++        "help": "O Seer para de baixar quando a biblioteca chega nesse tamanho. O limite nunca apaga nada.",
+         "adminOnly": "Só um admin pode mudar o limite.",
+         "invalid": "Digite um tamanho em GB, ou deixe vazio para não ter limite",
+         "saved": "Limite de armazenamento salvo"
+@@ -596,6 +596,18 @@
+       "progress": {
+         "track": "Baixando faixa %{n} de %{total}",
+         "missing": "%{smart_count} de %{total} faixas faltando: %{list} |||| %{smart_count} de %{total} faixas faltando: %{list}"
++      },
++      "duplicates": {
++        "title": "Músicas duplicadas",
++        "checking": "Procurando duplicadas…",
++        "failed": "Não foi possível procurar duplicadas",
++        "none": "Nenhuma música duplicada.",
++        "found": "%{smart_count} cópia a mais (%{size}) |||| %{smart_count} cópias a mais (%{size})",
++        "more": "e mais %{smart_count} |||| e mais %{smart_count}",
++        "help": "A melhor cópia de cada música fica. Só cópias que o Seer baixou são removidas, e elas ficam numa lixeira por 7 dias.",
++        "clean": "Limpar duplicadas",
++        "confirm": "Remover %{smart_count} cópia |||| Remover %{smart_count} cópias",
++        "cleaned": "%{smart_count} cópia movida para a lixeira |||| %{smart_count} cópias movidas para a lixeira"
+       }
+     }
+   },
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 5cef448..5cfa62a 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -47,16 +47,23 @@ type Storage interface {
+ 	SetLimit(ctx context.Context, bytes int64) error
+ }
+ 
++// Duplicates finds and cleans songs that are in the library twice.
++type Duplicates interface {
++	Find(ctx context.Context) (*seer.DupReport, error)
++	Clean(ctx context.Context) (*seer.DupReport, error)
++}
++
+ type Router struct {
+ 	http.Handler
+ 	ds      model.DataStore
+ 	svc     Service
+ 	imp     Imports
+ 	storage Storage
++	dups    Duplicates
+ }
+ 
+ func New(ds model.DataStore, s *seer.Seer) *Router {
+-	r := &Router{ds: ds, svc: s, imp: s.Importer, storage: s.Storage}
++	r := &Router{ds: ds, svc: s, imp: s.Importer, storage: s.Storage, dups: s.Duplicates}
+ 	r.Handler = r.routes()
+ 	return r
+ }
+@@ -75,6 +82,13 @@ func NewWithStorage(ds model.DataStore, svc Service, st Storage) *Router {
+ 	return r
+ }
+ 
++// NewWithDuplicates builds the router around any Service and Duplicates (used by tests).
++func NewWithDuplicates(ds model.DataStore, svc Service, d Duplicates) *Router {
++	r := &Router{ds: ds, svc: svc, dups: d}
++	r.Handler = r.routes()
++	return r
++}
++
+ // NewWithService builds the router around any Service (used by tests).
+ func NewWithService(ds model.DataStore, svc Service) *Router {
+ 	r := &Router{ds: ds, svc: svc}
+@@ -102,6 +116,10 @@ func (api *Router) routes() http.Handler {
+ 			r.Get("/storage", api.getStorage)
+ 			r.With(adminOnly).Put("/storage", api.setStorage)
+ 		}
++		if api.dups != nil {
++			r.With(adminOnly).Get("/duplicates", api.findDuplicates)
++			r.With(adminOnly).Post("/duplicates/clean", api.cleanDuplicates)
++		}
+ 		if api.imp != nil {
+ 			r.Route("/imports", func(r chi.Router) {
+ 				r.Get("/", api.listImports)
+@@ -229,6 +247,26 @@ func (api *Router) setStorage(w http.ResponseWriter, r *http.Request) {
+ 	api.getStorage(w, r)
+ }
+ 
++func (api *Router) findDuplicates(w http.ResponseWriter, r *http.Request) {
++	rep, err := api.dups.Find(r.Context())
++	if err != nil {
++		log.Error(r.Context(), "Seer: looking for duplicates failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	writeJSON(w, http.StatusOK, rep)
++}
++
++func (api *Router) cleanDuplicates(w http.ResponseWriter, r *http.Request) {
++	rep, err := api.dups.Clean(r.Context())
++	if err != nil {
++		log.Error(r.Context(), "Seer: cleaning duplicates failed", err)
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	writeJSON(w, http.StatusOK, rep)
++}
++
+ func (api *Router) getRequest(w http.ResponseWriter, r *http.Request) {
+ 	user, _ := request.UserFrom(r.Context())
+ 	req, err := api.svc.Get(r.Context(), chi.URLParam(r, "id"))
+diff --git a/server/seerapi/seerapi_test.go b/server/seerapi/seerapi_test.go
+index ba87805..3862130 100644
+--- a/server/seerapi/seerapi_test.go
++++ b/server/seerapi/seerapi_test.go
+@@ -206,3 +206,38 @@ func TestSeerStorageAPI(t *testing.T) {
+ 		t.Errorf("admin set: %d %s", w.Code, w.Body)
+ 	}
+ }
++
++type fakeDups struct{ cleaned bool }
++
++func (f *fakeDups) Find(context.Context) (*seer.DupReport, error) {
++	if f.cleaned {
++		return &seer.DupReport{Groups: []seer.DupGroup{}}, nil
++	}
++	return &seer.DupReport{Files: 1, Bytes: 30, Groups: []seer.DupGroup{{Title: "T", Files: []seer.DupFile{{ID: "a"}, {ID: "b", Remove: true}}}}}, nil
++}
++func (f *fakeDups) Clean(ctx context.Context) (*seer.DupReport, error) {
++	rep, _ := f.Find(ctx)
++	f.cleaned = true
++	rep.Trash = "/data/seer-trash/x"
++	return rep, nil
++}
++
++func TestSeerDuplicatesAPI(t *testing.T) {
++	d := &fakeDups{}
++	api := NewWithDuplicates(nil, &fakeService{reqs: map[string]*acquire.Request{}}, d)
++	user := model.User{ID: "u1"}
++	admin := model.User{ID: "adm", IsAdmin: true}
++
++	if w := do(t, api, user, "GET", "/duplicates", ""); w.Code != http.StatusForbidden {
++		t.Errorf("users must not list duplicates: %d", w.Code)
++	}
++	if w := do(t, api, user, "POST", "/duplicates/clean", ""); w.Code != http.StatusForbidden || d.cleaned {
++		t.Errorf("users must not clean: %d", w.Code)
++	}
++	if w := do(t, api, admin, "GET", "/duplicates", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"files":1`) {
++		t.Errorf("find: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, admin, "POST", "/duplicates/clean", ""); w.Code != 200 || !d.cleaned || !strings.Contains(w.Body.String(), `"trash"`) {
++		t.Errorf("clean: %d %s", w.Code, w.Body)
++	}
++}
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 571db39..503890a 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -588,7 +588,7 @@
+         "fullShort": "Limit reached, downloads paused",
+         "unlimited": "No limit",
+         "limitLabel": "Limit for the music library",
+-        "help": "Seer stops downloading once the library reaches this size. Nothing is ever deleted.",
++        "help": "Seer stops downloading once the library reaches this size. The limit never deletes anything.",
+         "adminOnly": "Only an admin can change the limit.",
+         "invalid": "Type a size in GB, or leave it empty for no limit",
+         "saved": "Storage limit saved"
+@@ -599,6 +599,18 @@
+       "progress": {
+         "track": "Downloading track %{n} of %{total}",
+         "missing": "%{smart_count} of %{total} tracks missing: %{list} |||| %{smart_count} of %{total} tracks missing: %{list}"
++      },
++      "duplicates": {
++        "title": "Duplicate songs",
++        "checking": "Looking for duplicates…",
++        "failed": "Could not look for duplicates",
++        "none": "No duplicate songs found.",
++        "found": "%{smart_count} extra copy (%{size}) |||| %{smart_count} extra copies (%{size})",
++        "more": "and %{smart_count} more |||| and %{smart_count} more",
++        "help": "The best copy of each song stays. Only copies Seer downloaded are removed, and they stay in a trash folder for 7 days.",
++        "clean": "Clean up duplicates",
++        "confirm": "Remove %{smart_count} copy |||| Remove %{smart_count} copies",
++        "cleaned": "%{smart_count} copy moved to the trash |||| %{smart_count} copies moved to the trash"
+       }
+     }
+   },
+diff --git a/ui/src/seer/DuplicatesPanel.jsx b/ui/src/seer/DuplicatesPanel.jsx
+new file mode 100644
+index 0000000..a9a0e67
+--- /dev/null
++++ b/ui/src/seer/DuplicatesPanel.jsx
+@@ -0,0 +1,140 @@
++import { useEffect, useState } from 'react'
++import { Button } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import { useLocale, useNotify, useTranslate } from 'react-admin'
++import { cleanDuplicates, getDuplicates } from './api'
++import { formatBytes } from './StorageWidget'
++
++const useStyles = makeStyles((theme) => ({
++  root: {
++    marginTop: theme.spacing(2.5),
++    paddingTop: theme.spacing(2),
++    borderTop: `1px solid ${theme.palette.divider}`,
++  },
++  title: { fontSize: 14, fontWeight: 700, marginBottom: 4 },
++  sub: { fontSize: 12, color: theme.palette.text.secondary, lineHeight: 1.4 },
++  list: {
++    margin: theme.spacing(1, 0),
++    padding: 0,
++    listStyle: 'none',
++    fontSize: 13,
++    maxHeight: 140,
++    overflowY: 'auto',
++    '& li': {
++      padding: '3px 0',
++      whiteSpace: 'nowrap',
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++    },
++  },
++  actions: { display: 'flex', gap: 8, marginTop: theme.spacing(1) },
++}))
++
++const MAX_LISTED = 20
++
++// Lists the songs that are in the library twice and moves the extra copies
++// Seer downloaded to the trash (kept for a week).
++export const DuplicatesPanel = ({ onCleaned }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const notify = useNotify()
++  const locale = useLocale()
++  const [report, setReport] = useState(null)
++  const [confirm, setConfirm] = useState(false)
++  const [busy, setBusy] = useState(false)
++
++  useEffect(() => {
++    getDuplicates()
++      .then(setReport)
++      .catch(() => setReport({ groups: [], files: 0, failed: true }))
++  }, [])
++
++  const clean = () => {
++    setBusy(true)
++    cleanDuplicates()
++      .then((rep) => {
++        notify('resources.seer.duplicates.cleaned', 'info', {
++          smart_count: rep.files,
++        })
++        setReport({ groups: [], files: 0 })
++        setConfirm(false)
++        onCleaned && onCleaned()
++      })
++      .catch((e) => notify(e?.body || e?.message || String(e), 'warning'))
++      .finally(() => setBusy(false))
++  }
++
++  const groups = (report?.groups || []).filter((g) =>
++    g.files.some((f) => f.remove),
++  )
++
++  return (
++    <div className={classes.root} data-testid="seer-duplicates">
++      <div className={classes.title}>
++        {translate('resources.seer.duplicates.title')}
++      </div>
++      {!report ? (
++        <div className={classes.sub}>
++          {translate('resources.seer.duplicates.checking')}
++        </div>
++      ) : report.failed ? (
++        <div className={classes.sub}>
++          {translate('resources.seer.duplicates.failed')}
++        </div>
++      ) : report.files === 0 ? (
++        <div className={classes.sub}>
++          {translate('resources.seer.duplicates.none')}
++        </div>
++      ) : (
++        <>
++          <div className={classes.sub}>
++            {translate('resources.seer.duplicates.found', {
++              smart_count: report.files,
++              size: formatBytes(report.bytes, locale),
++            })}
++          </div>
++          <ul className={classes.list}>
++            {groups.slice(0, MAX_LISTED).map((g) => (
++              <li key={g.files.map((f) => f.id).join()}>
++                {g.artist} · {g.title}
++              </li>
++            ))}
++            {groups.length > MAX_LISTED && (
++              <li className={classes.sub}>
++                {translate('resources.seer.duplicates.more', {
++                  smart_count: groups.length - MAX_LISTED,
++                })}
++              </li>
++            )}
++          </ul>
++          <div className={classes.sub}>
++            {translate('resources.seer.duplicates.help')}
++          </div>
++          <div className={classes.actions}>
++            {confirm ? (
++              <>
++                <Button
++                  variant="contained"
++                  color="secondary"
++                  disabled={busy}
++                  onClick={clean}
++                >
++                  {translate('resources.seer.duplicates.confirm', {
++                    smart_count: report.files,
++                  })}
++                </Button>
++                <Button disabled={busy} onClick={() => setConfirm(false)}>
++                  {translate('ra.action.cancel')}
++                </Button>
++              </>
++            ) : (
++              <Button variant="outlined" onClick={() => setConfirm(true)}>
++                {translate('resources.seer.duplicates.clean')}
++              </Button>
++            )}
++          </div>
++        </>
++      )}
++    </div>
++  )
++}
+diff --git a/ui/src/seer/DuplicatesPanel.test.jsx b/ui/src/seer/DuplicatesPanel.test.jsx
+new file mode 100644
+index 0000000..486838c
+--- /dev/null
++++ b/ui/src/seer/DuplicatesPanel.test.jsx
+@@ -0,0 +1,75 @@
++import React from 'react'
++import { render, fireEvent, waitFor } from '@testing-library/react'
++import { describe, it, expect, vi, beforeEach } from 'vitest'
++import * as api from './api'
++import { DuplicatesPanel } from './DuplicatesPanel'
++
++const notify = vi.fn()
++vi.mock('react-admin', async () => {
++  const actual = await vi.importActual('react-admin')
++  return {
++    ...actual,
++    useTranslate: () => (key, opts) =>
++      opts ? `${key}:${JSON.stringify(opts)}` : key,
++    useNotify: () => notify,
++    useLocale: () => 'en',
++  }
++})
++
++vi.mock('./api', () => ({
++  getDuplicates: vi.fn(),
++  cleanDuplicates: vi.fn(),
++}))
++
++const report = {
++  files: 2,
++  bytes: 60_000_000,
++  groups: [
++    {
++      artist: 'blink-182',
++      title: 'The First Time',
++      files: [{ id: 'a' }, { id: 'b', remove: true }],
++    },
++    {
++      artist: 'blink-182',
++      title: 'Darkside',
++      files: [{ id: 'c' }, { id: 'd', remove: true }],
++    },
++  ],
++}
++
++describe('DuplicatesPanel', () => {
++  beforeEach(() => vi.clearAllMocks())
++
++  it('says when there is nothing to clean', async () => {
++    api.getDuplicates.mockResolvedValue({ files: 0, groups: [] })
++    const { findByText } = render(<DuplicatesPanel />)
++    expect(await findByText('resources.seer.duplicates.none')).toBeTruthy()
++  })
++
++  it('lists the duplicates and cleans them after a confirmation', async () => {
++    api.getDuplicates.mockResolvedValue(report)
++    api.cleanDuplicates.mockResolvedValue({ ...report, trash: '/t' })
++    const onCleaned = vi.fn()
++    const { findByText, getByText, queryByText } = render(
++      <DuplicatesPanel onCleaned={onCleaned} />,
++    )
++    expect(await findByText('blink-182 · The First Time')).toBeTruthy()
++    getByText(
++      'resources.seer.duplicates.found:{"smart_count":2,"size":"60 MB"}',
++    )
++    fireEvent.click(getByText('resources.seer.duplicates.clean'))
++    expect(api.cleanDuplicates).not.toHaveBeenCalled()
++    fireEvent.click(
++      getByText('resources.seer.duplicates.confirm:{"smart_count":2}'),
++    )
++    await waitFor(() => expect(onCleaned).toHaveBeenCalled())
++    expect(api.cleanDuplicates).toHaveBeenCalledTimes(1)
++    expect(notify).toHaveBeenCalledWith(
++      'resources.seer.duplicates.cleaned',
++      'info',
++      { smart_count: 2 },
++    )
++    expect(queryByText('blink-182 · The First Time')).toBeNull()
++  })
++})
+diff --git a/ui/src/seer/StorageWidget.jsx b/ui/src/seer/StorageWidget.jsx
+index dfca04b..647816a 100644
+--- a/ui/src/seer/StorageWidget.jsx
++++ b/ui/src/seer/StorageWidget.jsx
+@@ -15,6 +15,7 @@ import { useLocale, useNotify, usePermissions, useTranslate } from 'react-admin'
+ import { useRefreshOnEvents } from '../common'
+ import { GREEN } from './actions'
+ import { getStorage, setStorageLimit } from './api'
++import { DuplicatesPanel } from './DuplicatesPanel'
+ 
+ const GB = 1e9
+ const PRESETS = [100, 250, 500, 1000, 2000]
+@@ -227,6 +228,13 @@ const StorageDialog = ({ info, onClose, onSaved }) => {
+             <div className={classes.sub}>
+               {translate('resources.seer.storage.help')}
+             </div>
++            <DuplicatesPanel
++              onCleaned={() =>
++                getStorage()
++                  .then(onSaved)
++                  .catch(() => {})
++              }
++            />
+           </>
+         ) : (
+           <div className={classes.sub} style={{ marginTop: 16 }}>
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index bd1e6d4..3518495 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -74,3 +74,11 @@ export const setStorageLimit = (limit) =>
+     method: 'PUT',
+     body: JSON.stringify({ limit }),
+   }).then(({ json }) => json)
++
++export const getDuplicates = () =>
++  httpClient(`${SEER_URL}/duplicates`).then(({ json }) => json)
++
++export const cleanDuplicates = () =>
++  httpClient(`${SEER_URL}/duplicates/clean`, { method: 'POST' }).then(
++    ({ json }) => json,
++  )
+-- 
+2.43.0
+

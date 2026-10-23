@@ -1,0 +1,1278 @@
+From a861f8c6a5ca4e80440d4793c14ce479d2380167 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 21:42:43 +0000
+Subject: [PATCH 08/10] Seer: show how much space the music takes and cap it
+
+The sidebar shows the library size and free disk space. Admins set a limit
+there; past it (or below Seer.MinFreeSpace free) new requests are refused
+with 507 and queued ones fail with "storage limit reached".
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ SEER.md                        |  23 ++-
+ conf/configuration.go          |   4 +
+ core/acquire/importer.go       |   2 +-
+ core/acquire/service.go        |  19 ++
+ core/acquire/service_test.go   |  51 ++++-
+ core/seer/seer.go              |   7 +-
+ core/seer/storage.go           | 146 ++++++++++++++
+ core/seer/storage_test.go      |  65 +++++++
+ core/seer/storage_unix.go      |  32 ++++
+ core/seer/storage_windows.go   |  11 ++
+ resources/i18n/pt-br.json      |  18 +-
+ server/seerapi/seerapi.go      |  54 +++++-
+ server/seerapi/seerapi_test.go |  34 ++++
+ ui/src/i18n/en.json            |  16 ++
+ ui/src/layout/Menu.jsx         |  12 ++
+ ui/src/seer/Seer.test.jsx      |  16 ++
+ ui/src/seer/SeerPage.jsx       |  17 ++
+ ui/src/seer/StorageWidget.jsx  | 334 +++++++++++++++++++++++++++++++++
+ ui/src/seer/api.js             |   9 +
+ 19 files changed, 857 insertions(+), 13 deletions(-)
+ create mode 100644 core/seer/storage.go
+ create mode 100644 core/seer/storage_test.go
+ create mode 100644 core/seer/storage_unix.go
+ create mode 100644 core/seer/storage_windows.go
+ create mode 100644 ui/src/seer/StorageWidget.jsx
+
+diff --git a/SEER.md b/SEER.md
+index f748f6b..e4f5e5e 100644
+--- a/SEER.md
++++ b/SEER.md
+@@ -38,6 +38,23 @@ hand. Linked playlists can be re-read every day ("Sync every day").
+   (`https://music.youtube.com/playlist?list=LM`) set `Seer.YouTube.Cookies` to
+   a cookies.txt exported from a browser where you are logged in.
+ 
++## Storage limit
++
++The bottom of the sidebar shows how much the music takes (all libraries, from
++the last scan) and the free space on the disk that holds `DestFolder`. Clicking
++it opens a dialog where an admin sets a limit (or none). Once the library
++reaches the limit, or the disk has less than `MinFreeSpace` free, new requests
++answer 507 and queued ones fail with "storage limit reached"; retry them after
++freeing space or raising the limit. Nothing is ever deleted. The limit set in
++the UI is stored in the database and wins over `Seer.StorageLimit`.
++
++## Look and apps
++
++The `Seer` theme (`ui/src/themes/seer.js`) is the default: browsers that were on
++the old default switch to it once, and any theme picked later is kept. The web
++app is installable (manifest "Navidrome Seer", maskable icon, shortcuts):
++Chrome/Edge on Android or desktop offer "Install app", also from the user menu.
++
+ ## Configuration
+ 
+ ```toml
+@@ -48,6 +65,8 @@ Sources = "lidarr,soulseek,youtube"  # priority order; first one that succeeds w
+ DestFolder = ""                  # default: <first library>/Seer. Must be inside a library
+ Workers = 2
+ ImportTimeout = "30m"            # how long to wait for the scan to find a download
++StorageLimit = ""                # e.g. "500GB"; no new downloads past it (editable in the UI)
++MinFreeSpace = "2GB"             # no new downloads when the disk has less free
+ UserAgent = ""                   # sent to MusicBrainz; please set one with your contact
+ MusicBrainzURL = "https://musicbrainz.org/ws/2"
+ 
+@@ -88,12 +107,14 @@ Environment variables work as usual, e.g. `ND_SEER_ENABLED=true`,
+ | GET | `/catalog/artist/{mbid}` | any user | artist and discography |
+ | GET | `/catalog/album/{mbid}` | any user | album and tracklist |
+ | GET | `/requests` | any user | own requests; admins get all (`?mine=true` for own) |
+-| POST | `/requests` | any user | body: a catalog item. 409 if already in the library; returns the existing request if someone already asked for it |
++| POST | `/requests` | any user | body: a catalog item. 409 if already in the library, 507 past the storage limit; returns the existing request if someone already asked for it |
+ | GET | `/requests/{id}` | owner or admin | one request |
+ | POST | `/requests/{id}/approve` | admin | queue a pending request, or retry a failed one |
+ | GET/POST | `/imports` | any user | list imports; start one (`{"url","sync"}` or multipart `file`) |
+ | GET/PUT/DELETE | `/imports/{id}` | owner or admin | import with its songs; `{"sync"}`; forget it |
+ | POST | `/imports/{id}/items/{pos}/resolve` | owner or admin | body: the catalog track picked for an unmatched song |
++| GET | `/storage` | any user | `used`, `limit`, `diskTotal`, `diskFree`, `minFree`, `full`, `reason` (bytes) |
++| PUT | `/storage` | admin | body: `{"limit": bytes}`, 0 removes the limit |
+ 
+ Statuses: `pending` → `queued` → `searching` → `downloading` → `importing` →
+ `available`, or `failed` with `error`.
+diff --git a/conf/configuration.go b/conf/configuration.go
+index 3a09b9d..ecf49dd 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -241,6 +241,8 @@ type seerOptions struct {
+ 	UserAgent      string // sent to MusicBrainz
+ 	MusicBrainzURL string // MusicBrainz web service base URL (for mirrors)
+ 	ImportTimeout  time.Duration
++	StorageLimit   string              // e.g. "500GB": no new downloads once the library is this big. Editable in the UI
++	MinFreeSpace   string              // no new downloads when the disk has less than this free
+ 	YouTube        seerYouTubeOptions  `json:",omitzero"`
+ 	Soulseek       seerSoulseekOptions `json:",omitzero"`
+ 	Lidarr         seerLidarrOptions   `json:",omitzero"`
+@@ -1147,6 +1149,8 @@ func setViperDefaults() {
+ 	viper.SetDefault("seer.useragent", "")
+ 	viper.SetDefault("seer.musicbrainzurl", "https://musicbrainz.org/ws/2")
+ 	viper.SetDefault("seer.importtimeout", 30*time.Minute)
++	viper.SetDefault("seer.storagelimit", "")
++	viper.SetDefault("seer.minfreespace", "2GB")
+ 	viper.SetDefault("seer.youtube.enabled", false)
+ 	viper.SetDefault("seer.youtube.path", "yt-dlp")
+ 	viper.SetDefault("seer.youtube.format", "opus")
+diff --git a/core/acquire/importer.go b/core/acquire/importer.go
+index ebff3d2..cf03fef 100644
+--- a/core/acquire/importer.go
++++ b/core/acquire/importer.go
+@@ -40,7 +40,7 @@ const (
+ )
+ 
+ type ImportItem struct {
+-	Position int    `json:"position"`
++	Position int `json:"position"`
+ 	ImportTrack
+ 	State     string `json:"state"`
+ 	MBID      string `json:"mbid,omitempty"`
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index e4fd8c5..b6ef4d6 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -22,6 +22,8 @@ var (
+ 	ErrInLibrary = errors.New("already in library")
+ 	ErrNotFound  = errors.New("request not found")
+ 	ErrBadState  = errors.New("request cannot be approved in its current state")
++	// ErrStorageFull is returned when Config.CheckSpace refuses new downloads.
++	ErrStorageFull = errors.New("storage limit reached")
+ )
+ 
+ // Catalog searches and browses the external catalog.
+@@ -77,6 +79,9 @@ type Config struct {
+ 	RescanInterval time.Duration
+ 	// OnChange, when set, is called after a request is created or changes status.
+ 	OnChange func(Request)
++	// CheckSpace, when set, is asked before a request is created and before it is
++	// downloaded. Returning an error (wrapping ErrStorageFull) stops the download.
++	CheckSpace func(ctx context.Context) error
+ }
+ 
+ type Service struct {
+@@ -216,6 +221,9 @@ func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (
+ 	if existing != nil {
+ 		return existing, nil
+ 	}
++	if err := s.checkSpace(ctx); err != nil {
++		return nil, err
++	}
+ 	now := time.Now()
+ 	req := &Request{
+ 		ID: newID(), UserID: userID, Kind: item.Kind, MBID: item.MBID,
+@@ -273,6 +281,13 @@ func (s *Service) enqueue(ctx context.Context, id string) {
+ 	}
+ }
+ 
++func (s *Service) checkSpace(ctx context.Context) error {
++	if s.cfg.CheckSpace == nil {
++		return nil
++	}
++	return s.cfg.CheckSpace(ctx)
++}
++
+ func (s *Service) done(id string) {
+ 	s.mu.Lock()
+ 	delete(s.inflight, id)
+@@ -285,6 +300,10 @@ func (s *Service) process(ctx context.Context, id string) {
+ 	if err != nil || req == nil {
+ 		return
+ 	}
++	if err := s.checkSpace(ctx); err != nil {
++		s.setStatus(ctx, req, StatusFailed, err.Error())
++		return
++	}
+ 	s.setStatus(ctx, req, StatusSearching, "")
+ 
+ 	var errs []string
+diff --git a/core/acquire/service_test.go b/core/acquire/service_test.go
+index e323600..1f1821b 100644
+--- a/core/acquire/service_test.go
++++ b/core/acquire/service_test.go
+@@ -3,7 +3,10 @@ package acquire
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
++	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ )
+@@ -45,16 +48,18 @@ func (l *fakeLib) Rescan(context.Context) error {
+ }
+ 
+ type fakeSource struct {
+-	name string
+-	kind Kind
+-	err  error
+-	lib  *fakeLib
++	name  string
++	kind  Kind
++	err   error
++	lib   *fakeLib
++	calls atomic.Int32
+ }
+ 
+ func (s *fakeSource) Name() string         { return s.name }
+ func (s *fakeSource) Enabled() bool        { return true }
+ func (s *fakeSource) Supports(k Kind) bool { return k == s.kind }
+ func (s *fakeSource) Fetch(_ context.Context, r Request, _ string) (Result, error) {
++	s.calls.Add(1)
+ 	if s.err != nil {
+ 		return Result{}, s.err
+ 	}
+@@ -249,3 +254,41 @@ func TestStartResumesQueuedRequests(t *testing.T) {
+ 		t.Errorf("pending (unapproved) request must stay pending, got %s", r.Status)
+ 	}
+ }
++
++func TestStorageLimit(t *testing.T) {
++	lib := &fakeLib{have: map[string]bool{}}
++	st := NewMemoryStore()
++	var full atomic.Bool
++	cfg := fastConfig(false)
++	cfg.CheckSpace = func(context.Context) error {
++		if full.Load() {
++			return fmt.Errorf("%w: 10 GB of 10 GB used", ErrStorageFull)
++		}
++		return nil
++	}
++	src := &fakeSource{name: "a", kind: KindAlbum}
++	svc := NewService(cfg, fakeCatalog{}, []Source{src}, st, lib)
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	svc.Start(ctx)
++
++	// Accepted while there is room, then the disk fills up before it is approved.
++	req, err := svc.Submit(ctx, "u", CatalogItem{Kind: KindAlbum, MBID: "m1", Title: "T"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	full.Store(true)
++	if _, err := svc.Submit(ctx, "u", CatalogItem{Kind: KindAlbum, MBID: "m2", Title: "U"}); !errors.Is(err, ErrStorageFull) {
++		t.Fatalf("want ErrStorageFull, got %v", err)
++	}
++	if _, err := svc.Approve(ctx, req.ID); err != nil {
++		t.Fatal(err)
++	}
++	got := waitStatus(t, st, req.ID, StatusFailed)
++	if !strings.Contains(got.Error, "storage limit") {
++		t.Fatalf("error = %q", got.Error)
++	}
++	if n := src.calls.Load(); n != 0 {
++		t.Fatalf("source was called %d times while storage was full", n)
++	}
++}
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index 47732b9..a39b178 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -20,6 +20,7 @@ import (
+ type Seer struct {
+ 	*acquire.Service
+ 	Importer *acquire.Importer
++	Storage  *Storage
+ }
+ 
+ // Enabled reports whether the feature is turned on in the configuration.
+@@ -35,12 +36,14 @@ func GetInstance(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker e
+ // New builds a Seer from conf.Server.Seer.
+ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Broker) *Seer {
+ 	opts := conf.Server.Seer
++	storage := NewStorage(ds)
+ 	cfg := acquire.Config{
+ 		DestDir:       destFolder(ds),
+ 		Workers:       opts.Workers,
+ 		AutoApprove:   opts.AutoApprove,
+ 		ImportTimeout: opts.ImportTimeout,
+-		OnChange: func(acquire.Request) { refreshUI(broker) },
++		OnChange:      func(acquire.Request) { refreshUI(broker) },
++		CheckSpace:    storage.Check,
+ 	}
+ 	catalog := &acquire.MusicBrainz{UserAgent: opts.UserAgent, BaseURL: opts.MusicBrainzURL}
+ 	lib := &library{ds: ds, scanner: scanner}
+@@ -51,7 +54,7 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 	}
+ 	imp := acquire.NewImporter(svc, db, catalog, reader, &playlistWriter{ds: ds})
+ 	imp.OnChange = func() { refreshUI(broker) }
+-	return &Seer{Service: svc, Importer: imp}
++	return &Seer{Service: svc, Importer: imp, Storage: storage}
+ }
+ 
+ // refreshUI tells open pages to reload (useRefreshOnEvents(['seer'])).
+diff --git a/core/seer/storage.go b/core/seer/storage.go
+new file mode 100644
+index 0000000..a3940ca
+--- /dev/null
++++ b/core/seer/storage.go
+@@ -0,0 +1,146 @@
++package seer
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/dustin/go-humanize"
++	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++)
++
++// storageLimitKey holds the limit set in the UI, in bytes. It wins over Seer.StorageLimit.
++const storageLimitKey = "SeerStorageLimit"
++
++// StorageInfo is what the storage widget shows.
++type StorageInfo struct {
++	Used      int64  `json:"used"`      // size of the music in all libraries, from the last scan
++	Limit     int64  `json:"limit"`     // 0 = no limit
++	DiskTotal uint64 `json:"diskTotal"` // the disk holding the music folder (0 if unknown)
++	DiskFree  uint64 `json:"diskFree"`
++	MinFree   uint64 `json:"minFree"`
++	Full      bool   `json:"full"`             // new downloads are refused
++	Reason    string `json:"reason,omitempty"` // why, when Full
++}
++
++// Storage measures how much the music takes and enforces the configured limits.
++type Storage struct {
++	ds   model.DataStore
++	disk func(path string) (total, free uint64, err error)
++
++	mu     sync.Mutex
++	cached *StorageInfo
++	at     time.Time
++}
++
++func NewStorage(ds model.DataStore) *Storage {
++	return &Storage{ds: ds, disk: diskUsage}
++}
++
++// ParseSize reads sizes like "500GB", "1.5 TB" or a plain number of bytes.
++// An empty string or "0" means no limit.
++func ParseSize(s string) (int64, error) {
++	s = strings.TrimSpace(s)
++	if s == "" || s == "0" {
++		return 0, nil
++	}
++	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
++		return n, nil
++	}
++	n, err := humanize.ParseBytes(s)
++	if err != nil {
++		return 0, err
++	}
++	return int64(n), nil
++}
++
++func (st *Storage) limit(ctx context.Context) int64 {
++	if v, err := st.ds.Property().Get(ctx, storageLimitKey); err == nil && v != "" {
++		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
++			return n
++		}
++	}
++	n, err := ParseSize(conf.Server.Seer.StorageLimit)
++	if err != nil {
++		log.Warn(ctx, "Seer: invalid Seer.StorageLimit", "value", conf.Server.Seer.StorageLimit, err)
++	}
++	return n
++}
++
++// SetLimit stores a new limit (0 removes it).
++func (st *Storage) SetLimit(ctx context.Context, bytes int64) error {
++	if bytes < 0 {
++		return errors.New("limit cannot be negative")
++	}
++	if err := st.ds.Property().Put(ctx, storageLimitKey, strconv.FormatInt(bytes, 10)); err != nil {
++		return err
++	}
++	st.mu.Lock()
++	st.cached = nil
++	st.mu.Unlock()
++	return nil
++}
++
++// Info returns the current usage. It is cached for a few seconds, since every
++// request and every import item asks for it.
++func (st *Storage) Info(ctx context.Context) (*StorageInfo, error) {
++	st.mu.Lock()
++	defer st.mu.Unlock()
++	if st.cached != nil && time.Since(st.at) < 10*time.Second {
++		c := *st.cached
++		return &c, nil
++	}
++	libs, err := st.ds.Library().GetAll(ctx)
++	if err != nil {
++		return nil, err
++	}
++	info := &StorageInfo{Limit: st.limit(ctx)}
++	minFree, err := ParseSize(conf.Server.Seer.MinFreeSpace)
++	if err != nil {
++		log.Warn(ctx, "Seer: invalid Seer.MinFreeSpace", "value", conf.Server.Seer.MinFreeSpace, err)
++	}
++	info.MinFree = uint64(max(minFree, 0))
++	for _, l := range libs {
++		info.Used += l.TotalSize
++	}
++	path := conf.Server.Seer.DestFolder
++	if path == "" && len(libs) > 0 {
++		path = libs[0].Path
++	}
++	if path != "" {
++		if total, free, err := st.disk(nearestDir(path)); err == nil {
++			info.DiskTotal, info.DiskFree = total, free
++		}
++	}
++	switch {
++	case info.Limit > 0 && info.Used >= info.Limit:
++		info.Full = true
++		info.Reason = fmt.Sprintf("%s of %s used", humanize.Bytes(uint64(info.Used)), humanize.Bytes(uint64(info.Limit)))
++	case info.DiskTotal > 0 && info.MinFree > 0 && info.DiskFree < info.MinFree:
++		info.Full = true
++		info.Reason = fmt.Sprintf("only %s free on disk", humanize.Bytes(info.DiskFree))
++	}
++	st.cached, st.at = info, time.Now()
++	c := *info
++	return &c, nil
++}
++
++// Check is the acquire.Config.CheckSpace hook.
++func (st *Storage) Check(ctx context.Context) error {
++	info, err := st.Info(ctx)
++	if err != nil {
++		log.Warn(ctx, "Seer: could not measure storage, allowing the download", err)
++		return nil
++	}
++	if info.Full {
++		return fmt.Errorf("%w: %s", acquire.ErrStorageFull, info.Reason)
++	}
++	return nil
++}
+diff --git a/core/seer/storage_test.go b/core/seer/storage_test.go
+new file mode 100644
+index 0000000..346c244
+--- /dev/null
++++ b/core/seer/storage_test.go
+@@ -0,0 +1,65 @@
++package seer
++
++import (
++	"context"
++	"errors"
++	"strings"
++	"testing"
++
++	"github.com/navidrome/navidrome/conf"
++	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/tests"
++)
++
++func TestParseSize(t *testing.T) {
++	for in, want := range map[string]int64{"": 0, "0": 0, "1024": 1024, "2GB": 2_000_000_000, "1.5 TB": 1_500_000_000_000, "10GiB": 10 << 30} {
++		if got, err := ParseSize(in); err != nil || got != want {
++			t.Errorf("ParseSize(%q) = %d, %v; want %d", in, got, err, want)
++		}
++	}
++	if _, err := ParseSize("lots"); err == nil {
++		t.Error("ParseSize accepted garbage")
++	}
++}
++
++func TestStorageLimits(t *testing.T) {
++	conf.Server.Seer.StorageLimit = "100GB"
++	conf.Server.Seer.MinFreeSpace = "2GB"
++	conf.Server.Seer.DestFolder = "/music/Seer"
++	t.Cleanup(func() {
++		conf.Server.Seer.StorageLimit, conf.Server.Seer.MinFreeSpace, conf.Server.Seer.DestFolder = "", "2GB", ""
++	})
++	libs := &tests.MockLibraryRepo{}
++	libs.SetData(model.Libraries{{ID: 1, Path: "/music", TotalSize: 40_000_000_000}, {ID: 2, Path: "/more", TotalSize: 20_000_000_000}})
++	ds := &tests.MockDataStore{MockedLibrary: libs, MockedProperty: &tests.MockedPropertyRepo{}}
++	free := uint64(500_000_000_000)
++	st := NewStorage(ds)
++	st.disk = func(string) (uint64, uint64, error) { return 1_000_000_000_000, free, nil }
++	ctx := context.Background()
++
++	info, err := st.Info(ctx)
++	if err != nil || info.Used != 60_000_000_000 || info.Limit != 100_000_000_000 || info.Full || info.DiskFree != free {
++		t.Fatalf("info = %+v, %v", info, err)
++	}
++	if err := st.Check(ctx); err != nil {
++		t.Fatalf("check under the limit: %v", err)
++	}
++
++	// The limit set in the UI wins over the config, and takes effect at once.
++	if err := st.SetLimit(ctx, 50_000_000_000); err != nil {
++		t.Fatal(err)
++	}
++	err = st.Check(ctx)
++	if !errors.Is(err, acquire.ErrStorageFull) || !strings.Contains(err.Error(), "60 GB of 50 GB") {
++		t.Fatalf("check over the limit: %v", err)
++	}
++
++	// No limit, but the disk itself is nearly full.
++	_ = st.SetLimit(ctx, 0)
++	free = 1_000_000_000
++	info, _ = st.Info(ctx)
++	if info.Limit != 0 || !info.Full || !strings.Contains(info.Reason, "free on disk") {
++		t.Fatalf("low disk: %+v", info)
++	}
++}
+diff --git a/core/seer/storage_unix.go b/core/seer/storage_unix.go
+new file mode 100644
+index 0000000..49a37e5
+--- /dev/null
++++ b/core/seer/storage_unix.go
+@@ -0,0 +1,32 @@
++//go:build !windows
++
++package seer
++
++import (
++	"os"
++	"path/filepath"
++	"syscall"
++)
++
++func diskUsage(path string) (total, free uint64, err error) {
++	var fs syscall.Statfs_t
++	if err := syscall.Statfs(path, &fs); err != nil {
++		return 0, 0, err
++	}
++	bs := uint64(fs.Bsize) //nolint:gosec
++	return fs.Blocks * bs, fs.Bavail * bs, nil
++}
++
++// nearestDir walks up to the first existing directory (the Seer folder may not exist yet).
++func nearestDir(path string) string {
++	for {
++		if _, err := os.Stat(path); err == nil {
++			return path
++		}
++		parent := filepath.Dir(path)
++		if parent == path {
++			return path
++		}
++		path = parent
++	}
++}
+diff --git a/core/seer/storage_windows.go b/core/seer/storage_windows.go
+new file mode 100644
+index 0000000..ffc7a3d
+--- /dev/null
++++ b/core/seer/storage_windows.go
+@@ -0,0 +1,11 @@
++//go:build windows
++
++package seer
++
++import "errors"
++
++func diskUsage(string) (uint64, uint64, error) {
++	return 0, 0, errors.New("disk usage is not available on Windows")
++}
++
++func nearestDir(path string) string { return path }
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index dd8f16d..f0fa4e6 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -573,6 +573,22 @@
+           "ytmusic": "Playlist do YouTube Music",
+           "file": "Arquivo importado"
+         }
++      },
++      "storage": {
++        "title": "Armazenamento",
++        "music": "de músicas",
++        "ofLimit": "de %{limit}",
++        "noLimit": "Sem limite definido",
++        "disk": "%{free} livres de %{total} no disco",
++        "diskFree": "%{free} livres no disco",
++        "paused": "Limite atingido: novos pedidos e importações esperam até você liberar espaço ou aumentar o limite.",
++        "fullShort": "Limite atingido, downloads pausados",
++        "unlimited": "Sem limite",
++        "limitLabel": "Limite da biblioteca de músicas",
++        "help": "O Seer para de baixar quando a biblioteca chega nesse tamanho. Nada é apagado.",
++        "adminOnly": "Só um admin pode mudar o limite.",
++        "invalid": "Digite um tamanho em GB, ou deixe vazio para não ter limite",
++        "saved": "Limite de armazenamento salvo"
+       }
+     }
+   },
+@@ -899,4 +915,4 @@
+     "empty": "Nada tocando",
+     "minutesAgo": "%{smart_count} minuto atrás |||| %{smart_count} minutos atrás"
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 4842d58..5cef448 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -41,15 +41,22 @@ type Imports interface {
+ 	Delete(ctx context.Context, id string) error
+ }
+ 
++// Storage reports and limits how much space the music takes.
++type Storage interface {
++	Info(ctx context.Context) (*seer.StorageInfo, error)
++	SetLimit(ctx context.Context, bytes int64) error
++}
++
+ type Router struct {
+ 	http.Handler
+-	ds  model.DataStore
+-	svc Service
+-	imp Imports
++	ds      model.DataStore
++	svc     Service
++	imp     Imports
++	storage Storage
+ }
+ 
+ func New(ds model.DataStore, s *seer.Seer) *Router {
+-	r := &Router{ds: ds, svc: s, imp: s.Importer}
++	r := &Router{ds: ds, svc: s, imp: s.Importer, storage: s.Storage}
+ 	r.Handler = r.routes()
+ 	return r
+ }
+@@ -61,6 +68,13 @@ func NewWithImports(ds model.DataStore, svc Service, imp Imports) *Router {
+ 	return r
+ }
+ 
++// NewWithStorage builds the router around any Service and Storage (used by tests).
++func NewWithStorage(ds model.DataStore, svc Service, st Storage) *Router {
++	r := &Router{ds: ds, svc: svc, storage: st}
++	r.Handler = r.routes()
++	return r
++}
++
+ // NewWithService builds the router around any Service (used by tests).
+ func NewWithService(ds model.DataStore, svc Service) *Router {
+ 	r := &Router{ds: ds, svc: svc}
+@@ -84,6 +98,10 @@ func (api *Router) routes() http.Handler {
+ 			r.Get("/{id}", api.getRequest)
+ 			r.With(adminOnly).Post("/{id}/approve", api.approveRequest)
+ 		})
++		if api.storage != nil {
++			r.Get("/storage", api.getStorage)
++			r.With(adminOnly).Put("/storage", api.setStorage)
++		}
+ 		if api.imp != nil {
+ 			r.Route("/imports", func(r chi.Router) {
+ 				r.Get("/", api.listImports)
+@@ -176,6 +194,8 @@ func (api *Router) createRequest(w http.ResponseWriter, r *http.Request) {
+ 	switch {
+ 	case errors.Is(err, acquire.ErrInLibrary):
+ 		http.Error(w, err.Error(), http.StatusConflict)
++	case errors.Is(err, acquire.ErrStorageFull):
++		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+ 	case err != nil:
+ 		http.Error(w, err.Error(), http.StatusBadRequest)
+ 	default:
+@@ -183,6 +203,32 @@ func (api *Router) createRequest(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
++func (api *Router) getStorage(w http.ResponseWriter, r *http.Request) {
++	info, err := api.storage.Info(r.Context())
++	if err != nil {
++		log.Error(r.Context(), "Seer: measuring storage failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	writeJSON(w, http.StatusOK, info)
++}
++
++func (api *Router) setStorage(w http.ResponseWriter, r *http.Request) {
++	var body struct {
++		Limit int64 `json:"limit"` // bytes, 0 = no limit
++	}
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil || body.Limit < 0 {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	if err := api.storage.SetLimit(r.Context(), body.Limit); err != nil {
++		log.Error(r.Context(), "Seer: saving storage limit failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	api.getStorage(w, r)
++}
++
+ func (api *Router) getRequest(w http.ResponseWriter, r *http.Request) {
+ 	user, _ := request.UserFrom(r.Context())
+ 	req, err := api.svc.Get(r.Context(), chi.URLParam(r, "id"))
+diff --git a/server/seerapi/seerapi_test.go b/server/seerapi/seerapi_test.go
+index b384203..ba87805 100644
+--- a/server/seerapi/seerapi_test.go
++++ b/server/seerapi/seerapi_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"testing"
+ 
+ 	"github.com/navidrome/navidrome/core/acquire"
++	"github.com/navidrome/navidrome/core/seer"
+ 	"github.com/navidrome/navidrome/model"
+ 	"github.com/navidrome/navidrome/model/request"
+ )
+@@ -34,6 +35,9 @@ func (f *fakeService) Submit(_ context.Context, userID string, item acquire.Cata
+ 	if item.MBID == "owned" {
+ 		return nil, acquire.ErrInLibrary
+ 	}
++	if item.MBID == "full" {
++		return nil, acquire.ErrStorageFull
++	}
+ 	r := &acquire.Request{ID: "new", UserID: userID, MBID: item.MBID, Status: acquire.StatusPending}
+ 	f.reqs[r.ID] = r
+ 	return r, nil
+@@ -90,6 +94,9 @@ func TestSeerAPI(t *testing.T) {
+ 	if w := do(t, api, user, "POST", "/requests", `{"kind":"track","mbid":"owned","title":"T"}`); w.Code != http.StatusConflict {
+ 		t.Errorf("create owned: %d", w.Code)
+ 	}
++	if w := do(t, api, user, "POST", "/requests", `{"kind":"track","mbid":"full","title":"T"}`); w.Code != http.StatusInsufficientStorage {
++		t.Errorf("create when full: %d", w.Code)
++	}
+ 	if w := do(t, api, user, "POST", "/requests", `not json`); w.Code != http.StatusBadRequest {
+ 		t.Errorf("create bad body: %d", w.Code)
+ 	}
+@@ -172,3 +179,30 @@ func TestSeerImportsAPI(t *testing.T) {
+ 		t.Errorf("list: %d %s", w.Code, w.Body)
+ 	}
+ }
++
++type fakeStorage struct{ limit int64 }
++
++func (f *fakeStorage) Info(context.Context) (*seer.StorageInfo, error) {
++	return &seer.StorageInfo{Used: 10, Limit: f.limit, Full: f.limit > 0 && f.limit <= 10}, nil
++}
++func (f *fakeStorage) SetLimit(_ context.Context, n int64) error { f.limit = n; return nil }
++
++func TestSeerStorageAPI(t *testing.T) {
++	st := &fakeStorage{}
++	api := NewWithStorage(nil, &fakeService{reqs: map[string]*acquire.Request{}}, st)
++	user := model.User{ID: "u1"}
++	admin := model.User{ID: "adm", IsAdmin: true}
++
++	if w := do(t, api, user, "GET", "/storage", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"used":10`) {
++		t.Errorf("get: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, user, "PUT", "/storage", `{"limit":5}`); w.Code != http.StatusForbidden || st.limit != 0 {
++		t.Errorf("users must not change the limit: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/storage", `{"limit":-1}`); w.Code != http.StatusBadRequest {
++		t.Errorf("negative limit: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/storage", `{"limit":5}`); w.Code != 200 || st.limit != 5 || !strings.Contains(w.Body.String(), `"full":true`) {
++		t.Errorf("admin set: %d %s", w.Code, w.Body)
++	}
++}
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 603b33b..003dda7 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -576,6 +576,22 @@
+           "ytmusic": "YouTube Music playlist",
+           "file": "Imported file"
+         }
++      },
++      "storage": {
++        "title": "Storage",
++        "music": "of music",
++        "ofLimit": "of %{limit}",
++        "noLimit": "No limit set",
++        "disk": "%{free} free of %{total} on the disk",
++        "diskFree": "%{free} free on the disk",
++        "paused": "Limit reached: new requests and imports wait until you free space or raise the limit.",
++        "fullShort": "Limit reached, downloads paused",
++        "unlimited": "No limit",
++        "limitLabel": "Limit for the music library",
++        "help": "Seer stops downloading once the library reaches this size. Nothing is ever deleted.",
++        "adminOnly": "Only an admin can change the limit.",
++        "invalid": "Type a size in GB, or leave it empty for no limit",
++        "saved": "Storage limit saved"
+       }
+     }
+   },
+diff --git a/ui/src/layout/Menu.jsx b/ui/src/layout/Menu.jsx
+index 45f40b2..e6ac84b 100644
+--- a/ui/src/layout/Menu.jsx
++++ b/ui/src/layout/Menu.jsx
+@@ -11,6 +11,7 @@ import albumLists from '../album/albumLists'
+ import PlaylistsSubMenu from './PlaylistsSubMenu'
+ import LibrarySelector from '../common/LibrarySelector'
+ import config from '../config'
++import { StorageWidget } from '../seer/StorageWidget'
+ 
+ const useStyles = makeStyles((theme) => ({
+   root: {
+@@ -32,6 +33,12 @@ const useStyles = makeStyles((theme) => ({
+     color: theme.palette.text.primary,
+     fontWeight: 'bold',
+   },
++  storage: {
++    position: 'sticky',
++    bottom: (props) => (props.addPadding ? 80 : 0),
++    paddingTop: theme.spacing(1),
++    background: theme.palette.background.default,
++  },
+ }))
+ 
+ const translatedResourceName = (resource, translate) =>
+@@ -139,6 +146,11 @@ const Menu = ({ dense = false }) => {
+       ) : (
+         resources.filter(subItems('playlist')).map(renderResourceMenuItemLink)
+       )}
++      {config.seerEnabled && (
++        <div className={classes.storage}>
++          <StorageWidget open={open} />
++        </div>
++      )}
+     </div>
+   )
+ }
+diff --git a/ui/src/seer/Seer.test.jsx b/ui/src/seer/Seer.test.jsx
+index 2205704..b48f8d2 100644
+--- a/ui/src/seer/Seer.test.jsx
++++ b/ui/src/seer/Seer.test.jsx
+@@ -5,6 +5,7 @@ import * as RA from 'react-admin'
+ import { SeerContext } from './actions'
+ import { RequestsList } from './RequestsList'
+ import { SearchView, pickTop } from './SearchView'
++import { formatBytes, usage } from './StorageWidget'
+ 
+ vi.mock('react-admin', async () => {
+   const actual = await vi.importActual('react-admin')
+@@ -176,3 +177,18 @@ describe('RequestsList', () => {
+     expect(getByText('resources.seer.message.noRequests')).toBeTruthy()
+   })
+ })
++
++describe('storage widget helpers', () => {
++  it('formats sizes like a person would say them', () => {
++    expect(formatBytes(0, 'en')).toBe('0 GB')
++    expect(formatBytes(9_900_000, 'en')).toBe('9.9 MB')
++    expect(formatBytes(412_000_000_000, 'en')).toBe('412 GB')
++    expect(formatBytes(1_500_000_000_000, 'pt-BR')).toBe('1,5 TB')
++  })
++  it('fills the bar against the limit, or the disk when there is none', () => {
++    expect(usage({ used: 50, limit: 100, diskTotal: 1000 })).toBe(0.5)
++    expect(usage({ used: 50, limit: 0, diskTotal: 1000 })).toBe(0.05)
++    expect(usage({ used: 500, limit: 100 })).toBe(1)
++    expect(usage({ used: 5 })).toBe(0)
++  })
++})
+diff --git a/ui/src/seer/SeerPage.jsx b/ui/src/seer/SeerPage.jsx
+index 74672b0..681d7e9 100644
+--- a/ui/src/seer/SeerPage.jsx
++++ b/ui/src/seer/SeerPage.jsx
+@@ -22,6 +22,7 @@ import { ImportView } from './ImportView'
+ import { Section } from './components'
+ import { RequestsList } from './RequestsList'
+ import { SearchView } from './SearchView'
++import { useStorage } from './StorageWidget'
+ import { useCatalog } from './useCatalog'
+ 
+ const useStyles = makeStyles((theme) => {
+@@ -61,6 +62,16 @@ const useStyles = makeStyles((theme) => {
+       '& > svg': { color: theme.palette.text.secondary },
+     },
+     input: { flex: 1, fontSize: 16, fontWeight: 500 },
++    full: {
++      margin: theme.spacing(1, 0, 2),
++      padding: theme.spacing(1.5, 2),
++      borderRadius: 12,
++      fontSize: 14,
++      fontWeight: 600,
++      color: '#ff5c7a',
++      background: 'rgba(255,92,122,0.12)',
++      border: '1px solid rgba(255,92,122,0.35)',
++    },
+     welcome: {
+       position: 'relative',
+       overflow: 'hidden',
+@@ -135,6 +146,7 @@ const SeerPage = () => {
+   const [query, setQuery] = useState(params.get('q') || '')
+   const [debounced, setDebounced] = useState(query.trim())
+   const [requests, setRequests] = useState([])
++  const [storage] = useStorage()
+   const inputRef = useRef()
+ 
+   // Artist and album pages open at the top, like a new page.
+@@ -294,6 +306,11 @@ const SeerPage = () => {
+             </div>
+           </div>
+         )}
++        {storage?.full && (
++          <div className={classes.full} role="status">
++            {translate('resources.seer.storage.paused')}
++          </div>
++        )}
+         {body}
+         <div className={classes.credit}>
+           {translate('resources.seer.message.credit')}
+diff --git a/ui/src/seer/StorageWidget.jsx b/ui/src/seer/StorageWidget.jsx
+new file mode 100644
+index 0000000..dfca04b
+--- /dev/null
++++ b/ui/src/seer/StorageWidget.jsx
+@@ -0,0 +1,334 @@
++import { useCallback, useEffect, useState } from 'react'
++import {
++  Button,
++  ButtonBase,
++  Dialog,
++  DialogActions,
++  DialogContent,
++  DialogTitle,
++  InputAdornment,
++  TextField,
++} from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import StorageIcon from '@material-ui/icons/Storage'
++import { useLocale, useNotify, usePermissions, useTranslate } from 'react-admin'
++import { useRefreshOnEvents } from '../common'
++import { GREEN } from './actions'
++import { getStorage, setStorageLimit } from './api'
++
++const GB = 1e9
++const PRESETS = [100, 250, 500, 1000, 2000]
++
++const formatNumber = (v, locale, digits) => {
++  try {
++    return v.toLocaleString(locale, { maximumFractionDigits: digits })
++  } catch {
++    return v.toFixed(digits)
++  }
++}
++
++export const formatBytes = (n, locale) => {
++  if (!n) return '0 GB'
++  const [div, unit] =
++    n >= 1e12 ? [1e12, 'TB'] : n >= GB ? [GB, 'GB'] : [1e6, 'MB']
++  const v = n / div
++  return `${formatNumber(v, locale, v < 10 ? 1 : 0)} ${unit}`
++}
++
++// share of the bar: of the limit when there is one, otherwise of the disk
++export const usage = (info) => {
++  const of = info.limit || info.diskTotal || 0
++  return of ? Math.min(1, info.used / of) : 0
++}
++
++const barColor = (info, pct) =>
++  info.full ? '#ff5c7a' : pct > 0.85 ? '#f5a524' : GREEN
++
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  return {
++    root: {
++      display: 'block',
++      width: 'calc(100% - 16px)',
++      boxSizing: 'border-box',
++      margin: theme.spacing(1, 1, 1),
++      padding: theme.spacing(1.5, 1.5),
++      borderRadius: 12,
++      textAlign: 'left',
++      background: dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.04)',
++      transition: 'background 150ms ease',
++      '&:hover': {
++        background: dark ? 'rgba(255,255,255,0.09)' : 'rgba(0,0,0,0.07)',
++      },
++    },
++    compact: {
++      width: 39,
++      height: 39,
++      padding: 0,
++      margin: theme.spacing(1, 'auto'),
++      display: 'flex',
++      alignItems: 'center',
++      justifyContent: 'center',
++    },
++    head: {
++      display: 'flex',
++      alignItems: 'center',
++      gap: 8,
++      fontSize: 13,
++      fontWeight: 700,
++      color: theme.palette.text.primary,
++      '& svg': { fontSize: 18, color: theme.palette.text.secondary },
++    },
++    bar: {
++      height: 6,
++      borderRadius: 999,
++      overflow: 'hidden',
++      margin: '10px 0 8px',
++      background: dark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)',
++      '& > span': {
++        display: 'block',
++        height: '100%',
++        borderRadius: 999,
++        transition: 'width 400ms ease',
++      },
++    },
++    sub: {
++      fontSize: 12,
++      color: theme.palette.text.secondary,
++      lineHeight: 1.4,
++    },
++    full: { color: '#ff5c7a', fontWeight: 600 },
++    presets: {
++      display: 'flex',
++      flexWrap: 'wrap',
++      gap: 8,
++      margin: theme.spacing(2, 0, 1),
++    },
++    preset: {
++      height: 34,
++      padding: '0 14px',
++      borderRadius: 999,
++      fontSize: 13,
++      fontWeight: 600,
++      border: `1px solid ${theme.palette.divider}`,
++      '&:hover': { borderColor: theme.palette.text.primary },
++    },
++    presetOn: {
++      background: `${GREEN}26`,
++      borderColor: GREEN,
++      color: dark ? GREEN : '#0a7a35',
++    },
++    big: {
++      fontSize: 34,
++      fontWeight: 900,
++      letterSpacing: '-0.03em',
++      lineHeight: 1.1,
++    },
++  }
++})
++
++const StorageDialog = ({ info, onClose, onSaved }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const notify = useNotify()
++  const { permissions } = usePermissions()
++  const isAdmin = permissions === 'admin'
++  const locale = useLocale()
++  const [gb, setGb] = useState(info.limit ? String(info.limit / GB) : '')
++  const [saving, setSaving] = useState(false)
++  const pct = usage(info)
++
++  const save = (value) => {
++    const n = Number(String(value).replace(',', '.'))
++    if (value !== '' && (!Number.isFinite(n) || n < 0)) {
++      notify('resources.seer.storage.invalid', 'warning')
++      return
++    }
++    setSaving(true)
++    setStorageLimit(value === '' ? 0 : Math.round(n * GB))
++      .then((next) => {
++        onSaved(next)
++        notify('resources.seer.storage.saved', 'info')
++        onClose()
++      })
++      .catch((e) => notify(e?.body || e?.message || String(e), 'warning'))
++      .finally(() => setSaving(false))
++  }
++
++  return (
++    <Dialog open onClose={onClose} fullWidth maxWidth="xs">
++      <DialogTitle>{translate('resources.seer.storage.title')}</DialogTitle>
++      <DialogContent>
++        <div className={classes.big}>{formatBytes(info.used, locale)}</div>
++        <div className={classes.sub}>
++          {info.limit
++            ? translate('resources.seer.storage.ofLimit', {
++                limit: formatBytes(info.limit, locale),
++              })
++            : translate('resources.seer.storage.noLimit')}
++        </div>
++        <div className={classes.bar}>
++          <span
++            style={{
++              width: `${pct * 100}%`,
++              background: barColor(info, pct),
++            }}
++          />
++        </div>
++        {info.diskTotal > 0 && (
++          <div className={classes.sub}>
++            {translate('resources.seer.storage.disk', {
++              free: formatBytes(info.diskFree, locale),
++              total: formatBytes(info.diskTotal, locale),
++            })}
++          </div>
++        )}
++        {info.full && (
++          <div className={`${classes.sub} ${classes.full}`}>
++            {translate('resources.seer.storage.paused')}
++          </div>
++        )}
++        {isAdmin ? (
++          <>
++            <div className={classes.presets}>
++              {PRESETS.map((p) => (
++                <ButtonBase
++                  key={p}
++                  className={`${classes.preset} ${
++                    Number(gb) === p ? classes.presetOn : ''
++                  }`}
++                  onClick={() => setGb(String(p))}
++                >
++                  {formatBytes(p * GB, locale)}
++                </ButtonBase>
++              ))}
++              <ButtonBase
++                className={`${classes.preset} ${gb === '' ? classes.presetOn : ''}`}
++                onClick={() => setGb('')}
++              >
++                {translate('resources.seer.storage.unlimited')}
++              </ButtonBase>
++            </div>
++            <TextField
++              fullWidth
++              variant="outlined"
++              margin="dense"
++              label={translate('resources.seer.storage.limitLabel')}
++              value={gb}
++              onChange={(e) => setGb(e.target.value)}
++              placeholder={translate('resources.seer.storage.unlimited')}
++              inputProps={{ inputMode: 'decimal' }}
++              InputProps={{
++                endAdornment: (
++                  <InputAdornment position="end">GB</InputAdornment>
++                ),
++              }}
++            />
++            <div className={classes.sub}>
++              {translate('resources.seer.storage.help')}
++            </div>
++          </>
++        ) : (
++          <div className={classes.sub} style={{ marginTop: 16 }}>
++            {translate('resources.seer.storage.adminOnly')}
++          </div>
++        )}
++      </DialogContent>
++      <DialogActions>
++        <Button onClick={onClose}>{translate('ra.action.close')}</Button>
++        {isAdmin && (
++          <Button
++            color="primary"
++            variant="contained"
++            disabled={saving}
++            onClick={() => save(gb.trim())}
++          >
++            {translate('ra.action.save')}
++          </Button>
++        )}
++      </DialogActions>
++    </Dialog>
++  )
++}
++
++export const useStorage = () => {
++  const [info, setInfo] = useState(null)
++  const load = useCallback(
++    () =>
++      getStorage()
++        .then(setInfo)
++        .catch(() => {}),
++    [],
++  )
++  useEffect(() => {
++    load()
++    const t = setInterval(load, 60000)
++    return () => clearInterval(t)
++  }, [load])
++  useRefreshOnEvents({ events: ['seer'], onRefresh: load })
++  return [info, setInfo]
++}
++
++export const StorageWidget = ({ open = true }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const [info, setInfo] = useStorage()
++  const [dialog, setDialog] = useState(false)
++  if (!info) return null
++  const locale = useLocale()
++  const pct = usage(info)
++  const color = barColor(info, pct)
++  const title = translate('resources.seer.storage.title')
++
++  return (
++    <>
++      {open ? (
++        <ButtonBase
++          className={classes.root}
++          onClick={() => setDialog(true)}
++          aria-label={title}
++        >
++          <div className={classes.head}>
++            <StorageIcon />
++            {formatBytes(info.used, locale)}
++            <span className={classes.sub} style={{ fontWeight: 500 }}>
++              {info.limit
++                ? translate('resources.seer.storage.ofLimit', {
++                    limit: formatBytes(info.limit, locale),
++                  })
++                : translate('resources.seer.storage.music')}
++            </span>
++          </div>
++          <div className={classes.bar}>
++            <span style={{ width: `${pct * 100}%`, background: color }} />
++          </div>
++          <div className={`${classes.sub} ${info.full ? classes.full : ''}`}>
++            {info.full
++              ? translate('resources.seer.storage.fullShort')
++              : info.diskTotal > 0
++                ? translate('resources.seer.storage.diskFree', {
++                    free: formatBytes(info.diskFree, locale),
++                  })
++                : title}
++          </div>
++        </ButtonBase>
++      ) : (
++        <ButtonBase
++          className={`${classes.root} ${classes.compact}`}
++          onClick={() => setDialog(true)}
++          aria-label={title}
++          title={`${title}: ${formatBytes(info.used, locale)}`}
++        >
++          <StorageIcon style={{ color }} />
++        </ButtonBase>
++      )}
++      {dialog && (
++        <StorageDialog
++          info={info}
++          onClose={() => setDialog(false)}
++          onSaved={setInfo}
++        />
++      )}
++    </>
++  )
++}
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index ab68c37..bd1e6d4 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -65,3 +65,12 @@ export const resolveImportItem = (id, position, item) =>
+     method: 'POST',
+     body: JSON.stringify(item),
+   }).then(({ json }) => json)
++
++export const getStorage = () =>
++  httpClient(`${SEER_URL}/storage`).then(({ json }) => json)
++
++export const setStorageLimit = (limit) =>
++  httpClient(`${SEER_URL}/storage`, {
++    method: 'PUT',
++    body: JSON.stringify({ limit }),
++  }).then(({ json }) => json)
+-- 
+2.43.0
+

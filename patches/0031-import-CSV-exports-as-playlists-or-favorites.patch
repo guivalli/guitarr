@@ -1,0 +1,596 @@
+From a37d728ce23f8064de15ad914bd9f66a4eac371b Mon Sep 17 00:00:00 2001
+From: Guitarr <noreply@example.com>
+Date: Fri, 23 Oct 2026 00:46:52 -0300
+Subject: [PATCH] Seer: import CSV exports (Exportify) as playlists or
+ favorites
+
+---
+ core/acquire/import_read.go                   |  50 +++++++++
+ core/acquire/importer.go                      |  46 ++++++--
+ core/acquire/importer_test.go                 | 103 ++++++++++++++++--
+ core/seer/playlists.go                        |  30 +++++
+ .../20261023000000_add_import_job_target.sql  |   5 +
+ server/seerapi/seerapi.go                     |  77 +++++++++----
+ server/seerapi/seerapi_test.go                |  33 +++++-
+ 7 files changed, 299 insertions(+), 45 deletions(-)
+ create mode 100644 db/migrations/20261023000000_add_import_job_target.sql
+
+diff --git a/core/acquire/import_read.go b/core/acquire/import_read.go
+index c0804a16..9a5a422b 100644
+--- a/core/acquire/import_read.go
++++ b/core/acquire/import_read.go
+@@ -1,6 +1,7 @@
+ package acquire
+ 
+ import (
++	"archive/zip"
+ 	"bytes"
+ 	"context"
+ 	"encoding/base64"
+@@ -377,6 +378,9 @@ func ParseImportFile(name string, data []byte) (*ImportList, error) {
+ 		base = base[i+1:]
+ 	}
+ 	list := &ImportList{Source: "file", Name: strings.TrimSuffix(base, fileExt(base))}
++	if !strings.Contains(list.Name, " ") {
++		list.Name = strings.TrimSpace(strings.ReplaceAll(list.Name, "_", " ")) // Exportify: my_playlist.csv
++	}
+ 	trimmed := bytes.TrimSpace(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")))
+ 	switch {
+ 	case len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '['):
+@@ -399,6 +403,52 @@ func ParseImportFile(name string, data []byte) (*ImportList, error) {
+ 	return list, nil
+ }
+ 
++// ParseImportFiles reads one exported playlist, or every playlist inside a .zip
++// (Exportify's "Export All"). Files in the zip that hold no songs are skipped.
++func ParseImportFiles(name string, data []byte) ([]*ImportList, error) {
++	if !strings.EqualFold(fileExt(name), ".zip") {
++		list, err := ParseImportFile(name, data)
++		if err != nil {
++			return nil, err
++		}
++		return []*ImportList{list}, nil
++	}
++	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
++	if err != nil {
++		return nil, fmt.Errorf("reading zip: %w", err)
++	}
++	var lists []*ImportList
++	for _, f := range zr.File {
++		ext := strings.ToLower(fileExt(f.Name))
++		if f.FileInfo().IsDir() || (ext != ".csv" && ext != ".json" && ext != ".txt") || strings.Contains(f.Name, "__MACOSX") {
++			continue
++		}
++		rc, err := f.Open()
++		if err != nil {
++			continue
++		}
++		body, err := io.ReadAll(io.LimitReader(rc, 16<<20))
++		rc.Close()
++		if err != nil {
++			continue
++		}
++		if list, err := ParseImportFile(f.Name, body); err == nil {
++			lists = append(lists, list)
++		}
++	}
++	if len(lists) == 0 {
++		return nil, errors.New("no playlists found in the zip")
++	}
++	return lists, nil
++}
++
++var likedSongs = regexp.MustCompile(`(?i)^(liked[ _-]?songs|your[ _-]?likes|liked[ _-]?music|m[uú]sicas[ _-]?curtidas|curtidas)$`)
++
++// IsLikedSongs tells if an exported list is the "Liked Songs" of the account.
++func IsLikedSongs(name string) bool {
++	return likedSongs.MatchString(strings.TrimSpace(name))
++}
++
+ func fileExt(s string) string {
+ 	if i := strings.LastIndex(s, "."); i > 0 {
+ 		return s[i:]
+diff --git a/core/acquire/importer.go b/core/acquire/importer.go
+index cf03fefc..4f4668ce 100644
+--- a/core/acquire/importer.go
++++ b/core/acquire/importer.go
+@@ -21,6 +21,7 @@ type ImportJob struct {
+ 	Error      string    `json:"error,omitempty"`
+ 	Sync       bool      `json:"sync"` // re-read the link every day and add new songs
+ 	PlaylistID string    `json:"playlistId,omitempty"`
++	Target     string    `json:"target"` // playlist, favorites or both
+ 	CreatedAt  time.Time `json:"createdAt"`
+ 	UpdatedAt  time.Time `json:"updatedAt"`
+ 	// Counts by item state, filled when listing.
+@@ -59,6 +60,24 @@ type Matcher interface {
+ // It returns the playlist ID (creating the playlist when id is empty).
+ type PlaylistWriter interface {
+ 	WritePlaylist(ctx context.Context, userID, id, name string, mediaFileIDs []string) (string, error)
++	// StarSongs marks the songs as favorites of the user (those not starred yet).
++	StarSongs(ctx context.Context, userID string, mediaFileIDs []string) error
++}
++
++// Where the songs of an import go.
++const (
++	TargetPlaylist  = "playlist"
++	TargetFavorites = "favorites"
++	TargetBoth      = "both"
++)
++
++// NormTarget returns a valid target, playlist by default.
++func NormTarget(t string) string {
++	switch t {
++	case TargetFavorites, TargetBoth:
++		return t
++	}
++	return TargetPlaylist
+ }
+ 
+ // ListReader reads a playlist from a link.
+@@ -168,7 +187,7 @@ func (im *Importer) notify() {
+ }
+ 
+ // CreateFromLink starts importing a Spotify / YouTube Music link.
+-func (im *Importer) CreateFromLink(ctx context.Context, userID, link string, syncDaily bool) (*ImportJob, error) {
++func (im *Importer) CreateFromLink(ctx context.Context, userID, link string, syncDaily bool, target string) (*ImportJob, error) {
+ 	link = strings.TrimSpace(link)
+ 	if !spotifyLink.MatchString(link) && !strings.Contains(link, "youtube.com") && !strings.Contains(link, "youtu.be") {
+ 		return nil, ErrUnsupportedLink
+@@ -177,7 +196,7 @@ func (im *Importer) CreateFromLink(ctx context.Context, userID, link string, syn
+ 	if spotifyLink.MatchString(link) {
+ 		source = "spotify"
+ 	}
+-	job := &ImportJob{ID: newID(), UserID: userID, Source: source, URL: link, Status: "reading", Sync: syncDaily, Name: link}
++	job := &ImportJob{ID: newID(), UserID: userID, Source: source, URL: link, Status: "reading", Sync: syncDaily, Name: link, Target: NormTarget(target)}
+ 	if err := im.insertJob(ctx, job); err != nil {
+ 		return nil, err
+ 	}
+@@ -187,8 +206,8 @@ func (im *Importer) CreateFromLink(ctx context.Context, userID, link string, syn
+ }
+ 
+ // CreateFromList starts importing tracks already parsed (an uploaded file).
+-func (im *Importer) CreateFromList(ctx context.Context, userID string, list *ImportList) (*ImportJob, error) {
+-	job := &ImportJob{ID: newID(), UserID: userID, Source: list.Source, Status: "matching", Name: list.Name}
++func (im *Importer) CreateFromList(ctx context.Context, userID string, list *ImportList, target string) (*ImportJob, error) {
++	job := &ImportJob{ID: newID(), UserID: userID, Source: list.Source, Status: "matching", Name: list.Name, Target: NormTarget(target)}
+ 	if err := im.insertJob(ctx, job); err != nil {
+ 		return nil, err
+ 	}
+@@ -203,8 +222,8 @@ func (im *Importer) CreateFromList(ctx context.Context, userID string, list *Imp
+ func (im *Importer) insertJob(ctx context.Context, j *ImportJob) error {
+ 	now := time.Now()
+ 	j.CreatedAt, j.UpdatedAt = now, now
+-	_, err := im.db.ExecContext(ctx, `INSERT INTO import_job (id, user_id, name, source, url, status, sync, created_at, updated_at)
+-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, j.ID, j.UserID, j.Name, j.Source, j.URL, j.Status, j.Sync, now, now)
++	_, err := im.db.ExecContext(ctx, `INSERT INTO import_job (id, user_id, name, source, url, status, sync, target, created_at, updated_at)
++		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, j.ID, j.UserID, j.Name, j.Source, j.URL, j.Status, j.Sync, NormTarget(j.Target), now, now)
+ 	return err
+ }
+ 
+@@ -462,9 +481,14 @@ func (im *Importer) refresh(ctx context.Context, id string) {
+ 		}
+ 	}
+ 	if im.playlists != nil && len(ids) > 0 && (changed || job.PlaylistID == "" || job.Status != "done") {
+-		plsID, err := im.playlists.WritePlaylist(ctx, job.UserID, job.PlaylistID, job.Name, ids)
+-		if err == nil && plsID != job.PlaylistID {
+-			_, _ = im.db.ExecContext(ctx, `UPDATE import_job SET playlist_id = ? WHERE id = ?`, plsID, id)
++		if job.Target != TargetFavorites {
++			plsID, err := im.playlists.WritePlaylist(ctx, job.UserID, job.PlaylistID, job.Name, ids)
++			if err == nil && plsID != job.PlaylistID {
++				_, _ = im.db.ExecContext(ctx, `UPDATE import_job SET playlist_id = ? WHERE id = ?`, plsID, id)
++			}
++		}
++		if job.Target == TargetFavorites || job.Target == TargetBoth {
++			_ = im.playlists.StarSongs(ctx, job.UserID, ids) // retried on the next change
+ 		}
+ 	}
+ 	if !open && job.Status == "downloading" {
+@@ -474,11 +498,11 @@ func (im *Importer) refresh(ctx context.Context, id string) {
+ 	}
+ }
+ 
+-const jobColumns = `id, user_id, name, source, url, status, error, sync, playlist_id, created_at, updated_at`
++const jobColumns = `id, user_id, name, source, url, status, error, sync, playlist_id, target, created_at, updated_at`
+ 
+ func scanJob(row interface{ Scan(...any) error }) (*ImportJob, error) {
+ 	var j ImportJob
+-	err := row.Scan(&j.ID, &j.UserID, &j.Name, &j.Source, &j.URL, &j.Status, &j.Error, &j.Sync, &j.PlaylistID, &j.CreatedAt, &j.UpdatedAt)
++	err := row.Scan(&j.ID, &j.UserID, &j.Name, &j.Source, &j.URL, &j.Status, &j.Error, &j.Sync, &j.PlaylistID, &j.Target, &j.CreatedAt, &j.UpdatedAt)
+ 	if errors.Is(err, sql.ErrNoRows) {
+ 		return nil, ErrNotFound
+ 	}
+diff --git a/core/acquire/importer_test.go b/core/acquire/importer_test.go
+index 258571f8..037032cd 100644
+--- a/core/acquire/importer_test.go
++++ b/core/acquire/importer_test.go
+@@ -1,6 +1,8 @@
+ package acquire
+ 
+ import (
++	"archive/zip"
++	"bytes"
+ 	"context"
+ 	"database/sql"
+ 	"errors"
+@@ -32,8 +34,9 @@ type fakeReader struct{ list *ImportList }
+ func (r fakeReader) Read(context.Context, string) (*ImportList, error) { return r.list, nil }
+ 
+ type fakePlaylists struct {
+-	mu    sync.Mutex
+-	calls [][]string
++	mu      sync.Mutex
++	calls   [][]string
++	starred []string
+ }
+ 
+ func (p *fakePlaylists) WritePlaylist(_ context.Context, _, _, _ string, ids []string) (string, error) {
+@@ -43,6 +46,13 @@ func (p *fakePlaylists) WritePlaylist(_ context.Context, _, _, _ string, ids []s
+ 	return "pls-1", nil
+ }
+ 
++func (p *fakePlaylists) StarSongs(_ context.Context, _ string, ids []string) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.starred = append(p.starred, ids...)
++	return nil
++}
++
+ func (p *fakePlaylists) last() []string {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+@@ -55,11 +65,15 @@ func (p *fakePlaylists) last() []string {
+ func importDB(t *testing.T) *sql.DB {
+ 	t.Helper()
+ 	st := newSQLStore(t)
+-	mig, err := os.ReadFile("../../db/migrations/20261011000000_create_import_tables.sql")
+-	if err != nil {
+-		t.Fatal(err)
++	var up string
++	for _, f := range []string{"20261011000000_create_import_tables.sql", "20261023000000_add_import_job_target.sql"} {
++		mig, err := os.ReadFile("../../db/migrations/" + f)
++		if err != nil {
++			t.Fatal(err)
++		}
++		up += strings.Split(string(mig), "-- +goose Down")[0]
+ 	}
+-	if _, err := st.DB.Exec(strings.Split(string(mig), "-- +goose Down")[0] + `INSERT INTO user (id) VALUES ('u1');`); err != nil {
++	if _, err := st.DB.Exec(up + `INSERT INTO user (id) VALUES ('u1');`); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	return st.DB
+@@ -83,7 +97,7 @@ func TestImporterRequestsMissingSongsAndBuildsPlaylist(t *testing.T) {
+ 	svc.Start(ctx)
+ 	im.Start(ctx)
+ 
+-	job, err := im.CreateFromLink(ctx, "u1", "https://open.spotify.com/playlist/abc123", true)
++	job, err := im.CreateFromLink(ctx, "u1", "https://open.spotify.com/playlist/abc123", true, "")
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -104,8 +118,11 @@ func TestImporterRequestsMissingSongsAndBuildsPlaylist(t *testing.T) {
+ 	if ids := pls.last(); strings.Join(ids, ",") != "lib-mb-owned,lib-mb-new" {
+ 		t.Errorf("playlist = %v", ids)
+ 	}
+-	if got.PlaylistID != "pls-1" {
+-		t.Errorf("playlist id = %q", got.PlaylistID)
++	if got.PlaylistID != "pls-1" || got.Target != TargetPlaylist {
++		t.Errorf("playlist id = %q, target %q", got.PlaylistID, got.Target)
++	}
++	if len(pls.starred) != 0 {
++		t.Errorf("a playlist import starred %v", pls.starred)
+ 	}
+ 
+ 	// the user picks a match for the unknown song
+@@ -122,6 +139,74 @@ func TestImporterRequestsMissingSongsAndBuildsPlaylist(t *testing.T) {
+ 	}
+ }
+ 
++func TestImporterFavoritesStarsWithoutPlaylist(t *testing.T) {
++	db := importDB(t)
++	lib := &fakeLib{have: map[string]bool{"mb-owned": true}}
++	svc := NewService(fastConfig(true), fakeCatalog{}, []Source{&fakeSource{name: "yt", kind: KindTrack, lib: lib}}, NewSQLStore(db), lib)
++	pls := &fakePlaylists{}
++	im := NewImporter(svc, db, fakeMatcher{down: &atomic.Int32{}}, fakeReader{}, pls)
++	im.RefreshInterval = 20 * time.Millisecond
++	ctx, cancel := context.WithCancel(context.Background())
++	defer func() { cancel(); svc.Wait(); im.Wait() }()
++	svc.Start(ctx)
++	im.Start(ctx)
++
++	list := &ImportList{Name: "Liked Songs", Source: "file", Tracks: []ImportTrack{{Artist: "A", Title: "Owned"}, {Artist: "A", Title: "New"}}}
++	job, err := im.CreateFromList(ctx, "u1", list, TargetFavorites)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var got *ImportJob
++	for i := 0; i < 300; i++ {
++		got, _ = im.Job(ctx, job.ID)
++		if got != nil && got.Status == "done" {
++			break
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	if got.Status != "done" || got.Target != TargetFavorites || got.PlaylistID != "" || pls.last() != nil {
++		t.Fatalf("job = %+v, playlist calls %v", got, pls.calls)
++	}
++	pls.mu.Lock()
++	defer pls.mu.Unlock()
++	if s := strings.Join(pls.starred, ","); !strings.Contains(s, "lib-mb-owned") || !strings.Contains(s, "lib-mb-new") {
++		t.Errorf("starred = %v", pls.starred)
++	}
++}
++
++func TestParseImportFilesZip(t *testing.T) {
++	var buf bytes.Buffer
++	zw := zip.NewWriter(&buf)
++	for name, body := range map[string]string{
++		"liked_songs.csv":  "Track Name,Artist Name(s)\nA,B\n",
++		"road_trip.csv":    "Track Name,Artist Name(s)\nC,D;E\n",
++		"empty.csv":        "Track Name,Artist Name(s)\n",
++		"__MACOSX/._x.csv": "junk",
++		"cover.png":        "png",
++	} {
++		f, _ := zw.Create(name)
++		_, _ = f.Write([]byte(body))
++	}
++	_ = zw.Close()
++	lists, err := ParseImportFiles("spotify_playlists.zip", buf.Bytes())
++	if err != nil || len(lists) != 2 {
++		t.Fatalf("zip: %v %v", lists, err)
++	}
++	names := map[string]bool{}
++	for _, l := range lists {
++		names[l.Name] = true
++	}
++	if !names["liked songs"] || !names["road trip"] {
++		t.Errorf("names = %v", names)
++	}
++	if !IsLikedSongs("liked songs") || !IsLikedSongs("Músicas Curtidas") || IsLikedSongs("road trip") {
++		t.Error("IsLikedSongs")
++	}
++	if _, err := ParseImportFiles("x.zip", []byte("not a zip")); err == nil {
++		t.Error("bad zip accepted")
++	}
++}
++
+ func TestParseImportFile(t *testing.T) {
+ 	csvData := "\xef\xbb\xbf\"Track URI\",\"Track Name\",\"Artist Name(s)\",\"Album Name\",\"Duration (ms)\",\"ISRC\"\n" +
+ 		"\"spotify:track:1\",\"Zóio de Lula\",\"Charlie Brown Jr.\",\"Preço Curto\",\"236000\",\"BRX\"\n"
+diff --git a/core/seer/playlists.go b/core/seer/playlists.go
+index 65815907..2fa56187 100644
+--- a/core/seer/playlists.go
++++ b/core/seer/playlists.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"slices"
+ 
++	"github.com/Masterminds/squirrel"
+ 	"github.com/navidrome/navidrome/model"
+ 	"github.com/navidrome/navidrome/model/request"
+ )
+@@ -43,3 +44,32 @@ func (w *playlistWriter) WritePlaylist(ctx context.Context, userID, id, name str
+ 	}
+ 	return pls.ID, nil
+ }
++
++// StarSongs marks the songs as favorites of the user, leaving the ones already
++// starred alone (their date stays, and an unchanged list writes nothing).
++func (w *playlistWriter) StarSongs(ctx context.Context, userID string, ids []string) error {
++	user, err := w.ds.User().Get(ctx, userID)
++	if err != nil {
++		return err
++	}
++	ctx = request.WithUser(ctx, *user)
++	repo := w.ds.MediaFile()
++	for chunk := range slices.Chunk(ids, 500) {
++		mfs, err := repo.GetAll(ctx, model.QueryOptions{Filters: squirrel.Eq{"media_file.id": chunk}})
++		if err != nil {
++			return err
++		}
++		var todo []string
++		for _, mf := range mfs {
++			if !mf.Starred {
++				todo = append(todo, mf.ID)
++			}
++		}
++		if len(todo) > 0 {
++			if err := repo.SetStar(ctx, true, todo...); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
+diff --git a/db/migrations/20261023000000_add_import_job_target.sql b/db/migrations/20261023000000_add_import_job_target.sql
+new file mode 100644
+index 00000000..34c24422
+--- /dev/null
++++ b/db/migrations/20261023000000_add_import_job_target.sql
+@@ -0,0 +1,5 @@
++-- +goose Up
++ALTER TABLE import_job ADD COLUMN target VARCHAR(16) NOT NULL DEFAULT 'playlist';
++
++-- +goose Down
++ALTER TABLE import_job DROP COLUMN target;
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index c523fb88..c35409b8 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -33,8 +33,8 @@ type Service interface {
+ 
+ // Imports is the playlist importer used by the API.
+ type Imports interface {
+-	CreateFromLink(ctx context.Context, userID, link string, sync bool) (*acquire.ImportJob, error)
+-	CreateFromList(ctx context.Context, userID string, list *acquire.ImportList) (*acquire.ImportJob, error)
++	CreateFromLink(ctx context.Context, userID, link string, sync bool, target string) (*acquire.ImportJob, error)
++	CreateFromList(ctx context.Context, userID string, list *acquire.ImportList, target string) (*acquire.ImportJob, error)
+ 	Jobs(ctx context.Context, userID string) ([]acquire.ImportJob, error)
+ 	Job(ctx context.Context, id string) (*acquire.ImportJob, error)
+ 	Resolve(ctx context.Context, jobID string, position int, cat acquire.CatalogItem) (*acquire.ImportItem, error)
+@@ -426,43 +426,78 @@ func (api *Router) listImports(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, http.StatusOK, jobs)
+ }
+ 
+-// createImport takes {"url": "...", "sync": true} or a multipart "file" upload.
++// createImport takes {"url": "...", "sync": true, "target": "playlist"} or a
++// multipart upload of one or more "file" (CSV/JSON/TXT, or a .zip of them).
++// target is playlist, favorites, both or auto (files only: a "Liked Songs"
++// export goes to favorites, the others become playlists). Several files answer
++// with a list of jobs.
+ func (api *Router) createImport(w http.ResponseWriter, r *http.Request) {
+ 	user, _ := request.UserFrom(r.Context())
+ 	var job *acquire.ImportJob
+ 	var err error
+ 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
+-		r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+-		file, hdr, ferr := r.FormFile("file")
+-		if ferr != nil {
+-			http.Error(w, "file is required", http.StatusBadRequest)
+-			return
+-		}
+-		defer file.Close()
+-		data, rerr := io.ReadAll(file)
+-		if rerr != nil {
++		r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
++		if perr := r.ParseMultipartForm(16 << 20); perr != nil {
+ 			http.Error(w, "file too large", http.StatusBadRequest)
+ 			return
+ 		}
+-		list, perr := acquire.ParseImportFile(hdr.Filename, data)
+-		if perr != nil {
+-			http.Error(w, perr.Error(), http.StatusBadRequest)
++		var lists []*acquire.ImportList
++		for _, hdr := range r.MultipartForm.File["file"] {
++			file, ferr := hdr.Open()
++			if ferr != nil {
++				http.Error(w, "file is required", http.StatusBadRequest)
++				return
++			}
++			data, rerr := io.ReadAll(file)
++			file.Close()
++			if rerr != nil {
++				http.Error(w, "file too large", http.StatusBadRequest)
++				return
++			}
++			found, perr := acquire.ParseImportFiles(hdr.Filename, data)
++			if perr != nil {
++				http.Error(w, hdr.Filename+": "+perr.Error(), http.StatusBadRequest)
++				return
++			}
++			lists = append(lists, found...)
++		}
++		if len(lists) == 0 {
++			http.Error(w, "file is required", http.StatusBadRequest)
+ 			return
+ 		}
+-		if name := strings.TrimSpace(r.FormValue("name")); name != "" {
+-			list.Name = name
++		if name := strings.TrimSpace(r.FormValue("name")); name != "" && len(lists) == 1 {
++			lists[0].Name = name
++		}
++		target := r.FormValue("target")
++		var jobs []*acquire.ImportJob
++		for _, list := range lists {
++			t := target
++			if t == "auto" || t == "" {
++				t = acquire.TargetPlaylist
++				if acquire.IsLikedSongs(list.Name) {
++					t = acquire.TargetFavorites
++				}
++			}
++			if job, err = api.imp.CreateFromList(r.Context(), user.ID, list, t); err != nil {
++				break
++			}
++			jobs = append(jobs, job)
++		}
++		if err == nil && len(jobs) > 1 {
++			writeJSON(w, http.StatusCreated, jobs)
++			return
+ 		}
+-		job, err = api.imp.CreateFromList(r.Context(), user.ID, list)
+ 	} else {
+ 		var body struct {
+-			URL  string `json:"url"`
+-			Sync bool   `json:"sync"`
++			URL    string `json:"url"`
++			Sync   bool   `json:"sync"`
++			Target string `json:"target"`
+ 		}
+ 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
+ 			http.Error(w, "invalid body", http.StatusBadRequest)
+ 			return
+ 		}
+-		job, err = api.imp.CreateFromLink(r.Context(), user.ID, body.URL, body.Sync)
++		job, err = api.imp.CreateFromLink(r.Context(), user.ID, body.URL, body.Sync, body.Target)
+ 	}
+ 	if err != nil {
+ 		http.Error(w, err.Error(), http.StatusBadRequest)
+diff --git a/server/seerapi/seerapi_test.go b/server/seerapi/seerapi_test.go
+index 54508753..bda00fae 100644
+--- a/server/seerapi/seerapi_test.go
++++ b/server/seerapi/seerapi_test.go
+@@ -1,8 +1,10 @@
+ package seerapi
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"errors"
++	"mime/multipart"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+@@ -130,16 +132,16 @@ func TestSeerAPI(t *testing.T) {
+ 
+ type fakeImports struct{ jobs map[string]*acquire.ImportJob }
+ 
+-func (f *fakeImports) CreateFromLink(_ context.Context, userID, link string, sync bool) (*acquire.ImportJob, error) {
++func (f *fakeImports) CreateFromLink(_ context.Context, userID, link string, sync bool, target string) (*acquire.ImportJob, error) {
+ 	if link == "bad" {
+ 		return nil, acquire.ErrUnsupportedLink
+ 	}
+-	j := &acquire.ImportJob{ID: "j1", UserID: userID, URL: link, Sync: sync}
++	j := &acquire.ImportJob{ID: "j1", UserID: userID, URL: link, Sync: sync, Target: target}
+ 	f.jobs[j.ID] = j
+ 	return j, nil
+ }
+-func (f *fakeImports) CreateFromList(_ context.Context, userID string, l *acquire.ImportList) (*acquire.ImportJob, error) {
+-	j := &acquire.ImportJob{ID: "j2", UserID: userID, Name: l.Name, Total: len(l.Tracks)}
++func (f *fakeImports) CreateFromList(_ context.Context, userID string, l *acquire.ImportList, target string) (*acquire.ImportJob, error) {
++	j := &acquire.ImportJob{ID: "j2-" + l.Name, UserID: userID, Name: l.Name, Total: len(l.Tracks), Target: target}
+ 	f.jobs[j.ID] = j
+ 	return j, nil
+ }
+@@ -166,6 +168,29 @@ func TestSeerImportsAPI(t *testing.T) {
+ 	if w := do(t, api, user, "POST", "/imports", `{"url":"https://open.spotify.com/playlist/x","sync":true}`); w.Code != 201 || !imp.jobs["j1"].Sync {
+ 		t.Errorf("create: %d %s", w.Code, w.Body)
+ 	}
++	if w := do(t, api, user, "POST", "/imports", `{"url":"https://open.spotify.com/playlist/y","target":"both"}`); w.Code != 201 || imp.jobs["j1"].Target != "both" {
++		t.Errorf("create with target: %d %s", w.Code, w.Body)
++	}
++	// two Exportify CSVs in one upload, "auto": Liked Songs become favorites
++	var buf bytes.Buffer
++	mw := multipart.NewWriter(&buf)
++	for name, body := range map[string]string{"liked_songs.csv": "Track Name,Artist Name(s)\nA,B\n", "road_trip.csv": "Track Name,Artist Name(s)\nC,D\n"} {
++		fw, _ := mw.CreateFormFile("file", name)
++		_, _ = fw.Write([]byte(body))
++	}
++	_ = mw.WriteField("target", "auto")
++	_ = mw.Close()
++	r := httptest.NewRequest("POST", "/imports", &buf)
++	r.Header.Set("Content-Type", mw.FormDataContentType())
++	r = r.WithContext(request.WithUser(r.Context(), user))
++	w := httptest.NewRecorder()
++	api.ServeHTTP(w, r)
++	if w.Code != 201 || !strings.HasPrefix(strings.TrimSpace(w.Body.String()), "[") ||
++		imp.jobs["j2-liked songs"].Target != "favorites" || imp.jobs["j2-road trip"].Target != "playlist" {
++		t.Errorf("multi upload: %d %s", w.Code, w.Body)
++	}
++	delete(imp.jobs, "j2-liked songs")
++	delete(imp.jobs, "j2-road trip")
+ 	if w := do(t, api, user, "POST", "/imports", `{"url":"bad"}`); w.Code != 400 {
+ 		t.Errorf("bad link: %d", w.Code)
+ 	}
+-- 
+2.47.3
+

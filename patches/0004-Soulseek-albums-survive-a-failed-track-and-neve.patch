@@ -1,0 +1,665 @@
+From 102e3da7a0075e569b93f4749f9cc5541d65dbf5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 18:13:10 +0000
+Subject: [PATCH 04/10] Seer: Soulseek albums survive a failed track and never
+ mix releases
+
+A single failed transfer (size mismatch, peer refused) no longer fails the
+whole album: the track is retried once and then fetched from another peer
+that has the same album. The album is imported when at least half of it
+arrived, with the missing tracks noted on the request. Albums are picked per
+folder and in one format, so tracks of other releases by the same peer are
+not pulled in. Stale transfer records are cleared before queueing, so a retry
+doesn't read the previous attempt's state.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ SEER.md                              |   5 +-
+ core/acquire/model.go                |   3 +
+ core/acquire/service.go              |   4 +-
+ core/acquire/source_soulseek.go      | 318 ++++++++++++++++++++++-----
+ core/acquire/source_soulseek_test.go | 141 ++++++++++++
+ ui/src/seer/RequestsList.jsx         |  10 +-
+ 6 files changed, 425 insertions(+), 56 deletions(-)
+
+diff --git a/SEER.md b/SEER.md
+index eaf17e2..457221a 100644
+--- a/SEER.md
++++ b/SEER.md
+@@ -82,7 +82,10 @@ cause is in the server log, "Seer: MusicBrainz request failed").
+ 2. Sources are tried in order. YouTube files are named and tagged from
+    MusicBrainz (title, artist, album, recording MBID) with ffmpeg, so the scan
+    matches them by MBID. Soulseek downloads are polled until complete and moved
+-   to `DestFolder/Artist/Album/`. Lidarr is asked to search and imports on its own.
++   to `DestFolder/Artist/Album/`. Albums come from a single folder (never mixing
++   releases, one format); a track that fails is retried once and then taken from
++   another peer's copy of the album. If at least half the album arrived it is
++   imported and the missing tracks are listed on the request; otherwise it fails. Lidarr is asked to search and imports on its own.
+ 3. A watcher (not the workers) waits for the library scan to find the item,
+    rescanning every 2 minutes, and fails the request after `ImportTimeout`.
+ 
+diff --git a/core/acquire/model.go b/core/acquire/model.go
+index 9bb9f30..161faf8 100644
+--- a/core/acquire/model.go
++++ b/core/acquire/model.go
+@@ -87,4 +87,7 @@ type Result struct {
+ 	// (Lidarr) that will import the files on its own; the Service then waits
+ 	// for the library scan to find the item instead of triggering one itself.
+ 	Async bool
++	// Warning is shown on the request when it succeeded only in part
++	// (e.g. an album with tracks that could not be downloaded).
++	Warning string
+ }
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index b04c9e0..e4fd8c5 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -302,7 +302,7 @@ func (s *Service) process(ctx context.Context, id string) {
+ 			errs = append(errs, fmt.Sprintf("%s: %v", src.Name(), err))
+ 			continue // fall through to the next source
+ 		}
+-		s.setStatus(ctx, req, StatusImporting, "")
++		s.setStatus(ctx, req, StatusImporting, res.Warning)
+ 		if !res.Async {
+ 			go s.rescan(ctx)
+ 		}
+@@ -343,7 +343,7 @@ func (s *Service) checkImports(ctx context.Context) {
+ 		item := CatalogItem{Kind: req.Kind, MBID: req.MBID, Artist: req.Artist, Album: req.Album, Title: req.Title}
+ 		switch {
+ 		case s.matched(ctx, item):
+-			s.setStatus(ctx, req, StatusAvailable, "")
++			s.setStatus(ctx, req, StatusAvailable, req.Error) // keeps a partial-download warning
+ 		case time.Since(req.UpdatedAt) > s.cfg.ImportTimeout:
+ 			s.setStatus(ctx, req, StatusFailed, "timed out waiting for the library scan")
+ 		default:
+diff --git a/core/acquire/source_soulseek.go b/core/acquire/source_soulseek.go
+index 6887351..98d3180 100644
+--- a/core/acquire/source_soulseek.go
++++ b/core/acquire/source_soulseek.go
+@@ -12,6 +12,8 @@ import (
+ 	"net/url"
+ 	"os"
+ 	"path/filepath"
++	"regexp"
++	"sort"
+ 	"strings"
+ 	"time"
+ )
+@@ -93,7 +95,7 @@ func (s *Soulseek) do(ctx context.Context, method, path string, body, out any) e
+ func (s *Soulseek) Fetch(ctx context.Context, req Request, destDir string) (Result, error) {
+ 	text := strings.TrimSpace(req.Artist + " " + req.Title)
+ 	if req.Kind == KindAlbum {
+-		text = strings.TrimSpace(req.Artist + " " + req.Album)
++		text = strings.TrimSpace(req.Artist + " " + albumOf(req))
+ 	}
+ 
+ 	var search struct {
+@@ -129,31 +131,146 @@ func (s *Soulseek) Fetch(ctx context.Context, req Request, destDir string) (Resu
+ 		return Result{}, err
+ 	}
+ 
+-	user, files := s.pick(req, responses)
+-	if len(files) == 0 {
++	cands := s.candidates(req, responses)
++	if len(cands) == 0 {
+ 		return Result{}, errors.New("no matching files on Soulseek")
+ 	}
+-	if err := s.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+url.PathEscape(user), files, nil); err != nil {
+-		return Result{}, err
++	if req.Kind == KindTrack {
++		return s.fetchTrack(ctx, req, cands, destDir)
++	}
++	return s.fetchAlbum(ctx, req, cands, destDir)
++}
++
++// fetchTrack tries the best peers in turn until one delivers the file.
++func (s *Soulseek) fetchTrack(ctx context.Context, req Request, cands []slskCandidate, destDir string) (Result, error) {
++	var errs []string
++	for i, c := range cands {
++		if i == 3 {
++			break
++		}
++		ok, failed, err := s.download(ctx, c.User, c.Files[:1])
++		if err != nil {
++			return Result{}, err
++		}
++		if len(ok) == 1 {
++			paths, err := s.importFiles(req, ok, destDir)
++			if err != nil {
++				return Result{}, err
++			}
++			return Result{Paths: paths}, nil
++		}
++		errs = append(errs, failed...)
+ 	}
+-	if err := s.waitTransfers(ctx, user, files); err != nil {
++	return Result{}, errors.New(strings.Join(errs, "; "))
++}
++
++// fetchAlbum downloads the best matching folder. Tracks that fail are retried
++// from other peers that have the same album; the album is imported as long as
++// most of it arrived, with the missing tracks reported in Result.Warning.
++func (s *Soulseek) fetchAlbum(ctx context.Context, req Request, cands []slskCandidate, destDir string) (Result, error) {
++	main := cands[0]
++	ok, failedMsgs, err := s.download(ctx, main.User, main.Files)
++	if err != nil {
+ 		return Result{}, err
+ 	}
+-	paths, err := s.importFiles(req, files, destDir)
++	got := map[string]bool{}
++	for _, f := range ok {
++		got[trackKey(f.Filename)] = true
++	}
++	var missing []slskFile
++	for _, f := range main.Files {
++		if !got[trackKey(f.Filename)] {
++			missing = append(missing, f)
++		}
++	}
++	alts := []slskCandidate{main} // a second try often works (e.g. a size mismatch)
++	for _, c := range cands[1:] {
++		if c.matchesAlbum || !main.matchesAlbum {
++			alts = append(alts, c)
++		}
++	}
++	for _, f := range missing {
++		key := trackKey(f.Filename)
++		for _, alt := range alts {
++			repl, found := alt.find(key)
++			if !found {
++				continue
++			}
++			okAlt, _, err := s.download(ctx, alt.User, []slskFile{repl})
++			if err != nil {
++				return Result{}, err
++			}
++			if len(okAlt) == 1 {
++				ok = append(ok, okAlt[0])
++				got[key] = true
++				break
++			}
++		}
++	}
++	var stillMissing []string
++	for _, f := range missing {
++		if !got[trackKey(f.Filename)] {
++			stillMissing = append(stillMissing, remoteBase(f.Filename))
++		}
++	}
++	if len(ok) == 0 || len(ok)*2 < len(main.Files) {
++		return Result{}, fmt.Errorf("only %d of %d tracks downloaded: %s", len(ok), len(main.Files), strings.Join(failedMsgs, "; "))
++	}
++	paths, err := s.importFiles(req, ok, destDir)
+ 	if err != nil {
+ 		return Result{}, err
+ 	}
+-	return Result{Paths: paths}, nil
++	res := Result{Paths: paths}
++	if len(stillMissing) > 0 {
++		res.Warning = fmt.Sprintf("%d of %d tracks could not be downloaded: %s",
++			len(stillMissing), len(main.Files), strings.Join(stillMissing, ", "))
++	}
++	return res, nil
++}
++
++// download queues files from one peer and waits for them. It returns the files
++// that arrived and a message for each one that did not; err is only set when
++// slskd can't be reached or the server is shutting down.
++func (s *Soulseek) download(ctx context.Context, user string, files []slskFile) ([]slskFile, []string, error) {
++	s.forget(ctx, user, files)
++	if err := s.do(ctx, http.MethodPost, "/api/v0/transfers/downloads/"+url.PathEscape(user), files, nil); err != nil {
++		return nil, []string{fmt.Sprintf("%s: %v", user, err)}, nil
++	}
++	return s.waitTransfers(ctx, user, files)
+ }
+ 
+ type slskTransfer struct {
++	ID       string `json:"id"`
+ 	Filename string `json:"filename"`
+ 	State    string `json:"state"`
+ }
+ 
+-// waitTransfers polls slskd until every requested file finished. Any file
+-// that ends in a non-successful state fails the whole fetch.
+-func (s *Soulseek) waitTransfers(ctx context.Context, user string, files []slskFile) error {
++// forget removes finished transfers of these files left by earlier attempts,
++// so their old state is not mistaken for the new download's.
++func (s *Soulseek) forget(ctx context.Context, user string, files []slskFile) {
++	var st struct {
++		Directories []struct {
++			Files []slskTransfer `json:"files"`
++		} `json:"directories"`
++	}
++	if err := s.do(ctx, http.MethodGet, "/api/v0/transfers/downloads/"+url.PathEscape(user), nil, &st); err != nil {
++		return
++	}
++	want := map[string]bool{}
++	for _, f := range files {
++		want[f.Filename] = true
++	}
++	for _, d := range st.Directories {
++		for _, t := range d.Files {
++			if want[t.Filename] && t.ID != "" && strings.HasPrefix(t.State, "Completed") {
++				_ = s.do(ctx, http.MethodDelete, "/api/v0/transfers/downloads/"+url.PathEscape(user)+"/"+url.PathEscape(t.ID)+"?remove=true", nil, nil)
++			}
++		}
++	}
++}
++
++// waitTransfers polls slskd until every requested file finished or the timeout passes.
++func (s *Soulseek) waitTransfers(ctx context.Context, user string, files []slskFile) ([]slskFile, []string, error) {
+ 	timeout, every := s.Timeout, s.PollInterval
+ 	if timeout <= 0 {
+ 		timeout = 30 * time.Minute
+@@ -161,16 +278,34 @@ func (s *Soulseek) waitTransfers(ctx context.Context, user string, files []slskF
+ 	if every <= 0 {
+ 		every = 5 * time.Second
+ 	}
+-	ctx, cancel := context.WithTimeout(ctx, timeout)
++	wctx, cancel := context.WithTimeout(ctx, timeout)
+ 	defer cancel()
+-	want := map[string]bool{}
++	state := map[string]string{}
+ 	for _, f := range files {
+-		want[f.Filename] = true
++		state[f.Filename] = ""
++	}
++	result := func() ([]slskFile, []string) {
++		var ok []slskFile
++		var failed []string
++		for _, f := range files {
++			switch st := state[f.Filename]; {
++			case strings.Contains(st, "Succeeded"):
++				ok = append(ok, f)
++			case st == "":
++				failed = append(failed, fmt.Sprintf("%s did not finish in time", remoteBase(f.Filename)))
++			default:
++				failed = append(failed, fmt.Sprintf("transfer of %s ended as %q", remoteBase(f.Filename), st))
++			}
++		}
++		return ok, failed
+ 	}
+ 	for {
+ 		select {
+ 		case <-ctx.Done():
+-			return fmt.Errorf("download did not finish: %w", ctx.Err())
++			return nil, nil, ctx.Err()
++		case <-wctx.Done():
++			ok, failed := result()
++			return ok, failed, nil
+ 		case <-time.After(every):
+ 		}
+ 		var st struct {
+@@ -178,23 +313,28 @@ func (s *Soulseek) waitTransfers(ctx context.Context, user string, files []slskF
+ 				Files []slskTransfer `json:"files"`
+ 			} `json:"directories"`
+ 		}
+-		if err := s.do(ctx, http.MethodGet, "/api/v0/transfers/downloads/"+url.PathEscape(user), nil, &st); err != nil {
+-			return err
++		if err := s.do(wctx, http.MethodGet, "/api/v0/transfers/downloads/"+url.PathEscape(user), nil, &st); err != nil {
++			if ctx.Err() != nil {
++				return nil, nil, ctx.Err()
++			}
++			continue // slskd hiccup: keep polling until the timeout
+ 		}
+-		done := 0
++		pending := 0
+ 		for _, d := range st.Directories {
+ 			for _, t := range d.Files {
+-				if !want[t.Filename] || !strings.HasPrefix(t.State, "Completed") {
+-					continue
+-				}
+-				if !strings.Contains(t.State, "Succeeded") {
+-					return fmt.Errorf("transfer of %s ended as %q", remoteBase(t.Filename), t.State)
++				if _, want := state[t.Filename]; want && strings.HasPrefix(t.State, "Completed") {
++					state[t.Filename] = t.State
+ 				}
+-				done++
+ 			}
+ 		}
+-		if done >= len(want) {
+-			return nil
++		for _, v := range state {
++			if v == "" {
++				pending++
++			}
++		}
++		if pending == 0 {
++			ok, failed := result()
++			return ok, failed, nil
+ 		}
+ 	}
+ }
+@@ -288,40 +428,116 @@ func moveFile(src, dst string) error {
+ 	return os.Remove(src)
+ }
+ 
+-// pick chooses the best peer: audio files matching the title (track) or the
+-// most complete folder (album), preferring free slots and lossless/high bitrate.
+-func (s *Soulseek) pick(req Request, rs []slskResponse) (string, []slskFile) {
+-	bestScore, bestUser := -1, ""
+-	var best []slskFile
+-	want := strings.ToLower(req.Title)
++var audioExts = map[string]bool{".flac": true, ".mp3": true, ".m4a": true, ".ogg": true, ".opus": true}
++
++// slskCandidate is one peer's folder (album) or file (track) that could fulfil a request.
++type slskCandidate struct {
++	User  string
++	Files []slskFile
++	score int
++	// matchesAlbum: the folder path names the requested album.
++	matchesAlbum bool
++}
++
++func (c slskCandidate) find(key string) (slskFile, bool) {
++	for _, f := range c.Files {
++		if trackKey(f.Filename) == key {
++			return f, true
++		}
++	}
++	return slskFile{}, false
++}
++
++func albumOf(req Request) string {
++	if req.Album != "" {
++		return req.Album
++	}
++	return req.Title
++}
++
++// candidates ranks what the peers offer, best first. Albums are handled per
++// folder, so one download never mixes tracks of different releases; a folder
++// whose path names the album wins over one that doesn't.
++func (s *Soulseek) candidates(req Request, rs []slskResponse) []slskCandidate {
++	var out []slskCandidate
++	album := fold(albumOf(req))
+ 	for _, r := range rs {
+-		var cand []slskFile
++		folders := map[string][]slskFile{}
++		var order []string
+ 		for _, f := range r.Files {
+-			ext := strings.ToLower(filepath.Ext(f.Filename))
+-			if ext != ".flac" && ext != ".mp3" && ext != ".m4a" && ext != ".ogg" && ext != ".opus" {
++			if !audioExts[strings.ToLower(filepath.Ext(f.Filename))] {
+ 				continue
+ 			}
+-			if req.Kind == KindTrack && !strings.Contains(strings.ToLower(f.Filename), want) {
++			if req.Kind == KindTrack && !strings.Contains(fold(remoteBase(f.Filename)), fold(req.Title)) {
+ 				continue
+ 			}
+-			cand = append(cand, f)
+-		}
+-		if len(cand) == 0 {
+-			continue
+-		}
+-		if req.Kind == KindTrack {
+-			cand = cand[:1]
++			dir := f.Filename[:len(f.Filename)-len(remoteBase(f.Filename))]
++			if _, seen := folders[dir]; !seen {
++				order = append(order, dir)
++			}
++			folders[dir] = append(folders[dir], f)
+ 		}
+-		score := len(cand)
+-		if r.HasFreeSlot {
+-			score += 100
++		for _, dir := range order {
++			files := s.oneFormat(folders[dir])
++			c := slskCandidate{User: r.Username, Files: files}
++			if r.HasFreeSlot {
++				c.score += 100
++			}
++			if s.PreferFLAC && strings.EqualFold(filepath.Ext(files[0].Filename), ".flac") {
++				c.score += 50
++			}
++			if album != "" && strings.Contains(fold(dir), album) {
++				c.score += 300
++				c.matchesAlbum = true
++			}
++			if req.Kind == KindAlbum {
++				if len(files) > 40 { // a whole discography, not an album
++					continue
++				}
++				c.score += len(files)
++			} else {
++				c.Files = files[:1]
++			}
++			out = append(out, c)
+ 		}
+-		if s.PreferFLAC && strings.HasSuffix(strings.ToLower(cand[0].Filename), ".flac") {
+-			score += 50
++	}
++	sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
++	return out
++}
++
++// oneFormat keeps a single format when a folder has the same album twice (FLAC and MP3).
++func (s *Soulseek) oneFormat(files []slskFile) []slskFile {
++	count := map[string]int{}
++	for _, f := range files {
++		count[strings.ToLower(filepath.Ext(f.Filename))]++
++	}
++	if len(count) < 2 {
++		return files
++	}
++	keep, best := "", -1
++	for ext, n := range count {
++		if (s.PreferFLAC && ext == ".flac") || (n > best && !(s.PreferFLAC && keep == ".flac")) {
++			keep, best = ext, n
+ 		}
+-		if score > bestScore {
+-			bestScore, bestUser, best = score, r.Username, cand
++	}
++	var out []slskFile
++	for _, f := range files {
++		if strings.ToLower(filepath.Ext(f.Filename)) == keep {
++			out = append(out, f)
+ 		}
+ 	}
+-	return bestUser, best
++	return out
++}
++
++var leadingNumber = regexp.MustCompile(`^[\d\s._-]+`)
++
++// trackKey identifies a track across peers that name files differently:
++// "Artist - Album - 03 - Não É Sério.flac" and "03. nao e serio.mp3" give "naoeserio".
++func trackKey(name string) string {
++	base := remoteBase(name)
++	base = strings.TrimSuffix(base, filepath.Ext(base))
++	if i := strings.LastIndex(base, " - "); i >= 0 {
++		base = base[i+3:]
++	}
++	return fold(leadingNumber.ReplaceAllString(base, ""))
+ }
+diff --git a/core/acquire/source_soulseek_test.go b/core/acquire/source_soulseek_test.go
+index 8c68594..2fa0b56 100644
+--- a/core/acquire/source_soulseek_test.go
++++ b/core/acquire/source_soulseek_test.go
+@@ -8,6 +8,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+@@ -33,6 +34,12 @@ func fakeSlskd(t *testing.T, dlDir, finalState string) *httptest.Server {
+ 				{Username: "slow", Files: []slskFile{{Filename: `x\Song.mp3`}}},
+ 				{Username: "peer", HasFreeSlot: true, Files: []slskFile{{Filename: remote, Size: 4}, {Filename: `x\cover.jpg`}}},
+ 			})
++		case r.URL.Path == "/api/v0/transfers/downloads/slow":
++			if r.Method == http.MethodGet {
++				_ = json.NewEncoder(w).Encode(map[string]any{"directories": []any{
++					map[string]any{"files": []slskTransfer{{Filename: `x\Song.mp3`, State: "Completed, Rejected"}}},
++				}})
++			}
+ 		case r.Method == http.MethodPost && r.URL.Path == "/api/v0/transfers/downloads/peer":
+ 			var files []slskFile
+ 			_ = json.NewDecoder(r.Body).Decode(&files)
+@@ -88,6 +95,140 @@ func TestSoulseekFailedTransfer(t *testing.T) {
+ 	}
+ }
+ 
++// albumSlskd emulates peers offering folders. fail lists "user|file" pairs whose
++// transfers always fail; everything else downloads at once.
++func albumSlskd(t *testing.T, dlDir string, peers []slskResponse, fail map[string]bool) (*httptest.Server, *[]string) {
++	var mu sync.Mutex
++	var queued []string
++	done := map[string]map[string]string{} // user -> file -> state
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		defer mu.Unlock()
++		const dl = "/api/v0/transfers/downloads/"
++		switch {
++		case r.Method == http.MethodPost && r.URL.Path == "/api/v0/searches":
++			_ = json.NewEncoder(w).Encode(map[string]string{"id": "s1"})
++		case r.URL.Path == "/api/v0/searches/s1":
++			_ = json.NewEncoder(w).Encode(map[string]bool{"isComplete": true})
++		case r.URL.Path == "/api/v0/searches/s1/responses":
++			_ = json.NewEncoder(w).Encode(peers)
++		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, dl):
++			user := strings.TrimPrefix(r.URL.Path, dl)
++			var files []slskFile
++			_ = json.NewDecoder(r.Body).Decode(&files)
++			if done[user] == nil {
++				done[user] = map[string]string{}
++			}
++			for _, f := range files {
++				if _, exists := done[user][f.Filename]; exists {
++					w.WriteHeader(http.StatusConflict) // slskd refuses a file it still tracks
++					return
++				}
++				queued = append(queued, user+"|"+f.Filename)
++				if fail[user+"|"+f.Filename] {
++					done[user][f.Filename] = "Completed, Errored"
++					continue
++				}
++				done[user][f.Filename] = "Completed, Succeeded"
++				dir := filepath.Join(dlDir, remoteParent(f.Filename))
++				_ = os.MkdirAll(dir, 0o755)
++				_ = os.WriteFile(filepath.Join(dir, remoteBase(f.Filename)), []byte(user), 0o644)
++			}
++		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, dl):
++			var ts []slskTransfer
++			for f, st := range done[strings.TrimPrefix(r.URL.Path, dl)] {
++				ts = append(ts, slskTransfer{ID: f, Filename: f, State: st})
++			}
++			_ = json.NewEncoder(w).Encode(map[string]any{"directories": []any{map[string]any{"files": ts}}})
++		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, dl):
++			parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, dl), "/", 2)
++			delete(done[parts[0]], parts[1])
++		default:
++			t.Errorf("unexpected call %s %s", r.Method, r.URL.Path)
++		}
++	}))
++	t.Cleanup(srv.Close)
++	return srv, &queued
++}
++
++func TestSoulseekAlbumRetriesAndKeepsOneRelease(t *testing.T) {
++	dl, lib := t.TempDir(), t.TempDir()
++	peers := []slskResponse{
++		{Username: "a", HasFreeSlot: true, Files: []slskFile{
++			{Filename: `Musicas\CBJR\2004 - Tamo Aí na Atividade\CBJR - Tamo aí na atividade - 01 - Um.flac`},
++			{Filename: `Musicas\CBJR\2004 - Tamo Aí na Atividade\CBJR - Tamo aí na atividade - 02 - Dois.flac`},
++			{Filename: `Musicas\CBJR\2004 - Tamo Aí na Atividade\CBJR - Tamo aí na atividade - 02 - Dois.mp3`},
++			{Filename: `Musicas\CBJR\2004 - Tamo Aí na Atividade\CBJR - Tamo aí na atividade - 03 - Tres.flac`},
++			{Filename: `Musicas\CBJR\2020 - Em casa\CBJR - Em casa - 07 - Tamo aí na atividade.mp3`},
++		}},
++		{Username: "b", Files: []slskFile{
++			{Filename: `b\Tamo Ai na Atividade (2004)\02. Dois.mp3`},
++		}},
++		{Username: "c", Files: []slskFile{
++			{Filename: `c\Random\03 - Tres.mp3`},
++		}},
++	}
++	fail := map[string]bool{
++		`a|Musicas\CBJR\2004 - Tamo Aí na Atividade\CBJR - Tamo aí na atividade - 02 - Dois.flac`: true,
++		`a|Musicas\CBJR\2004 - Tamo Aí na Atividade\CBJR - Tamo aí na atividade - 03 - Tres.flac`: true,
++	}
++	srv, queued := albumSlskd(t, dl, peers, fail)
++	s := &Soulseek{BaseURL: srv.URL, APIKey: "key", DownloadDir: dl, On: true, PollInterval: time.Millisecond, PreferFLAC: true}
++	s.searchPoll = time.Millisecond
++
++	res, err := s.Fetch(context.Background(), Request{Kind: KindAlbum, Artist: "CBJR", Title: "Tamo aí na atividade"}, lib)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(res.Paths) != 2 || !strings.Contains(res.Warning, "03 - Tres.flac") {
++		t.Fatalf("paths %v, warning %q", res.Paths, res.Warning)
++	}
++	for _, q := range *queued {
++		if strings.Contains(q, "Em casa") || strings.HasSuffix(q, "Dois.mp3") && strings.HasPrefix(q, "a|") || strings.HasPrefix(q, "c|") {
++			t.Errorf("queued a file from the wrong release or format: %s", q)
++		}
++	}
++	retries := 0
++	for _, q := range *queued {
++		if strings.HasSuffix(q, "02 - Dois.flac") {
++			retries++
++		}
++	}
++	if retries != 2 {
++		t.Errorf("failed track should be retried once from the same peer, queued %d times", retries)
++	}
++	if _, err := os.Stat(filepath.Join(lib, "CBJR", "Tamo aí na atividade", "02. Dois.mp3")); err != nil {
++		t.Errorf("replacement from another peer not imported: %v", err)
++	}
++}
++
++func TestSoulseekAlbumFailsWhenMostTracksMissing(t *testing.T) {
++	dl := t.TempDir()
++	peers := []slskResponse{{Username: "a", Files: []slskFile{
++		{Filename: `x\Album\01 - One.flac`}, {Filename: `x\Album\02 - Two.flac`}, {Filename: `x\Album\03 - Three.flac`},
++	}}}
++	fail := map[string]bool{`a|x\Album\02 - Two.flac`: true, `a|x\Album\03 - Three.flac`: true}
++	srv, _ := albumSlskd(t, dl, peers, fail)
++	s := &Soulseek{BaseURL: srv.URL, APIKey: "key", DownloadDir: dl, On: true, PollInterval: time.Millisecond}
++	s.searchPoll = time.Millisecond
++	_, err := s.Fetch(context.Background(), Request{Kind: KindAlbum, Artist: "Artist", Title: "Album"}, t.TempDir())
++	if err == nil || !strings.Contains(err.Error(), "only 1 of 3") {
++		t.Fatalf("expected a failure, got %v", err)
++	}
++}
++
++func TestTrackKey(t *testing.T) {
++	for in, want := range map[string]string{
++		`a\CBJR - Nadando - 03 - Não é sério.flac`: "naoeserio",
++		`b\03. Nao E Serio.mp3`:                    "naoeserio",
++		`c\Não é sério.ogg`:                        "naoeserio",
++	} {
++		if got := trackKey(in); got != want {
++			t.Errorf("trackKey(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
+ func TestSanitizeAndEnsureInside(t *testing.T) {
+ 	for in, want := range map[string]string{"../../etc": "_.._etc", "..": "Unknown", " AC/DC ": "AC_DC", ".hidden": "hidden", "": "Unknown"} {
+ 		if got := sanitize(in); got != want {
+diff --git a/ui/src/seer/RequestsList.jsx b/ui/src/seer/RequestsList.jsx
+index 6165847..c7091f7 100644
+--- a/ui/src/seer/RequestsList.jsx
++++ b/ui/src/seer/RequestsList.jsx
+@@ -149,8 +149,14 @@ export const RequestsList = ({ requests, onApprove }) => {
+                   .filter(Boolean)
+                   .join(' · ')}
+               </div>
+-              {r.status === 'failed' && r.error && (
+-                <div className={classes.error} title={r.error}>
++              {r.error && (
++                <div
++                  className={classes.error}
++                  style={
++                    r.status === 'failed' ? undefined : { color: '#f5a524' }
++                  }
++                  title={r.error}
++                >
+                   {r.error}
+                 </div>
+               )}
+-- 
+2.43.0
+

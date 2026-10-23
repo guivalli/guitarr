@@ -1,0 +1,4031 @@
+From f98c9e9fb377659b291a8d8cded33b116f74e84f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 17:24:24 +0000
+Subject: [PATCH 03/10] Seer: artist-first search, discography pages and a new
+ catalog UI
+
+Searching an artist's name now returns that artist, their albums and songs
+instead of titles that contain the words. MusicBrainz calls are retried on
+503/429 and cached for 10 minutes. New endpoints browse an artist's
+discography and an album's tracklist; requests keep a cover id.
+
+The Requests page is redesigned with Cover Art Archive covers: best result,
+songs, artists and albums on search, artist and album pages, and a
+requests list with live status pills.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ SEER.md                                       |  19 +-
+ core/acquire/catalog_musicbrainz.go           | 540 ++++++++++++++++--
+ core/acquire/catalog_musicbrainz_test.go      | 115 ++++
+ core/acquire/model.go                         |  27 +-
+ core/acquire/service.go                       |  45 +-
+ core/acquire/service_test.go                  |   6 +
+ core/acquire/store_sql.go                     |   8 +-
+ core/acquire/store_sql_test.go                |  14 +-
+ core/seer/library.go                          |  23 +-
+ ...261010170000_add_acquire_request_cover.sql |   5 +
+ resources/i18n/pt-br.json                     |  57 +-
+ server/seerapi/seerapi.go                     |  38 +-
+ server/seerapi/seerapi_test.go                |  19 +
+ ui/src/i18n/en.json                           |  57 +-
+ ui/src/seer/AlbumView.jsx                     | 151 +++++
+ ui/src/seer/ArtistView.jsx                    | 144 +++++
+ ui/src/seer/CatalogResults.jsx                |  97 ----
+ ui/src/seer/RequestsList.jsx                  | 181 ++++++
+ ui/src/seer/RequestsTable.jsx                 |  87 ---
+ ui/src/seer/SearchView.jsx                    | 262 +++++++++
+ ui/src/seer/Seer.test.jsx                     | 106 +++-
+ ui/src/seer/SeerPage.jsx                      | 329 ++++++++---
+ ui/src/seer/StatusChip.jsx                    |  60 +-
+ ui/src/seer/actions.jsx                       | 222 +++++++
+ ui/src/seer/api.js                            |   9 +
+ ui/src/seer/artwork.jsx                       | 161 ++++++
+ ui/src/seer/components.jsx                    | 388 +++++++++++++
+ ui/src/seer/states.jsx                        | 172 ++++++
+ ui/src/seer/useCatalog.js                     |  51 ++
+ 29 files changed, 2987 insertions(+), 406 deletions(-)
+ create mode 100644 core/acquire/catalog_musicbrainz_test.go
+ create mode 100644 db/migrations/20261010170000_add_acquire_request_cover.sql
+ create mode 100644 ui/src/seer/AlbumView.jsx
+ create mode 100644 ui/src/seer/ArtistView.jsx
+ delete mode 100644 ui/src/seer/CatalogResults.jsx
+ create mode 100644 ui/src/seer/RequestsList.jsx
+ delete mode 100644 ui/src/seer/RequestsTable.jsx
+ create mode 100644 ui/src/seer/SearchView.jsx
+ create mode 100644 ui/src/seer/actions.jsx
+ create mode 100644 ui/src/seer/artwork.jsx
+ create mode 100644 ui/src/seer/components.jsx
+ create mode 100644 ui/src/seer/states.jsx
+ create mode 100644 ui/src/seer/useCatalog.js
+
+diff --git a/SEER.md b/SEER.md
+index e32dfae..eaf17e2 100644
+--- a/SEER.md
++++ b/SEER.md
+@@ -10,10 +10,13 @@ library matching, scanner), `server/seerapi` (HTTP), migration
+ 
+ ## Web UI
+ 
+-When `Seer.Enabled` is on, a **Requests** entry appears in the sidebar (`#/seer`):
+-a search box over the MusicBrainz catalog (owned items get Play/Open, missing
+-ones a Request button, requested ones their live status) and the requests list,
+-where admins approve pending requests or retry failed ones. The list refreshes
++When `Seer.Enabled` is on, a **Requests** entry appears in the sidebar (`#/seer`).
++Searching shows the best result, songs, artists and albums with Cover Art Archive
++covers; typing an artist's name brings that artist's albums and songs. Artist
++pages list the discography (albums, EPs, live...), album pages the tracklist.
++Owned items get Play/Open, missing ones a Request button, requested ones their
++live status. Without a search, the page lists the requests, where admins approve
++pending requests or retry failed ones. The list refreshes
+ by itself through the server event stream (`refreshResource` for `seer`).
+ Code: `ui/src/seer/`; strings under `resources.seer` (English and pt-BR).
+ 
+@@ -58,7 +61,9 @@ Environment variables work as usual, e.g. `ND_SEER_ENABLED=true`,
+ 
+ | Method | Path | Who | What |
+ |---|---|---|---|
+-| GET | `/catalog?q=&limit=` | any user | catalog search, each item flagged `inLibrary` |
++| GET | `/catalog?q=&limit=` | any user | catalog search: artists, albums, tracks, each flagged `inLibrary` |
++| GET | `/catalog/artist/{mbid}` | any user | artist and discography |
++| GET | `/catalog/album/{mbid}` | any user | album and tracklist |
+ | GET | `/requests` | any user | own requests; admins get all (`?mine=true` for own) |
+ | POST | `/requests` | any user | body: a catalog item. 409 if already in the library; returns the existing request if someone already asked for it |
+ | GET | `/requests/{id}` | owner or admin | one request |
+@@ -67,6 +72,10 @@ Environment variables work as usual, e.g. `ND_SEER_ENABLED=true`,
+ Statuses: `pending` → `queued` → `searching` → `downloading` → `importing` →
+ `available`, or `failed` with `error`.
+ 
++MusicBrainz responses are cached for 10 minutes and retried when MusicBrainz
++answers 503/429; a 502 from the catalog endpoints means it still failed (the
++cause is in the server log, "Seer: MusicBrainz request failed").
++
+ ## How a request flows
+ 
+ 1. Approved requests are queued; queued and in-progress requests survive restarts.
+diff --git a/core/acquire/catalog_musicbrainz.go b/core/acquire/catalog_musicbrainz.go
+index f39936f..880b96e 100644
+--- a/core/acquire/catalog_musicbrainz.go
++++ b/core/acquire/catalog_musicbrainz.go
+@@ -4,24 +4,27 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"net/url"
++	"regexp"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
++	"unicode"
++
++	"golang.org/x/text/unicode/norm"
+ )
+ 
+ // DefaultUserAgent is sent when none is configured; MusicBrainz blocks empty ones.
+ const DefaultUserAgent = "NavidromeSeer/0.1 ( https://github.com/navidrome/navidrome )"
+ 
+-// luceneEscaper escapes the characters that have a meaning in MusicBrainz's
+-// Lucene query syntax, so free text from the user is searched literally.
+-var luceneEscaper = strings.NewReplacer(
+-	`\`, `\\`, `+`, `\+`, `-`, `\-`, `!`, `\!`, `(`, `\(`, `)`, `\)`, `{`, `\{`, `}`, `\}`,
+-	`[`, `\[`, `]`, `\]`, `^`, `\^`, `"`, `\"`, `~`, `\~`, `*`, `\*`, `?`, `\?`, `:`, `\:`,
+-	`/`, `\/`, `&&`, `\&&`, `||`, `\||`,
+-)
++var mbidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
++
++// ValidMBID reports whether s looks like a MusicBrainz identifier.
++func ValidMBID(s string) bool { return mbidRe.MatchString(s) }
+ 
+ // MusicBrainz implements Catalog using the MusicBrainz web service.
+ // MusicBrainz asks for a meaningful User-Agent and at most 1 request/second.
+@@ -29,61 +32,266 @@ type MusicBrainz struct {
+ 	UserAgent string // e.g. "navidrome-acquire/0.1 (you@example.com)"
+ 	Client    *http.Client
+ 	BaseURL   string // default https://musicbrainz.org/ws/2
++	// CacheTTL is how long responses are reused (default 10 minutes); typing the
++	// same search again, or going back to an artist, costs no request.
++	CacheTTL time.Duration
+ 
+ 	mu   sync.Mutex
+ 	last time.Time
++
++	cacheMu sync.Mutex
++	cache   map[string]cacheEntry
+ }
+ 
+-func (m *MusicBrainz) throttle() {
++type cacheEntry struct {
++	body []byte
++	exp  time.Time
++}
++
++func (m *MusicBrainz) throttle(ctx context.Context) error {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 	if wait := time.Second - time.Since(m.last); wait > 0 {
+-		time.Sleep(wait)
++		select {
++		case <-time.After(wait):
++		case <-ctx.Done():
++			return ctx.Err()
++		}
+ 	}
+ 	m.last = time.Now()
++	return nil
+ }
+ 
++func (m *MusicBrainz) cached(key string) ([]byte, bool) {
++	m.cacheMu.Lock()
++	defer m.cacheMu.Unlock()
++	e, ok := m.cache[key]
++	if !ok || time.Now().After(e.exp) {
++		return nil, false
++	}
++	return e.body, true
++}
++
++func (m *MusicBrainz) store(key string, body []byte) {
++	ttl := m.CacheTTL
++	if ttl <= 0 {
++		ttl = 10 * time.Minute
++	}
++	m.cacheMu.Lock()
++	defer m.cacheMu.Unlock()
++	if m.cache == nil || len(m.cache) > 500 {
++		m.cache = map[string]cacheEntry{}
++	}
++	m.cache[key] = cacheEntry{body: body, exp: time.Now().Add(ttl)}
++}
++
++// get calls the web service, retrying when MusicBrainz is busy (503) or rate limits (429).
+ func (m *MusicBrainz) get(ctx context.Context, path string, q url.Values, out any) error {
+ 	base := m.BaseURL
+ 	if base == "" {
+ 		base = "https://musicbrainz.org/ws/2"
+ 	}
++	q.Set("fmt", "json")
++	u := base + path + "?" + q.Encode()
++	if body, ok := m.cached(u); ok {
++		return json.Unmarshal(body, out)
++	}
+ 	cl := m.Client
+ 	if cl == nil {
+ 		cl = &http.Client{Timeout: 15 * time.Second}
+ 	}
+-	q.Set("fmt", "json")
+-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path+"?"+q.Encode(), nil)
+-	if err != nil {
+-		return err
+-	}
+ 	ua := m.UserAgent
+ 	if ua == "" {
+ 		ua = DefaultUserAgent
+ 	}
+-	req.Header.Set("User-Agent", ua)
+-	m.throttle()
+-	resp, err := cl.Do(req)
+-	if err != nil {
+-		return err
+-	}
+-	defer resp.Body.Close()
+-	if resp.StatusCode != http.StatusOK {
+-		return fmt.Errorf("musicbrainz: HTTP %d", resp.StatusCode)
++	var lastErr error
++	for attempt := range 3 {
++		if attempt > 0 {
++			select {
++			case <-time.After(time.Duration(attempt) * 1500 * time.Millisecond):
++			case <-ctx.Done():
++				return ctx.Err()
++			}
++		}
++		if err := m.throttle(ctx); err != nil {
++			return err
++		}
++		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
++		if err != nil {
++			return err
++		}
++		req.Header.Set("User-Agent", ua)
++		req.Header.Set("Accept", "application/json")
++		resp, err := cl.Do(req)
++		if err != nil {
++			if ctx.Err() != nil {
++				return ctx.Err()
++			}
++			lastErr = err
++			continue
++		}
++		body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
++		resp.Body.Close()
++		switch {
++		case resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests:
++			lastErr = fmt.Errorf("musicbrainz is busy (HTTP %d)", resp.StatusCode)
++			continue
++		case resp.StatusCode == http.StatusNotFound:
++			return ErrNotFound
++		case resp.StatusCode != http.StatusOK:
++			return fmt.Errorf("musicbrainz: HTTP %d", resp.StatusCode)
++		case err != nil:
++			lastErr = err
++			continue
++		}
++		if err := json.Unmarshal(body, out); err != nil {
++			return fmt.Errorf("musicbrainz: %w", err)
++		}
++		m.store(u, body)
++		return nil
+ 	}
+-	return json.NewDecoder(resp.Body).Decode(out)
++	return lastErr
+ }
+ 
+ type mbArtistCredit []struct {
+-	Name string `json:"name"`
++	Name       string `json:"name"`
++	JoinPhrase string `json:"joinphrase"`
++	Artist     struct {
++		ID string `json:"id"`
++	} `json:"artist"`
+ }
+ 
+ func (a mbArtistCredit) String() string {
+-	names := make([]string, 0, len(a))
+-	for _, c := range a {
+-		names = append(names, c.Name)
++	var sb strings.Builder
++	for i, c := range a {
++		sb.WriteString(c.Name)
++		switch {
++		case c.JoinPhrase != "":
++			sb.WriteString(c.JoinPhrase)
++		case i < len(a)-1:
++			sb.WriteString(", ")
++		}
+ 	}
+-	return strings.Join(names, ", ")
++	return strings.TrimSpace(sb.String())
++}
++
++func (a mbArtistCredit) firstID() string {
++	if len(a) > 0 {
++		return a[0].Artist.ID
++	}
++	return ""
++}
++
++type mbReleaseGroup struct {
++	ID             string         `json:"id"`
++	Title          string         `json:"title"`
++	PrimaryType    string         `json:"primary-type"`
++	SecondaryTypes []string       `json:"secondary-types"`
++	FirstRelease   string         `json:"first-release-date"`
++	ArtistCredit   mbArtistCredit `json:"artist-credit"`
++	Score          int            `json:"score"`
++}
++
++func (rg mbReleaseGroup) wanted() bool {
++	return rg.PrimaryType == "" || rg.PrimaryType == "Album" || rg.PrimaryType == "EP"
++}
++
++func (rg mbReleaseGroup) item(artist, artistID string) CatalogItem {
++	if artist == "" {
++		artist, artistID = rg.ArtistCredit.String(), rg.ArtistCredit.firstID()
++	}
++	typ := rg.PrimaryType
++	for _, s := range rg.SecondaryTypes {
++		typ += " + " + s
++	}
++	return CatalogItem{
++		Kind: KindAlbum, MBID: rg.ID, CoverID: rg.ID, Artist: artist, ArtistMBID: artistID,
++		Album: rg.Title, Title: rg.Title, Year: yearOf(rg.FirstRelease), Type: strings.TrimPrefix(typ, " + "),
++	}
++}
++
++type mbArtist struct {
++	ID             string `json:"id"`
++	Name           string `json:"name"`
++	Type           string `json:"type"`
++	Country        string `json:"country"`
++	Disambiguation string `json:"disambiguation"`
++	Score          int    `json:"score"`
++	Aliases        []struct {
++		Name string `json:"name"`
++	} `json:"aliases"`
++}
++
++func (a mbArtist) item() CatalogItem {
++	return CatalogItem{
++		Kind: KindArtist, MBID: a.ID, Artist: a.Name, ArtistMBID: a.ID, Title: a.Name,
++		Type: a.Type, Country: a.Country, Disambiguation: a.Disambiguation,
++	}
++}
++
++// matches reports whether the user typed this artist's name (or one of its aliases).
++func (a mbArtist) matches(query string) bool {
++	q := fold(query)
++	if q == "" {
++		return false
++	}
++	if fold(a.Name) == q {
++		return true
++	}
++	for _, al := range a.Aliases {
++		if fold(al.Name) == q {
++			return true
++		}
++	}
++	return false
++}
++
++type mbRecording struct {
++	ID           string         `json:"id"`
++	Title        string         `json:"title"`
++	Length       int            `json:"length"`
++	Video        bool           `json:"video"`
++	ArtistCredit mbArtistCredit `json:"artist-credit"`
++	Score        int            `json:"score"`
++	Releases     []struct {
++		Title        string `json:"title"`
++		Date         string `json:"date"`
++		Status       string `json:"status"`
++		ReleaseGroup struct {
++			ID             string   `json:"id"`
++			PrimaryType    string   `json:"primary-type"`
++			SecondaryTypes []string `json:"secondary-types"`
++		} `json:"release-group"`
++	} `json:"releases"`
++}
++
++// item picks the release that best represents the recording: an official
++// studio album if there is one, so the cover and album name are the familiar ones.
++func (r mbRecording) item() (CatalogItem, bool) {
++	if len(r.Releases) == 0 || r.Video {
++		return CatalogItem{}, false
++	}
++	best, bestRank := 0, 99
++	for i, rel := range r.Releases {
++		rank := 0
++		if rel.Status != "" && rel.Status != "Official" {
++			rank += 4
++		}
++		if len(rel.ReleaseGroup.SecondaryTypes) > 0 {
++			rank += 2 // compilation, live...
++		}
++		if rel.ReleaseGroup.PrimaryType != "Album" {
++			rank++
++		}
++		if rank < bestRank || (rank == bestRank && rel.Date != "" && (r.Releases[best].Date == "" || rel.Date < r.Releases[best].Date)) {
++			best, bestRank = i, rank
++		}
++	}
++	rel := r.Releases[best]
++	return CatalogItem{
++		Kind: KindTrack, MBID: r.ID, Artist: r.ArtistCredit.String(), ArtistMBID: r.ArtistCredit.firstID(),
++		Title: r.Title, DurationMs: r.Length, Album: rel.Title, Year: yearOf(rel.Date), CoverID: rel.ReleaseGroup.ID,
++	}, true
+ }
+ 
+ func yearOf(date string) int {
+@@ -95,54 +303,262 @@ func yearOf(date string) int {
+ 	return 0
+ }
+ 
+-// Search returns a mix of albums (release groups) and tracks (recordings).
++// fold lowercases, strips accents and drops punctuation: "Charlie Brown Jr." == "charlie brown jr".
++func fold(s string) string {
++	var sb strings.Builder
++	for _, r := range norm.NFD.String(strings.ToLower(s)) {
++		if unicode.IsLetter(r) || unicode.IsDigit(r) {
++			sb.WriteRune(r)
++		}
++	}
++	return sb.String()
++}
++
++// Search returns artists, then albums (release groups), then tracks (recordings).
++// When the query is an artist's name, albums and tracks come from that artist
++// instead of from titles that happen to contain the words.
+ func (m *MusicBrainz) Search(ctx context.Context, query string, limit int) ([]CatalogItem, error) {
+ 	if limit <= 0 {
+ 		limit = 10
+ 	}
+ 	var out []CatalogItem
+-	query = luceneEscaper.Replace(query)
+-
+-	var rgs struct {
+-		ReleaseGroups []struct {
+-			ID           string         `json:"id"`
+-			Title        string         `json:"title"`
+-			PrimaryType  string         `json:"primary-type"`
+-			FirstRelease string         `json:"first-release-date"`
+-			ArtistCredit mbArtistCredit `json:"artist-credit"`
+-		} `json:"release-groups"`
+-	}
+-	if err := m.get(ctx, "/release-group", url.Values{"query": {query}, "limit": {strconv.Itoa(limit)}}, &rgs); err != nil {
+-		return nil, err
++	var errs []error
++
++	var arts struct {
++		Artists []mbArtist `json:"artists"`
++	}
++	var top *mbArtist
++	if err := m.get(ctx, "/artist", url.Values{"query": {query}, "dismax": {"true"}, "limit": {"8"}}, &arts); err != nil {
++		errs = append(errs, err)
++	}
++	for i, a := range arts.Artists {
++		if top == nil && a.Score >= 80 && a.matches(query) {
++			top = &arts.Artists[i]
++		}
++	}
++	shown := 0
++	if top != nil {
++		out = append(out, top.item())
++		shown++
+ 	}
+-	for _, rg := range rgs.ReleaseGroups {
+-		if rg.PrimaryType != "" && rg.PrimaryType != "Album" && rg.PrimaryType != "EP" {
++	for _, a := range arts.Artists {
++		if shown >= 6 || a.Score < 60 {
++			break
++		}
++		if top != nil && a.ID == top.ID {
+ 			continue
+ 		}
+-		out = append(out, CatalogItem{Kind: KindAlbum, MBID: rg.ID, Artist: rg.ArtistCredit.String(), Album: rg.Title, Title: rg.Title, Year: yearOf(rg.FirstRelease)})
++		out = append(out, a.item())
++		shown++
+ 	}
+ 
++	if top != nil {
++		albums, err := m.artistAlbums(ctx, *top)
++		if err != nil {
++			errs = append(errs, err)
++		}
++		if len(albums) > limit {
++			albums = albums[:limit]
++		}
++		out = append(out, albums...)
++		tracks, err := m.searchRecordings(ctx, url.Values{
++			"query": {fmt.Sprintf(`arid:%s AND status:official AND primarytype:album`, top.ID)},
++		}, limit)
++		if err != nil {
++			errs = append(errs, err)
++		}
++		out = append(out, tracks...)
++	} else {
++		var rgs struct {
++			ReleaseGroups []mbReleaseGroup `json:"release-groups"`
++		}
++		if err := m.get(ctx, "/release-group", url.Values{"query": {query}, "dismax": {"true"}, "limit": {strconv.Itoa(limit)}}, &rgs); err != nil {
++			errs = append(errs, err)
++		}
++		for _, rg := range rgs.ReleaseGroups {
++			if rg.wanted() {
++				out = append(out, rg.item("", ""))
++			}
++		}
++		tracks, err := m.searchRecordings(ctx, url.Values{"query": {query}, "dismax": {"true"}}, limit)
++		if err != nil {
++			errs = append(errs, err)
++		}
++		out = append(out, tracks...)
++	}
++	if len(out) == 0 && len(errs) > 0 {
++		return nil, errs[0]
++	}
++	return out, nil
++}
++
++// searchRecordings returns up to limit tracks, one per artist and title
++// (MusicBrainz has a recording per remaster, live take, etc.).
++func (m *MusicBrainz) searchRecordings(ctx context.Context, q url.Values, limit int) ([]CatalogItem, error) {
+ 	var recs struct {
+-		Recordings []struct {
+-			ID           string         `json:"id"`
+-			Title        string         `json:"title"`
+-			Length       int            `json:"length"`
+-			ArtistCredit mbArtistCredit `json:"artist-credit"`
+-			Releases     []struct {
+-				Title string `json:"title"`
+-				Date  string `json:"date"`
+-			} `json:"releases"`
+-		} `json:"recordings"`
+-	}
+-	if err := m.get(ctx, "/recording", url.Values{"query": {query}, "limit": {strconv.Itoa(limit)}}, &recs); err != nil {
+-		return out, nil // albums alone are still useful
++		Recordings []mbRecording `json:"recordings"`
++	}
++	q.Set("limit", strconv.Itoa(min(limit*4, 100)))
++	if err := m.get(ctx, "/recording", q, &recs); err != nil {
++		return nil, err
+ 	}
++	seen := map[string]bool{}
++	var out []CatalogItem
+ 	for _, r := range recs.Recordings {
+-		it := CatalogItem{Kind: KindTrack, MBID: r.ID, Artist: r.ArtistCredit.String(), Title: r.Title, DurationMs: r.Length}
+-		if len(r.Releases) > 0 {
+-			it.Album, it.Year = r.Releases[0].Title, yearOf(r.Releases[0].Date)
++		it, ok := r.item()
++		if !ok {
++			continue
++		}
++		key := fold(it.Artist) + "|" + fold(it.Title)
++		if seen[key] {
++			continue
+ 		}
++		seen[key] = true
+ 		out = append(out, it)
++		if len(out) >= limit {
++			break
++		}
+ 	}
+ 	return out, nil
+ }
++
++// artistAlbums lists an artist's albums and EPs: studio albums first, then the
++// rest (live, compilations...), each group oldest first.
++func (m *MusicBrainz) artistAlbums(ctx context.Context, a mbArtist) ([]CatalogItem, error) {
++	var all []mbReleaseGroup
++	for offset := 0; offset < 300; offset += 100 {
++		var page struct {
++			Count         int              `json:"release-group-count"`
++			ReleaseGroups []mbReleaseGroup `json:"release-groups"`
++		}
++		q := url.Values{"artist": {a.ID}, "type": {"album|ep"}, "limit": {"100"}, "offset": {strconv.Itoa(offset)}}
++		if err := m.get(ctx, "/release-group", q, &page); err != nil {
++			if len(all) > 0 {
++				break
++			}
++			return nil, err
++		}
++		all = append(all, page.ReleaseGroups...)
++		if len(all) >= page.Count || len(page.ReleaseGroups) == 0 {
++			break
++		}
++	}
++	sort.SliceStable(all, func(i, j int) bool {
++		si, sj := len(all[i].SecondaryTypes) > 0, len(all[j].SecondaryTypes) > 0
++		if si != sj {
++			return !si
++		}
++		ai, aj := all[i].PrimaryType == "Album", all[j].PrimaryType == "Album"
++		if ai != aj {
++			return ai
++		}
++		di, dj := all[i].FirstRelease, all[j].FirstRelease
++		if (di == "") != (dj == "") {
++			return di != ""
++		}
++		return di < dj
++	})
++	out := make([]CatalogItem, 0, len(all))
++	for _, rg := range all {
++		out = append(out, rg.item(a.Name, a.ID))
++	}
++	return out, nil
++}
++
++// Artist returns an artist and its discography.
++func (m *MusicBrainz) Artist(ctx context.Context, mbid string) (*ArtistDetail, error) {
++	if !ValidMBID(mbid) {
++		return nil, ErrNotFound
++	}
++	var a mbArtist
++	if err := m.get(ctx, "/artist/"+mbid, url.Values{}, &a); err != nil {
++		return nil, err
++	}
++	albums, err := m.artistAlbums(ctx, a)
++	if err != nil {
++		return nil, err
++	}
++	return &ArtistDetail{Artist: a.item(), Albums: albums}, nil
++}
++
++// Album returns an album (release group) with the tracklist of its most
++// representative release: official, fewest discs, earliest.
++func (m *MusicBrainz) Album(ctx context.Context, mbid string) (*AlbumDetail, error) {
++	if !ValidMBID(mbid) {
++		return nil, ErrNotFound
++	}
++	var rg mbReleaseGroup
++	if err := m.get(ctx, "/release-group/"+mbid, url.Values{"inc": {"artist-credits"}}, &rg); err != nil {
++		return nil, err
++	}
++	var rels struct {
++		Releases []struct {
++			Status string `json:"status"`
++			Date   string `json:"date"`
++			Media  []struct {
++				Tracks []struct {
++					Position  int    `json:"position"`
++					Title     string `json:"title"`
++					Length    int    `json:"length"`
++					Recording struct {
++						ID           string         `json:"id"`
++						Title        string         `json:"title"`
++						Length       int            `json:"length"`
++						ArtistCredit mbArtistCredit `json:"artist-credit"`
++					} `json:"recording"`
++				} `json:"tracks"`
++			} `json:"media"`
++		} `json:"releases"`
++	}
++	q := url.Values{"release-group": {mbid}, "inc": {"recordings+artist-credits"}, "limit": {"25"}}
++	if err := m.get(ctx, "/release", q, &rels); err != nil {
++		return nil, err
++	}
++	album := rg.item("", "")
++	detail := &AlbumDetail{Album: album, Tracks: []CatalogItem{}}
++	best, bestRank := -1, [3]int{}
++	for i, rel := range rels.Releases {
++		n := 0
++		for _, md := range rel.Media {
++			n += len(md.Tracks)
++		}
++		if n == 0 {
++			continue
++		}
++		official := 1
++		if rel.Status == "Official" {
++			official = 0
++		}
++		date, _ := strconv.Atoi(strings.ReplaceAll((rel.Date + "9999-99-99")[:10], "-", ""))
++		rank := [3]int{official, len(rel.Media), date}
++		if best < 0 || rank[0] < bestRank[0] || (rank[0] == bestRank[0] && (rank[1] < bestRank[1] || (rank[1] == bestRank[1] && rank[2] < bestRank[2]))) {
++			best, bestRank = i, rank
++		}
++	}
++	if best < 0 {
++		return detail, nil
++	}
++	num := 0
++	for _, md := range rels.Releases[best].Media {
++		for _, t := range md.Tracks {
++			num++
++			title, length := t.Recording.Title, t.Recording.Length
++			if title == "" {
++				title = t.Title
++			}
++			if length == 0 {
++				length = t.Length
++			}
++			artist, artistID := t.Recording.ArtistCredit.String(), t.Recording.ArtistCredit.firstID()
++			if artist == "" {
++				artist, artistID = album.Artist, album.ArtistMBID
++			}
++			detail.Tracks = append(detail.Tracks, CatalogItem{
++				Kind: KindTrack, MBID: t.Recording.ID, Artist: artist, ArtistMBID: artistID,
++				Album: album.Title, Title: title, Year: album.Year, DurationMs: length,
++				CoverID: album.MBID, TrackNumber: num,
++			})
++		}
++	}
++	return detail, nil
++}
+diff --git a/core/acquire/catalog_musicbrainz_test.go b/core/acquire/catalog_musicbrainz_test.go
+new file mode 100644
+index 0000000..0dfbe11
+--- /dev/null
++++ b/core/acquire/catalog_musicbrainz_test.go
+@@ -0,0 +1,115 @@
++package acquire
++
++import (
++	"context"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++)
++
++const (
++	cbjr  = "11111111-1111-1111-1111-111111111111"
++	other = "22222222-2222-2222-2222-222222222222"
++	rg1   = "33333333-3333-3333-3333-333333333333"
++	rg2   = "44444444-4444-4444-4444-444444444444"
++)
++
++func fakeMB(t *testing.T, busy int32) (*MusicBrainz, *atomic.Int32) {
++	var calls atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		n := calls.Add(1)
++		if n <= busy {
++			w.WriteHeader(http.StatusServiceUnavailable)
++			return
++		}
++		q := r.URL.Query()
++		switch {
++		case r.URL.Path == "/artist" && q.Get("dismax") == "true":
++			_, _ = w.Write([]byte(`{"artists":[
++				{"id":"` + other + `","name":"Charlie Brown","score":100},
++				{"id":"` + cbjr + `","name":"Charlie Brown Jr.","type":"Group","country":"BR","score":98}]}`))
++		case r.URL.Path == "/artist/"+cbjr:
++			_, _ = w.Write([]byte(`{"id":"` + cbjr + `","name":"Charlie Brown Jr.","type":"Group"}`))
++		case r.URL.Path == "/release-group" && q.Get("artist") == cbjr:
++			_, _ = w.Write([]byte(`{"release-group-count":2,"release-groups":[
++				{"id":"` + rg2 + `","title":"Acústico MTV","primary-type":"Album","secondary-types":["Live"],"first-release-date":"2003"},
++				{"id":"` + rg1 + `","title":"Transpiração Contínua Prolongada","primary-type":"Album","first-release-date":"1997-01-01"}]}`))
++		case r.URL.Path == "/recording" && strings.HasPrefix(q.Get("query"), "arid:"+cbjr):
++			_, _ = w.Write([]byte(`{"recordings":[
++				{"id":"r1","title":"Zóio de Lula","artist-credit":[{"name":"Charlie Brown Jr.","artist":{"id":"` + cbjr + `"}}],
++				 "releases":[{"title":"Hits","status":"Official","release-group":{"id":"` + rg2 + `","primary-type":"Album","secondary-types":["Compilation"]}},
++				             {"title":"Preço Curto","date":"1999","status":"Official","release-group":{"id":"` + rg1 + `","primary-type":"Album"}}]},
++				{"id":"r2","title":"Zóio de lula","artist-credit":[{"name":"Charlie Brown Jr."}],"releases":[{"title":"Live"}]},
++				{"id":"r3","title":"Video","video":true,"releases":[{"title":"x"}]}]}`))
++		case r.URL.Path == "/release-group/"+rg1:
++			_, _ = w.Write([]byte(`{"id":"` + rg1 + `","title":"Transpiração Contínua Prolongada","primary-type":"Album","first-release-date":"1997",
++				"artist-credit":[{"name":"Charlie Brown Jr.","artist":{"id":"` + cbjr + `"}}]}`))
++		case r.URL.Path == "/release" && q.Get("release-group") == rg1:
++			_, _ = w.Write([]byte(`{"releases":[
++				{"status":"Bootleg","date":"1996","media":[{"tracks":[{"title":"x","recording":{"id":"bad"}}]}]},
++				{"status":"Official","date":"1997","media":[{"tracks":[
++					{"position":1,"recording":{"id":"t1","title":"Proibida pra Mim","length":180000}},
++					{"position":2,"recording":{"id":"t2","title":"O Coro Vai Comê!"}}]}]}]}`))
++		default:
++			_, _ = w.Write([]byte(`{}`))
++		}
++	}))
++	t.Cleanup(srv.Close)
++	return &MusicBrainz{BaseURL: srv.URL}, &calls
++}
++
++func TestMusicBrainzSearchArtistFirst(t *testing.T) {
++	mb, _ := fakeMB(t, 0)
++	items, err := mb.Search(context.Background(), "charlie brown jr", 10)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var kinds, titles []string
++	for _, it := range items {
++		kinds = append(kinds, string(it.Kind))
++		titles = append(titles, it.Title)
++	}
++	got := strings.Join(titles, "|")
++	want := "Charlie Brown Jr.|Charlie Brown|Transpiração Contínua Prolongada|Acústico MTV|Zóio de Lula"
++	if got != want {
++		t.Fatalf("titles = %s\nwant      %s (kinds %v)", got, want, kinds)
++	}
++	if items[0].Kind != KindArtist || items[3].Type != "Album + Live" || items[2].CoverID != rg1 {
++		t.Errorf("unexpected items: %+v", items[:4])
++	}
++	if tr := items[4]; tr.Album != "Preço Curto" || tr.CoverID != rg1 || tr.ArtistMBID != cbjr {
++		t.Errorf("track should use the studio album: %+v", tr)
++	}
++}
++
++func TestMusicBrainzRetriesAndCaches(t *testing.T) {
++	mb, calls := fakeMB(t, 2)
++	d, err := mb.Artist(context.Background(), cbjr)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if d.Artist.Title != "Charlie Brown Jr." || len(d.Albums) != 2 {
++		t.Fatalf("artist = %+v", d)
++	}
++	before := calls.Load()
++	if _, err := mb.Artist(context.Background(), cbjr); err != nil || calls.Load() != before {
++		t.Errorf("second call should be cached (calls %d -> %d, err %v)", before, calls.Load(), err)
++	}
++	if _, err := mb.Artist(context.Background(), "nope"); err != ErrNotFound {
++		t.Errorf("invalid mbid: %v", err)
++	}
++}
++
++func TestMusicBrainzAlbum(t *testing.T) {
++	mb, _ := fakeMB(t, 0)
++	d, err := mb.Album(context.Background(), rg1)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(d.Tracks) != 2 || d.Tracks[0].Title != "Proibida pra Mim" || d.Tracks[1].TrackNumber != 2 ||
++		d.Tracks[1].Artist != "Charlie Brown Jr." || d.Tracks[0].CoverID != rg1 || d.Album.Year != 1997 {
++		t.Errorf("album = %+v", d)
++	}
++}
+diff --git a/core/acquire/model.go b/core/acquire/model.go
+index dc84c8f..9bb9f30 100644
+--- a/core/acquire/model.go
++++ b/core/acquire/model.go
+@@ -11,6 +11,8 @@ type Kind string
+ const (
+ 	KindTrack Kind = "track"
+ 	KindAlbum Kind = "album"
++	// KindArtist only appears in catalog results (to browse a discography); it cannot be requested.
++	KindArtist Kind = "artist"
+ )
+ 
+ type Status string
+@@ -25,21 +27,41 @@ const (
+ 	StatusFailed      Status = "failed"
+ )
+ 
+-// CatalogItem is a track or album from the external catalog (MusicBrainz).
++// CatalogItem is an artist, album or track from the external catalog (MusicBrainz).
+ type CatalogItem struct {
+ 	Kind       Kind   `json:"kind"`
+-	MBID       string `json:"mbid"` // recording MBID (track) or release-group MBID (album)
++	MBID       string `json:"mbid"` // recording (track), release-group (album) or artist MBID
+ 	Artist     string `json:"artist"`
++	ArtistMBID string `json:"artistMbid,omitempty"`
+ 	Album      string `json:"album,omitempty"`
+ 	Title      string `json:"title"`
+ 	Year       int    `json:"year,omitempty"`
+ 	DurationMs int    `json:"durationMs,omitempty"`
++	// CoverID is the release-group MBID whose Cover Art Archive front image illustrates the item.
++	CoverID string `json:"coverId,omitempty"`
++	// Type is the release-group type ("Album", "EP", "Album + Live"...) or the artist type ("Group", "Person").
++	Type           string `json:"type,omitempty"`
++	Disambiguation string `json:"disambiguation,omitempty"`
++	Country        string `json:"country,omitempty"`
++	TrackNumber    int    `json:"trackNumber,omitempty"`
+ 	// InLibrary is filled by the Service after matching against the local library.
+ 	InLibrary bool `json:"inLibrary"`
+ 	// LibraryID is the local media_file/album ID when InLibrary is true.
+ 	LibraryID string `json:"libraryId,omitempty"`
+ }
+ 
++// ArtistDetail is an artist and its discography (albums and EPs, oldest first).
++type ArtistDetail struct {
++	Artist CatalogItem   `json:"artist"`
++	Albums []CatalogItem `json:"albums"`
++}
++
++// AlbumDetail is an album and the tracklist of one of its releases.
++type AlbumDetail struct {
++	Album  CatalogItem   `json:"album"`
++	Tracks []CatalogItem `json:"tracks"`
++}
++
+ // Request is a user's request to have an item fetched.
+ type Request struct {
+ 	ID        string    `json:"id"`
+@@ -49,6 +71,7 @@ type Request struct {
+ 	Artist    string    `json:"artist"`
+ 	Album     string    `json:"album,omitempty"`
+ 	Title     string    `json:"title"`
++	CoverID   string    `json:"coverId,omitempty"`
+ 	Status    Status    `json:"status"`
+ 	Source    string    `json:"source,omitempty"` // name of the Source that fulfilled it
+ 	Error     string    `json:"error,omitempty"`
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index ad21ab3..b04c9e0 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -24,9 +24,12 @@ var (
+ 	ErrBadState  = errors.New("request cannot be approved in its current state")
+ )
+ 
+-// Catalog searches the external catalog.
++// Catalog searches and browses the external catalog.
+ type Catalog interface {
+ 	Search(ctx context.Context, query string, limit int) ([]CatalogItem, error)
++	// Artist and Album return ErrNotFound for unknown ids.
++	Artist(ctx context.Context, mbid string) (*ArtistDetail, error)
++	Album(ctx context.Context, mbid string) (*AlbumDetail, error)
+ }
+ 
+ // Source fetches music from somewhere. Sources are tried in priority order.
+@@ -151,12 +154,42 @@ func (s *Service) SearchCatalog(ctx context.Context, query string, limit int) ([
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	s.flag(ctx, items)
++	return items, nil
++}
++
++// CatalogArtist returns an artist's discography, flagging the albums already in the library.
++func (s *Service) CatalogArtist(ctx context.Context, mbid string) (*ArtistDetail, error) {
++	d, err := s.catalog.Artist(ctx, mbid)
++	if err != nil {
++		return nil, err
++	}
++	s.flag(ctx, d.Albums)
++	if id, ok := s.lib.Match(ctx, d.Artist); ok {
++		d.Artist.InLibrary, d.Artist.LibraryID = true, id
++	}
++	return d, nil
++}
++
++// CatalogAlbum returns an album's tracklist, flagging what is already in the library.
++func (s *Service) CatalogAlbum(ctx context.Context, mbid string) (*AlbumDetail, error) {
++	d, err := s.catalog.Album(ctx, mbid)
++	if err != nil {
++		return nil, err
++	}
++	if id, ok := s.lib.Match(ctx, d.Album); ok {
++		d.Album.InLibrary, d.Album.LibraryID = true, id
++	}
++	s.flag(ctx, d.Tracks)
++	return d, nil
++}
++
++func (s *Service) flag(ctx context.Context, items []CatalogItem) {
+ 	for i := range items {
+ 		if id, ok := s.lib.Match(ctx, items[i]); ok {
+ 			items[i].InLibrary, items[i].LibraryID = true, id
+ 		}
+ 	}
+-	return items, nil
+ }
+ 
+ // Submit creates a request (or returns the existing active one).
+@@ -167,6 +200,12 @@ func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (
+ 	if item.Kind != KindTrack && item.Kind != KindAlbum {
+ 		return nil, fmt.Errorf("invalid kind %q", item.Kind)
+ 	}
++	if !ValidMBID(item.CoverID) {
++		item.CoverID = ""
++	}
++	if item.CoverID == "" && item.Kind == KindAlbum {
++		item.CoverID = item.MBID
++	}
+ 	if id, ok := s.lib.Match(ctx, item); ok {
+ 		return nil, fmt.Errorf("%w (%s)", ErrInLibrary, id)
+ 	}
+@@ -180,7 +219,7 @@ func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (
+ 	now := time.Now()
+ 	req := &Request{
+ 		ID: newID(), UserID: userID, Kind: item.Kind, MBID: item.MBID,
+-		Artist: item.Artist, Album: item.Album, Title: item.Title,
++		Artist: item.Artist, Album: item.Album, Title: item.Title, CoverID: item.CoverID,
+ 		Status: StatusPending, CreatedAt: now, UpdatedAt: now,
+ 	}
+ 	if s.cfg.AutoApprove {
+diff --git a/core/acquire/service_test.go b/core/acquire/service_test.go
+index 0a6ef46..e323600 100644
+--- a/core/acquire/service_test.go
++++ b/core/acquire/service_test.go
+@@ -13,6 +13,12 @@ type fakeCatalog struct{ items []CatalogItem }
+ func (f fakeCatalog) Search(context.Context, string, int) ([]CatalogItem, error) {
+ 	return append([]CatalogItem(nil), f.items...), nil
+ }
++func (f fakeCatalog) Artist(context.Context, string) (*ArtistDetail, error) {
++	return &ArtistDetail{Albums: append([]CatalogItem(nil), f.items...)}, nil
++}
++func (f fakeCatalog) Album(context.Context, string) (*AlbumDetail, error) {
++	return &AlbumDetail{Tracks: append([]CatalogItem(nil), f.items...)}, nil
++}
+ 
+ type fakeLib struct {
+ 	mu    sync.Mutex
+diff --git a/core/acquire/store_sql.go b/core/acquire/store_sql.go
+index af256be..0e22b27 100644
+--- a/core/acquire/store_sql.go
++++ b/core/acquire/store_sql.go
+@@ -15,20 +15,20 @@ type SQLStore struct {
+ 
+ func NewSQLStore(db *sql.DB) *SQLStore { return &SQLStore{DB: db} }
+ 
+-const requestColumns = `id, user_id, kind, mbid, artist, album, title, status, source, error, created_at, updated_at`
++const requestColumns = `id, user_id, kind, mbid, artist, album, title, status, source, error, created_at, updated_at, cover_id`
+ 
+ func scanRequest(row interface{ Scan(...any) error }) (Request, error) {
+ 	var r Request
+ 	err := row.Scan(&r.ID, &r.UserID, &r.Kind, &r.MBID, &r.Artist, &r.Album, &r.Title,
+-		&r.Status, &r.Source, &r.Error, &r.CreatedAt, &r.UpdatedAt)
++		&r.Status, &r.Source, &r.Error, &r.CreatedAt, &r.UpdatedAt, &r.CoverID)
+ 	return r, err
+ }
+ 
+ func (s *SQLStore) Create(ctx context.Context, r *Request) error {
+ 	_, err := s.DB.ExecContext(ctx, `INSERT INTO acquire_request (`+requestColumns+`)
+-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+ 		r.ID, r.UserID, r.Kind, r.MBID, r.Artist, r.Album, r.Title,
+-		r.Status, r.Source, r.Error, r.CreatedAt, r.UpdatedAt)
++		r.Status, r.Source, r.Error, r.CreatedAt, r.UpdatedAt, r.CoverID)
+ 	return err
+ }
+ 
+diff --git a/core/acquire/store_sql_test.go b/core/acquire/store_sql_test.go
+index 1d0bd02..6566e99 100644
+--- a/core/acquire/store_sql_test.go
++++ b/core/acquire/store_sql_test.go
+@@ -19,13 +19,17 @@ func newSQLStore(t *testing.T) *SQLStore {
+ 	}
+ 	t.Cleanup(func() { db.Close() })
+ 	db.SetMaxOpenConns(1)
+-	mig, err := os.ReadFile("../../db/migrations/20261010000000_create_acquire_request.sql")
+-	if err != nil {
++	if _, err := db.Exec(`CREATE TABLE user (id VARCHAR(255) PRIMARY KEY);`); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	up := strings.Split(string(mig), "-- +goose Down")[0]
+-	if _, err := db.Exec(`CREATE TABLE user (id VARCHAR(255) PRIMARY KEY);` + up); err != nil {
+-		t.Fatal(err)
++	for _, f := range []string{"20261010000000_create_acquire_request.sql", "20261010170000_add_acquire_request_cover.sql"} {
++		mig, err := os.ReadFile("../../db/migrations/" + f)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if _, err := db.Exec(strings.Split(string(mig), "-- +goose Down")[0]); err != nil {
++			t.Fatal(err)
++		}
+ 	}
+ 	return NewSQLStore(db)
+ }
+diff --git a/core/seer/library.go b/core/seer/library.go
+index 6394e5b..c45403d 100644
+--- a/core/seer/library.go
++++ b/core/seer/library.go
+@@ -18,12 +18,33 @@ type library struct {
+ // Match looks the item up by MusicBrainz ID first, then by artist and title.
+ // It uses the caller's context, so users only match libraries they can see.
+ func (l *library) Match(ctx context.Context, item acquire.CatalogItem) (string, bool) {
+-	if item.Kind == acquire.KindAlbum {
++	switch item.Kind {
++	case acquire.KindAlbum:
+ 		return l.matchAlbum(ctx, item)
++	case acquire.KindArtist:
++		return l.matchArtist(ctx, item)
+ 	}
+ 	return l.matchTrack(ctx, item)
+ }
+ 
++func (l *library) matchArtist(ctx context.Context, item acquire.CatalogItem) (string, bool) {
++	filters := []Sqlizer{Eq{"artist.mbz_artist_id": item.MBID}}
++	if item.Title != "" {
++		filters = append(filters, Expr("artist.name = ? COLLATE NOCASE", item.Title))
++	}
++	for _, f := range filters {
++		ars, err := l.ds.Artist().GetAll(ctx, model.QueryOptions{Max: 1, Filters: And{f, Eq{"artist.missing": false}}})
++		if err != nil {
++			log.Warn(ctx, "Seer: error matching artist", "mbid", item.MBID, err)
++			return "", false
++		}
++		if len(ars) > 0 {
++			return ars[0].ID, true
++		}
++	}
++	return "", false
++}
++
+ func (l *library) matchTrack(ctx context.Context, item acquire.CatalogItem) (string, bool) {
+ 	filters := []Sqlizer{Eq{"media_file.mbz_recording_id": item.MBID}}
+ 	if item.Title != "" && item.Artist != "" {
+diff --git a/db/migrations/20261010170000_add_acquire_request_cover.sql b/db/migrations/20261010170000_add_acquire_request_cover.sql
+new file mode 100644
+index 0000000..72f660d
+--- /dev/null
++++ b/db/migrations/20261010170000_add_acquire_request_cover.sql
+@@ -0,0 +1,5 @@
++-- +goose Up
++ALTER TABLE acquire_request ADD COLUMN cover_id VARCHAR(64) NOT NULL DEFAULT '';
++
++-- +goose Down
++ALTER TABLE acquire_request DROP COLUMN cover_id;
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index 1346692..096cbbd 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -467,7 +467,8 @@
+       },
+       "kind": {
+         "track": "Música",
+-        "album": "Álbum"
++        "album": "Álbum",
++        "artist": "Artista"
+       },
+       "status": {
+         "pending": "Aguardando aprovação",
+@@ -483,13 +484,59 @@
+         "play": "Tocar",
+         "open": "Abrir",
+         "approve": "Aprovar",
+-        "retry": "Tentar de novo"
++        "retry": "Tentar de novo",
++        "requestAlbum": "Pedir álbum",
++        "back": "Voltar"
+       },
+       "message": {
+-        "searchPlaceholder": "Busque qualquer artista, álbum ou música",
+-        "noResults": "Nada encontrado",
++        "searchPlaceholder": "O que você quer ouvir?",
++        "noResults": "Nada encontrado para \"%{query}\"",
+         "noRequests": "Nenhum pedido ainda",
+-        "requested": "Pedido enviado"
++        "requested": "Pedido enviado",
++        "inLibrary": "Na biblioteca",
++        "albumCount": "%{smart_count} álbum |||| %{smart_count} álbuns",
++        "trackCount": "%{smart_count} música |||| %{smart_count} músicas",
++        "ownedCount": "%{smart_count} na biblioteca |||| %{smart_count} na biblioteca",
++        "albumHint": "Álbuns completos vêm do Soulseek ou do Lidarr. Você também pode pedir só as músicas abaixo.",
++        "noTracks": "O MusicBrainz ainda não tem a lista de faixas deste álbum.",
++        "catalogErrorTitle": "O MusicBrainz não respondeu",
++        "catalogError": "Ele pode estar ocupado agora. Tente de novo em alguns segundos.",
++        "welcomeTitle": "O que você quer ouvir?",
++        "welcomeText": "Busque qualquer artista, álbum ou música do mundo. O que ainda não está na sua biblioteca fica a um clique.",
++        "credit": "Catálogo do MusicBrainz · Capas do Cover Art Archive"
++      },
++      "types": {
++        "Album": "Álbum",
++        "EP": "EP",
++        "Single": "Single",
++        "Live": "Ao vivo",
++        "Compilation": "Coletânea",
++        "Soundtrack": "Trilha sonora",
++        "Remix": "Remix",
++        "DJmix": "DJ mix",
++        "Demo": "Demo",
++        "Mixtape": "Mixtape",
++        "Spokenword": "Falado",
++        "Interview": "Entrevista",
++        "Audiobook": "Audiolivro",
++        "Group": "Banda",
++        "Person": "Artista",
++        "Orchestra": "Orquestra",
++        "Choir": "Coral"
++      },
++      "sections": {
++        "topResult": "Melhor resultado",
++        "songs": "Músicas",
++        "moreSongs": "Mais músicas",
++        "artists": "Artistas",
++        "albums": "Álbuns",
++        "discography": "Discografia"
++      },
++      "filters": {
++        "all": "Tudo",
++        "albums": "Álbuns",
++        "eps": "EPs",
++        "other": "Ao vivo e outros"
+       }
+     }
+   },
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index a71e25c..0024f88 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -20,6 +20,8 @@ import (
+ // Service is the part of the Seer used by the API.
+ type Service interface {
+ 	SearchCatalog(ctx context.Context, query string, limit int) ([]acquire.CatalogItem, error)
++	CatalogArtist(ctx context.Context, mbid string) (*acquire.ArtistDetail, error)
++	CatalogAlbum(ctx context.Context, mbid string) (*acquire.AlbumDetail, error)
+ 	Submit(ctx context.Context, userID string, item acquire.CatalogItem) (*acquire.Request, error)
+ 	Approve(ctx context.Context, id string) (*acquire.Request, error)
+ 	Get(ctx context.Context, id string) (*acquire.Request, error)
+@@ -51,6 +53,8 @@ func (api *Router) routes() http.Handler {
+ 			r.Use(server.JWTRefresher)
+ 		}
+ 		r.Get("/catalog", api.searchCatalog)
++		r.Get("/catalog/artist/{mbid}", api.catalogArtist)
++		r.Get("/catalog/album/{mbid}", api.catalogAlbum)
+ 		r.Route("/requests", func(r chi.Router) {
+ 			r.Get("/", api.listRequests)
+ 			r.Post("/", api.createRequest)
+@@ -68,8 +72,7 @@ func (api *Router) searchCatalog(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	items, err := api.svc.SearchCatalog(r.Context(), r.URL.Query().Get("q"), limit)
+ 	if err != nil {
+-		log.Error(r.Context(), "Seer: catalog search failed", err)
+-		http.Error(w, "catalog search failed", http.StatusBadGateway)
++		catalogError(w, r, err)
+ 		return
+ 	}
+ 	if items == nil {
+@@ -78,6 +81,37 @@ func (api *Router) searchCatalog(w http.ResponseWriter, r *http.Request) {
+ 	writeJSON(w, http.StatusOK, items)
+ }
+ 
++func (api *Router) catalogArtist(w http.ResponseWriter, r *http.Request) {
++	d, err := api.svc.CatalogArtist(r.Context(), chi.URLParam(r, "mbid"))
++	if err != nil {
++		catalogError(w, r, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, d)
++}
++
++func (api *Router) catalogAlbum(w http.ResponseWriter, r *http.Request) {
++	d, err := api.svc.CatalogAlbum(r.Context(), chi.URLParam(r, "mbid"))
++	if err != nil {
++		catalogError(w, r, err)
++		return
++	}
++	writeJSON(w, http.StatusOK, d)
++}
++
++// catalogError reports MusicBrainz failures as 502 (or 404), with the cause in the server log.
++func catalogError(w http.ResponseWriter, r *http.Request, err error) {
++	switch {
++	case errors.Is(err, acquire.ErrNotFound):
++		http.Error(w, "not found", http.StatusNotFound)
++	case errors.Is(err, context.Canceled):
++		// the browser gave up (the user kept typing); nobody reads the answer
++	default:
++		log.Error(r.Context(), "Seer: MusicBrainz request failed", err)
++		http.Error(w, "MusicBrainz is unavailable: "+err.Error(), http.StatusBadGateway)
++	}
++}
++
+ // listRequests returns the caller's requests; admins see everyone's unless ?mine=true.
+ func (api *Router) listRequests(w http.ResponseWriter, r *http.Request) {
+ 	user, _ := request.UserFrom(r.Context())
+diff --git a/server/seerapi/seerapi_test.go b/server/seerapi/seerapi_test.go
+index 5100de0..8bf7cb2 100644
+--- a/server/seerapi/seerapi_test.go
++++ b/server/seerapi/seerapi_test.go
+@@ -2,6 +2,7 @@ package seerapi
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+@@ -20,6 +21,15 @@ type fakeService struct {
+ func (f *fakeService) SearchCatalog(context.Context, string, int) ([]acquire.CatalogItem, error) {
+ 	return []acquire.CatalogItem{{Kind: acquire.KindTrack, MBID: "m", Title: "T"}}, nil
+ }
++func (f *fakeService) CatalogArtist(_ context.Context, mbid string) (*acquire.ArtistDetail, error) {
++	if mbid != "a1" {
++		return nil, acquire.ErrNotFound
++	}
++	return &acquire.ArtistDetail{Artist: acquire.CatalogItem{Kind: acquire.KindArtist, MBID: "a1"}}, nil
++}
++func (f *fakeService) CatalogAlbum(context.Context, string) (*acquire.AlbumDetail, error) {
++	return nil, errors.New("musicbrainz is busy (HTTP 503)")
++}
+ func (f *fakeService) Submit(_ context.Context, userID string, item acquire.CatalogItem) (*acquire.Request, error) {
+ 	if item.MBID == "owned" {
+ 		return nil, acquire.ErrInLibrary
+@@ -65,6 +75,15 @@ func TestSeerAPI(t *testing.T) {
+ 	if w := do(t, api, user, "GET", "/catalog?q=x", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"mbid":"m"`) {
+ 		t.Errorf("catalog: %d %s", w.Code, w.Body)
+ 	}
++	if w := do(t, api, user, "GET", "/catalog/artist/a1", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"mbid":"a1"`) {
++		t.Errorf("artist: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, user, "GET", "/catalog/artist/zz", ""); w.Code != 404 {
++		t.Errorf("unknown artist: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, user, "GET", "/catalog/album/x", ""); w.Code != 502 || !strings.Contains(w.Body.String(), "503") {
++		t.Errorf("album error: %d %s", w.Code, w.Body)
++	}
+ 	if w := do(t, api, user, "POST", "/requests", `{"kind":"track","mbid":"x","title":"T"}`); w.Code != 201 || svc.reqs["new"].UserID != "u1" {
+ 		t.Errorf("create: %d %s", w.Code, w.Body)
+ 	}
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index 446183c..b1f1b54 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -470,7 +470,8 @@
+       },
+       "kind": {
+         "track": "Track",
+-        "album": "Album"
++        "album": "Album",
++        "artist": "Artist"
+       },
+       "status": {
+         "pending": "Waiting approval",
+@@ -486,13 +487,59 @@
+         "play": "Play",
+         "open": "Open",
+         "approve": "Approve",
+-        "retry": "Retry"
++        "retry": "Retry",
++        "requestAlbum": "Request album",
++        "back": "Back"
+       },
+       "message": {
+-        "searchPlaceholder": "Search any artist, album or song",
+-        "noResults": "Nothing found",
++        "searchPlaceholder": "What do you want to listen to?",
++        "noResults": "No results for \"%{query}\"",
+         "noRequests": "No requests yet",
+-        "requested": "Request sent"
++        "requested": "Request sent",
++        "inLibrary": "In your library",
++        "albumCount": "%{smart_count} album |||| %{smart_count} albums",
++        "trackCount": "%{smart_count} song |||| %{smart_count} songs",
++        "ownedCount": "%{smart_count} in your library |||| %{smart_count} in your library",
++        "albumHint": "Whole albums come from Soulseek or Lidarr. You can also request single songs below.",
++        "noTracks": "MusicBrainz has no tracklist for this album yet.",
++        "catalogErrorTitle": "MusicBrainz didn't answer",
++        "catalogError": "It may be busy right now. Try again in a few seconds.",
++        "welcomeTitle": "What do you want to listen to?",
++        "welcomeText": "Search any artist, album or song in the world. What isn't in your library yet is one click away.",
++        "credit": "Catalog by MusicBrainz · Covers by the Cover Art Archive"
++      },
++      "types": {
++        "Album": "Album",
++        "EP": "EP",
++        "Single": "Single",
++        "Live": "Live",
++        "Compilation": "Compilation",
++        "Soundtrack": "Soundtrack",
++        "Remix": "Remix",
++        "DJmix": "DJ mix",
++        "Demo": "Demo",
++        "Mixtape": "Mixtape",
++        "Spokenword": "Spoken word",
++        "Interview": "Interview",
++        "Audiobook": "Audiobook",
++        "Group": "Band",
++        "Person": "Artist",
++        "Orchestra": "Orchestra",
++        "Choir": "Choir"
++      },
++      "sections": {
++        "topResult": "Top result",
++        "songs": "Songs",
++        "moreSongs": "More songs",
++        "artists": "Artists",
++        "albums": "Albums",
++        "discography": "Discography"
++      },
++      "filters": {
++        "all": "All",
++        "albums": "Albums",
++        "eps": "EPs",
++        "other": "Live & more"
+       }
+     }
+   },
+diff --git a/ui/src/seer/AlbumView.jsx b/ui/src/seer/AlbumView.jsx
+new file mode 100644
+index 0000000..ca3ca9e
+--- /dev/null
++++ b/ui/src/seer/AlbumView.jsx
+@@ -0,0 +1,151 @@
++import { Typography } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import ScheduleIcon from '@material-ui/icons/Schedule'
++import { useTranslate } from 'react-admin'
++import { ItemAction } from './actions'
++import { getAlbum } from './api'
++import { Cover, useCoverColor } from './artwork'
++import {
++  formatDuration,
++  Shimmer,
++  TrackRow,
++  useNav,
++  useTypeLabel,
++} from './components'
++import { ErrorState, Hero } from './states'
++import { useCatalog } from './useCatalog'
++
++const useStyles = makeStyles((theme) => ({
++  cover: {
++    width: 'clamp(160px, 24vw, 240px)',
++    height: 'clamp(160px, 24vw, 240px)',
++    boxShadow: '0 16px 48px rgba(0,0,0,0.55)',
++    fontSize: 40,
++  },
++  artistLink: {
++    fontWeight: 800,
++    cursor: 'pointer',
++    '&:hover': { textDecoration: 'underline' },
++  },
++  head: {
++    display: 'grid',
++    gridTemplateColumns: '28px minmax(0, 1fr) 52px 120px',
++    gap: theme.spacing(2),
++    padding: '0 12px 8px',
++    margin: theme.spacing(2, 0, 1),
++    borderBottom: `1px solid ${theme.palette.divider}`,
++    color: theme.palette.text.secondary,
++    fontSize: 12,
++    fontWeight: 600,
++    textTransform: 'uppercase',
++    letterSpacing: '0.08em',
++    '& > :nth-child(1), & > :nth-child(3)': { textAlign: 'right' },
++    [theme.breakpoints.down('xs')]: { display: 'none' },
++  },
++  hint: {
++    color: theme.palette.text.secondary,
++    fontSize: 13,
++    maxWidth: 520,
++  },
++}))
++
++export const AlbumView = ({ mbid }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const typeLabel = useTypeLabel()
++  const nav = useNav()
++  const { data, loading, error, retry } = useCatalog(`album:${mbid}`, () =>
++    getAlbum(mbid),
++  )
++  const album = data?.album
++  const color = useCoverColor(mbid, album?.title || mbid)
++
++  if (error) return <ErrorState onRetry={retry} />
++  const tracks = data?.tracks || []
++  const total = tracks.reduce((s, t) => s + (t.durationMs || 0), 0)
++  return (
++    <>
++      <Hero
++        color={color}
++        art={
++          <Cover
++            id={mbid}
++            seed={album?.title || mbid}
++            size={500}
++            radius={8}
++            className={classes.cover}
++          />
++        }
++        label={
++          album
++            ? typeLabel(album.type) || translate('resources.seer.kind.album')
++            : translate('resources.seer.kind.album')
++        }
++        title={
++          album ? (
++            album.title
++          ) : (
++            <Shimmer width="60%" height={72} style={{ opacity: 0.5 }} />
++          )
++        }
++        meta={
++          album && [
++            <span
++              key="a"
++              className={classes.artistLink}
++              onClick={() => nav.artist(album.artistMbid)}
++            >
++              {album.artist}
++            </span>,
++            album.year,
++            tracks.length > 0 &&
++              translate('resources.seer.message.trackCount', {
++                smart_count: tracks.length,
++              }),
++            total > 0 && formatDuration(total),
++          ]
++        }
++      >
++        {album && <ItemAction item={album} variant="hero" />}
++        {album && !album.inLibrary && (
++          <span className={classes.hint}>
++            {translate('resources.seer.message.albumHint')}
++          </span>
++        )}
++      </Hero>
++      {loading ? (
++        [0, 1, 2, 3, 4, 5].map((i) => (
++          <Shimmer key={i} height={44} style={{ margin: '12px 0' }} />
++        ))
++      ) : tracks.length === 0 ? (
++        <Typography
++          variant="body2"
++          color="textSecondary"
++          style={{ marginTop: 24 }}
++        >
++          {translate('resources.seer.message.noTracks')}
++        </Typography>
++      ) : (
++        <>
++          <div className={classes.head}>
++            <span>#</span>
++            <span>{translate('resources.seer.fields.title')}</span>
++            <span>
++              <ScheduleIcon style={{ fontSize: 16, verticalAlign: 'middle' }} />
++            </span>
++            <span />
++          </div>
++          {tracks.map((t) => (
++            <TrackRow
++              key={`${t.trackNumber}-${t.mbid}`}
++              item={t}
++              index={t.trackNumber}
++              showCover={false}
++              showAlbum={false}
++            />
++          ))}
++        </>
++      )}
++    </>
++  )
++}
+diff --git a/ui/src/seer/ArtistView.jsx b/ui/src/seer/ArtistView.jsx
+new file mode 100644
+index 0000000..b85b8ec
+--- /dev/null
++++ b/ui/src/seer/ArtistView.jsx
+@@ -0,0 +1,144 @@
++import { useMemo, useState } from 'react'
++import { ButtonBase } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import { useTranslate } from 'react-admin'
++import { ItemAction } from './actions'
++import { getArtist } from './api'
++import { ArtistAvatar, hueOf } from './artwork'
++import {
++  AlbumCard,
++  Grid,
++  GridSkeleton,
++  Section,
++  Shimmer,
++  useTypeLabel,
++} from './components'
++import { ErrorState, Hero } from './states'
++import { useCatalog } from './useCatalog'
++
++const filters = {
++  all: () => true,
++  albums: (a) => a.type === 'Album',
++  eps: (a) => a.type === 'EP',
++  other: (a) => a.type !== 'Album' && a.type !== 'EP',
++}
++
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  return {
++    avatar: {
++      boxShadow: '0 16px 48px rgba(0,0,0,0.5)',
++      width: 'clamp(140px, 22vw, 232px) !important',
++      height: 'clamp(140px, 22vw, 232px) !important',
++      fontSize: 'clamp(48px, 8vw, 84px) !important',
++    },
++    chips: { display: 'flex', gap: theme.spacing(1), flexWrap: 'wrap' },
++    chip: {
++      borderRadius: 999,
++      padding: '6px 14px',
++      fontSize: 13,
++      fontWeight: 600,
++      background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
++      color: theme.palette.text.primary,
++      transition: 'background 150ms ease',
++      '&:hover': {
++        background: dark ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.1)',
++      },
++    },
++    chipOn: {
++      background: `${theme.palette.text.primary} !important`,
++      color: theme.palette.background.default,
++    },
++  }
++})
++
++export const ArtistView = ({ mbid }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const typeLabel = useTypeLabel()
++  const [filter, setFilter] = useState('all')
++  const { data, loading, error, retry } = useCatalog(`artist:${mbid}`, () =>
++    getArtist(mbid),
++  )
++  const albums = useMemo(() => data?.albums || [], [data])
++  const counts = useMemo(
++    () =>
++      Object.fromEntries(
++        Object.entries(filters).map(([k, f]) => [k, albums.filter(f).length]),
++      ),
++    [albums],
++  )
++
++  if (error) return <ErrorState onRetry={retry} />
++  const artist = data?.artist
++  const color = `hsl(${hueOf(mbid)}, 48%, 36%)`
++  const owned = albums.filter((a) => a.inLibrary).length
++  return (
++    <>
++      <Hero
++        color={color}
++        art={
++          <ArtistAvatar
++            name={artist?.title || ''}
++            seed={mbid}
++            className={classes.avatar}
++          />
++        }
++        label={translate('resources.seer.kind.artist')}
++        title={
++          artist ? (
++            artist.title
++          ) : (
++            <Shimmer width="60%" height={72} style={{ opacity: 0.5 }} />
++          )
++        }
++        meta={
++          artist && [
++            typeLabel(artist.type),
++            artist.country,
++            artist.disambiguation,
++            translate('resources.seer.message.albumCount', {
++              smart_count: albums.length,
++            }),
++            owned > 0 &&
++              translate('resources.seer.message.ownedCount', {
++                smart_count: owned,
++              }),
++          ]
++        }
++      >
++        {artist?.inLibrary && <ItemAction item={artist} variant="hero" />}
++      </Hero>
++      <Section
++        title={translate('resources.seer.sections.discography')}
++        action={
++          !loading && (
++            <div className={classes.chips}>
++              {Object.keys(filters)
++                .filter((k) => k === 'all' || counts[k] > 0)
++                .map((k) => (
++                  <ButtonBase
++                    key={k}
++                    className={`${classes.chip} ${filter === k ? classes.chipOn : ''}`}
++                    onClick={() => setFilter(k)}
++                  >
++                    {translate(`resources.seer.filters.${k}`)} · {counts[k]}
++                  </ButtonBase>
++                ))}
++            </div>
++          )
++        }
++      >
++        {loading ? (
++          <GridSkeleton count={10} />
++        ) : (
++          <Grid>
++            {albums.filter(filters[filter]).map((a) => (
++              <AlbumCard key={a.mbid} item={a} showArtist={false} />
++            ))}
++          </Grid>
++        )}
++      </Section>
++    </>
++  )
++}
+diff --git a/ui/src/seer/CatalogResults.jsx b/ui/src/seer/CatalogResults.jsx
+deleted file mode 100644
+index 86699e8..0000000
+--- a/ui/src/seer/CatalogResults.jsx
++++ /dev/null
+@@ -1,97 +0,0 @@
+-import {
+-  Button,
+-  List,
+-  ListItem,
+-  ListItemIcon,
+-  ListItemSecondaryAction,
+-  ListItemText,
+-} from '@material-ui/core'
+-import AlbumIcon from '@material-ui/icons/Album'
+-import MusicNoteIcon from '@material-ui/icons/MusicNote'
+-import PlayArrowIcon from '@material-ui/icons/PlayArrow'
+-import AddIcon from '@material-ui/icons/Add'
+-import { useDataProvider, useNotify, useTranslate } from 'react-admin'
+-import { useDispatch } from 'react-redux'
+-import { useHistory } from 'react-router-dom'
+-import { playTracks } from '../actions'
+-import { StatusChip } from './StatusChip'
+-
+-const describe = (item) =>
+-  [item.artist, item.kind === 'track' ? item.album : null, item.year]
+-    .filter(Boolean)
+-    .join(' · ')
+-
+-const OwnedAction = ({ item }) => {
+-  const translate = useTranslate()
+-  const dataProvider = useDataProvider()
+-  const dispatch = useDispatch()
+-  const history = useHistory()
+-  const notify = useNotify()
+-
+-  const play = () => {
+-    if (item.kind === 'album') {
+-      history.push(`/album/${item.libraryId}/show`)
+-      return
+-    }
+-    dataProvider
+-      .getOne('song', { id: item.libraryId })
+-      .then(({ data }) => dispatch(playTracks({ [data.id]: data }, [data.id])))
+-      .catch(() => notify('ra.page.error', 'warning'))
+-  }
+-
+-  return (
+-    <Button size="small" color="primary" onClick={play}>
+-      <PlayArrowIcon fontSize="small" />
+-      {translate(
+-        item.kind === 'album'
+-          ? 'resources.seer.actions.open'
+-          : 'resources.seer.actions.play',
+-      )}
+-    </Button>
+-  )
+-}
+-
+-export const CatalogResults = ({ items, requests, onRequest }) => {
+-  const translate = useTranslate()
+-  const findRequest = (item) =>
+-    requests.find(
+-      (r) =>
+-        r.kind === item.kind && r.mbid === item.mbid && r.status !== 'failed',
+-    )
+-
+-  return (
+-    <List dense>
+-      {items.map((item) => {
+-        const req = findRequest(item)
+-        return (
+-          <ListItem key={`${item.kind}-${item.mbid}`}>
+-            <ListItemIcon>
+-              {item.kind === 'album' ? <AlbumIcon /> : <MusicNoteIcon />}
+-            </ListItemIcon>
+-            <ListItemText
+-              primary={item.title}
+-              secondary={`${translate(`resources.seer.kind.${item.kind}`)} · ${describe(item)}`}
+-            />
+-            <ListItemSecondaryAction>
+-              {item.inLibrary ? (
+-                <OwnedAction item={item} />
+-              ) : req ? (
+-                <StatusChip status={req.status} error={req.error} />
+-              ) : (
+-                <Button
+-                  size="small"
+-                  variant="outlined"
+-                  color="primary"
+-                  onClick={() => onRequest(item)}
+-                >
+-                  <AddIcon fontSize="small" />
+-                  {translate('resources.seer.actions.request')}
+-                </Button>
+-              )}
+-            </ListItemSecondaryAction>
+-          </ListItem>
+-        )
+-      })}
+-    </List>
+-  )
+-}
+diff --git a/ui/src/seer/RequestsList.jsx b/ui/src/seer/RequestsList.jsx
+new file mode 100644
+index 0000000..6165847
+--- /dev/null
++++ b/ui/src/seer/RequestsList.jsx
+@@ -0,0 +1,181 @@
++import { ButtonBase, Typography } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import { usePermissions, useTranslate } from 'react-admin'
++import { Cover } from './artwork'
++import { useNav } from './components'
++import { StatusChip } from './StatusChip'
++
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  return {
++    list: { display: 'flex', flexDirection: 'column', gap: 4 },
++    row: {
++      display: 'grid',
++      gridTemplateColumns: '52px minmax(0, 1fr) auto auto',
++      alignItems: 'center',
++      gap: theme.spacing(2),
++      padding: '8px 12px',
++      borderRadius: 10,
++      transition: 'background 150ms ease',
++      '&:hover': {
++        background: dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.05)',
++      },
++      [theme.breakpoints.down('xs')]: {
++        gridTemplateColumns: '44px minmax(0, 1fr) auto',
++        gap: theme.spacing(1.5),
++      },
++    },
++    cover: {
++      width: 52,
++      height: 52,
++      cursor: 'pointer',
++      fontSize: 10,
++      [theme.breakpoints.down('xs')]: { width: 44, height: 44 },
++    },
++    title: {
++      fontSize: 15,
++      fontWeight: 600,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    sub: {
++      fontSize: 13,
++      color: theme.palette.text.secondary,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    error: {
++      fontSize: 12,
++      color: '#ff5c7a',
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    when: {
++      fontSize: 13,
++      color: theme.palette.text.secondary,
++      whiteSpace: 'nowrap',
++      [theme.breakpoints.down('xs')]: { display: 'none' },
++    },
++    side: {
++      display: 'flex',
++      alignItems: 'center',
++      gap: theme.spacing(1),
++      justifyContent: 'flex-end',
++    },
++    admin: {
++      borderRadius: 999,
++      padding: '5px 14px',
++      fontSize: 12,
++      fontWeight: 700,
++      border: `1px solid ${theme.palette.divider}`,
++      '&:hover': { borderColor: theme.palette.text.primary },
++    },
++    empty: {
++      color: theme.palette.text.secondary,
++      padding: theme.spacing(2, 1),
++    },
++  }
++})
++
++const relative = (iso, locale) => {
++  const diff = (new Date(iso).getTime() - Date.now()) / 1000
++  const rtf = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' })
++  const steps = [
++    [60, 'second'],
++    [3600, 'minute'],
++    [86400, 'hour'],
++    [604800, 'day'],
++    [2629800, 'week'],
++    [31557600, 'month'],
++  ]
++  for (const [limit, unit] of steps) {
++    if (Math.abs(diff) < limit) {
++      const div = {
++        second: 1,
++        minute: 60,
++        hour: 3600,
++        day: 86400,
++        week: 604800,
++        month: 2629800,
++      }[unit]
++      return rtf.format(Math.round(diff / div), unit)
++    }
++  }
++  return new Date(iso).toLocaleDateString(locale)
++}
++
++export const RequestsList = ({ requests, onApprove }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const nav = useNav()
++  const { permissions } = usePermissions()
++  const isAdmin = permissions === 'admin'
++  const locale = document.documentElement.lang || undefined
++
++  if (requests.length === 0) {
++    return (
++      <Typography className={classes.empty}>
++        {translate('resources.seer.message.noRequests')}
++      </Typography>
++    )
++  }
++  return (
++    <div className={classes.list}>
++      {requests.map((r) => {
++        const target = r.kind === 'album' ? r.mbid : r.coverId
++        return (
++          <div key={r.id} className={classes.row}>
++            <Cover
++              id={r.coverId || (r.kind === 'album' ? r.mbid : null)}
++              seed={r.album || r.title}
++              radius={6}
++              className={classes.cover}
++              style={{}}
++            />
++            <div style={{ minWidth: 0 }} onClick={() => nav.album(target)}>
++              <div className={classes.title} title={r.title}>
++                {r.title}
++              </div>
++              <div className={classes.sub}>
++                {[
++                  translate(`resources.seer.kind.${r.kind}`),
++                  r.artist,
++                  r.kind === 'track' ? r.album : null,
++                  r.source,
++                ]
++                  .filter(Boolean)
++                  .join(' · ')}
++              </div>
++              {r.status === 'failed' && r.error && (
++                <div className={classes.error} title={r.error}>
++                  {r.error}
++                </div>
++              )}
++            </div>
++            <span className={classes.when}>
++              {relative(r.createdAt, locale)}
++            </span>
++            <div className={classes.side}>
++              <StatusChip status={r.status} error={r.error} />
++              {isAdmin && (r.status === 'pending' || r.status === 'failed') && (
++                <ButtonBase
++                  className={classes.admin}
++                  onClick={() => onApprove(r)}
++                >
++                  {translate(
++                    r.status === 'pending'
++                      ? 'resources.seer.actions.approve'
++                      : 'resources.seer.actions.retry',
++                  )}
++                </ButtonBase>
++              )}
++            </div>
++          </div>
++        )
++      })}
++    </div>
++  )
++}
+diff --git a/ui/src/seer/RequestsTable.jsx b/ui/src/seer/RequestsTable.jsx
+deleted file mode 100644
+index bc28a9a..0000000
+--- a/ui/src/seer/RequestsTable.jsx
++++ /dev/null
+@@ -1,87 +0,0 @@
+-import {
+-  Button,
+-  Table,
+-  TableBody,
+-  TableCell,
+-  TableHead,
+-  TableRow,
+-  Typography,
+-} from '@material-ui/core'
+-import { usePermissions, useTranslate } from 'react-admin'
+-import { StatusChip } from './StatusChip'
+-
+-const formatDate = (d) => new Date(d).toLocaleString()
+-
+-export const RequestsTable = ({ requests, onApprove }) => {
+-  const translate = useTranslate()
+-  const { permissions } = usePermissions()
+-  const isAdmin = permissions === 'admin'
+-
+-  if (requests.length === 0) {
+-    return (
+-      <Typography variant="body2" color="textSecondary">
+-        {translate('resources.seer.message.noRequests')}
+-      </Typography>
+-    )
+-  }
+-
+-  return (
+-    <Table size="small">
+-      <TableHead>
+-        <TableRow>
+-          <TableCell>{translate('resources.seer.fields.title')}</TableCell>
+-          <TableCell>{translate('resources.seer.fields.artist')}</TableCell>
+-          <TableCell>{translate('resources.seer.fields.status')}</TableCell>
+-          <TableCell>{translate('resources.seer.fields.source')}</TableCell>
+-          <TableCell>{translate('resources.seer.fields.createdAt')}</TableCell>
+-          {isAdmin && <TableCell />}
+-        </TableRow>
+-      </TableHead>
+-      <TableBody>
+-        {requests.map((r) => (
+-          <TableRow key={r.id}>
+-            <TableCell>
+-              {r.title}
+-              <Typography
+-                variant="caption"
+-                display="block"
+-                color="textSecondary"
+-              >
+-                {translate(`resources.seer.kind.${r.kind}`)}
+-                {r.kind === 'track' && r.album ? ` · ${r.album}` : ''}
+-              </Typography>
+-            </TableCell>
+-            <TableCell>{r.artist}</TableCell>
+-            <TableCell>
+-              <StatusChip status={r.status} error={r.error} />
+-              {r.status === 'failed' && r.error && (
+-                <Typography variant="caption" display="block" color="error">
+-                  {r.error}
+-                </Typography>
+-              )}
+-            </TableCell>
+-            <TableCell>{r.source || '—'}</TableCell>
+-            <TableCell>{formatDate(r.createdAt)}</TableCell>
+-            {isAdmin && (
+-              <TableCell align="right">
+-                {(r.status === 'pending' || r.status === 'failed') && (
+-                  <Button
+-                    size="small"
+-                    color="primary"
+-                    onClick={() => onApprove(r)}
+-                  >
+-                    {translate(
+-                      r.status === 'pending'
+-                        ? 'resources.seer.actions.approve'
+-                        : 'resources.seer.actions.retry',
+-                    )}
+-                  </Button>
+-                )}
+-              </TableCell>
+-            )}
+-          </TableRow>
+-        ))}
+-      </TableBody>
+-    </Table>
+-  )
+-}
+diff --git a/ui/src/seer/SearchView.jsx b/ui/src/seer/SearchView.jsx
+new file mode 100644
+index 0000000..41ddfe8
+--- /dev/null
++++ b/ui/src/seer/SearchView.jsx
+@@ -0,0 +1,262 @@
++import { ButtonBase, Typography } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import { useTranslate } from 'react-admin'
++import { ItemAction } from './actions'
++import { ArtistAvatar, Cover } from './artwork'
++import {
++  AlbumCard,
++  ArtistCard,
++  Grid,
++  GridSkeleton,
++  Section,
++  Shimmer,
++  TrackRow,
++  useNav,
++  useTypeLabel,
++} from './components'
++import { ErrorState } from './states'
++
++const fold = (s = '') =>
++  s
++    .normalize('NFD')
++    .toLowerCase()
++    .replace(/[^\p{L}\p{N}]/gu, '')
++
++// pickTop chooses the "best result": the artist whose name was typed, else the first album or track.
++export const pickTop = (items, query) =>
++  items.find((i) => i.kind === 'artist' && fold(i.title) === fold(query)) ||
++  items.find((i) => i.kind === 'album') ||
++  items.find((i) => i.kind === 'track') ||
++  items[0]
++
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  return {
++    topRow: {
++      display: 'grid',
++      gridTemplateColumns: 'minmax(0, 5fr) minmax(0, 7fr)',
++      gap: theme.spacing(3),
++      [theme.breakpoints.down('sm')]: { gridTemplateColumns: 'minmax(0, 1fr)' },
++    },
++    top: {
++      display: 'flex',
++      flexDirection: 'column',
++      alignItems: 'flex-start',
++      textAlign: 'left',
++      width: '100%',
++      boxSizing: 'border-box',
++      minHeight: 236,
++      padding: theme.spacing(2.5),
++      borderRadius: 14,
++      position: 'relative',
++      overflow: 'hidden',
++      background: dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.035)',
++      transition: 'background 200ms ease',
++      '&:hover': {
++        background: dark ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.07)',
++      },
++      '&:hover $topAction': { opacity: 1, transform: 'translateY(0)' },
++    },
++    glow: {
++      position: 'absolute',
++      inset: 0,
++      opacity: dark ? 0.22 : 0.14,
++      pointerEvents: 'none',
++    },
++    topTitle: {
++      fontSize: 32,
++      fontWeight: 900,
++      letterSpacing: '-0.03em',
++      lineHeight: 1.1,
++      marginTop: theme.spacing(2.5),
++      display: '-webkit-box',
++      WebkitLineClamp: 2,
++      WebkitBoxOrient: 'vertical',
++      overflow: 'hidden',
++    },
++    topSub: {
++      marginTop: theme.spacing(1),
++      display: 'flex',
++      alignItems: 'center',
++      gap: theme.spacing(1),
++      color: theme.palette.text.secondary,
++      fontSize: 14,
++      flexWrap: 'wrap',
++    },
++    badge: {
++      fontSize: 11,
++      fontWeight: 800,
++      textTransform: 'uppercase',
++      letterSpacing: '0.08em',
++      padding: '4px 10px',
++      borderRadius: 999,
++      background: dark ? 'rgba(0,0,0,0.4)' : 'rgba(255,255,255,0.8)',
++      color: theme.palette.text.primary,
++    },
++    topAction: {
++      position: 'absolute',
++      right: theme.spacing(2.5),
++      bottom: theme.spacing(2.5),
++      opacity: 0,
++      transform: 'translateY(8px)',
++      transition: 'opacity 200ms ease, transform 200ms ease',
++      '@media (hover: none)': { opacity: 1, transform: 'none' },
++    },
++    songs: { display: 'flex', flexDirection: 'column', gap: 2 },
++  }
++})
++
++const TopResult = ({ item }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const nav = useNav()
++  const typeLabel = useTypeLabel()
++  const isArtist = item.kind === 'artist'
++  const open = () =>
++    isArtist ? nav.artist(item.mbid) : nav.album(item.coverId || item.mbid)
++  return (
++    <ButtonBase
++      component="div"
++      className={classes.top}
++      onClick={open}
++      focusRipple
++    >
++      {isArtist ? (
++        <ArtistAvatar
++          name={item.title}
++          seed={item.mbid}
++          size={104}
++          style={{ boxShadow: '0 10px 30px rgba(0,0,0,0.4)' }}
++        />
++      ) : (
++        <Cover
++          id={item.coverId || item.mbid}
++          seed={item.album || item.title}
++          radius={8}
++          style={{
++            width: 104,
++            height: 104,
++            boxShadow: '0 10px 30px rgba(0,0,0,0.4)',
++          }}
++        />
++      )}
++      <div className={classes.topTitle}>{item.title}</div>
++      <div className={classes.topSub}>
++        <span className={classes.badge}>
++          {translate(`resources.seer.kind.${item.kind}`)}
++        </span>
++        <span>
++          {isArtist
++            ? [typeLabel(item.type), item.country, item.disambiguation]
++                .filter(Boolean)
++                .join(' · ')
++            : [item.artist, item.year].filter(Boolean).join(' · ')}
++        </span>
++      </div>
++      {!isArtist && (
++        <div className={classes.topAction}>
++          <ItemAction item={item} variant="fab" />
++        </div>
++      )}
++    </ButtonBase>
++  )
++}
++
++export const SearchSkeleton = () => {
++  const classes = useStyles()
++  return (
++    <>
++      <div className={classes.topRow} style={{ marginTop: 32 }}>
++        <Shimmer height={236} />
++        <div className={classes.songs}>
++          {[0, 1, 2, 3].map((i) => (
++            <div
++              key={i}
++              style={{
++                display: 'flex',
++                gap: 16,
++                padding: '8px 12px',
++                alignItems: 'center',
++              }}
++            >
++              <Shimmer width={44} height={44} />
++              <div style={{ flex: 1 }}>
++                <Shimmer width="55%" height={14} style={{ marginBottom: 8 }} />
++                <Shimmer width="30%" height={12} />
++              </div>
++            </div>
++          ))}
++        </div>
++      </div>
++      <div style={{ height: 40 }} />
++      <GridSkeleton count={6} />
++    </>
++  )
++}
++
++export const SearchView = ({ query, results, loading, error, onRetry }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  if (loading && !results) return <SearchSkeleton />
++  if (error) return <ErrorState onRetry={onRetry} />
++  if (!results) return null
++  if (results.length === 0) {
++    return (
++      <Typography
++        variant="h6"
++        style={{ marginTop: 48, textAlign: 'center', opacity: 0.7 }}
++      >
++        {translate('resources.seer.message.noResults', { query })}
++      </Typography>
++    )
++  }
++  const top = pickTop(results, query)
++  const artists = results.filter((i) => i.kind === 'artist')
++  const albums = results.filter((i) => i.kind === 'album')
++  const tracks = results.filter((i) => i.kind === 'track')
++  const firstTracks = tracks.slice(0, 4)
++  const moreTracks = tracks.slice(4)
++  return (
++    <div style={{ opacity: loading ? 0.5 : 1, transition: 'opacity 200ms' }}>
++      <div className={classes.topRow}>
++        <Section title={translate('resources.seer.sections.topResult')}>
++          <TopResult item={top} />
++        </Section>
++        {firstTracks.length > 0 && (
++          <Section title={translate('resources.seer.sections.songs')}>
++            <div className={classes.songs}>
++              {firstTracks.map((t) => (
++                <TrackRow key={t.mbid} item={t} showAlbum={false} />
++              ))}
++            </div>
++          </Section>
++        )}
++      </div>
++      {artists.length > 0 && (
++        <Section title={translate('resources.seer.sections.artists')}>
++          <Grid>
++            {artists.map((a) => (
++              <ArtistCard key={a.mbid} item={a} />
++            ))}
++          </Grid>
++        </Section>
++      )}
++      {albums.length > 0 && (
++        <Section title={translate('resources.seer.sections.albums')}>
++          <Grid>
++            {albums.map((a) => (
++              <AlbumCard key={a.mbid} item={a} />
++            ))}
++          </Grid>
++        </Section>
++      )}
++      {moreTracks.length > 0 && (
++        <Section title={translate('resources.seer.sections.moreSongs')}>
++          {moreTracks.map((t) => (
++            <TrackRow key={t.mbid} item={t} />
++          ))}
++        </Section>
++      )}
++    </div>
++  )
++}
+diff --git a/ui/src/seer/Seer.test.jsx b/ui/src/seer/Seer.test.jsx
+index b263b34..2205704 100644
+--- a/ui/src/seer/Seer.test.jsx
++++ b/ui/src/seer/Seer.test.jsx
+@@ -2,8 +2,9 @@ import React from 'react'
+ import { render, fireEvent } from '@testing-library/react'
+ import { describe, it, expect, vi, beforeEach } from 'vitest'
+ import * as RA from 'react-admin'
+-import { CatalogResults } from './CatalogResults'
+-import { RequestsTable } from './RequestsTable'
++import { SeerContext } from './actions'
++import { RequestsList } from './RequestsList'
++import { SearchView, pickTop } from './SearchView'
+ 
+ vi.mock('react-admin', async () => {
+   const actual = await vi.importActual('react-admin')
+@@ -21,47 +22,102 @@ vi.mock('react-redux', async () => {
+   return { ...actual, useDispatch: () => vi.fn() }
+ })
+ 
++const push = vi.fn()
+ vi.mock('react-router-dom', async () => {
+   const actual = await vi.importActual('react-router-dom')
+-  return { ...actual, useHistory: () => ({ push: vi.fn() }) }
++  return { ...actual, useHistory: () => ({ push, length: 1 }) }
+ })
+ 
+-const items = [
++const results = [
++  {
++    kind: 'artist',
++    mbid: 'ar1',
++    title: 'Charlie Brown Jr.',
++    artist: 'Charlie Brown Jr.',
++  },
++  {
++    kind: 'artist',
++    mbid: 'ar2',
++    title: 'Charlie Brown',
++    artist: 'Charlie Brown',
++  },
+   {
+     kind: 'album',
+-    mbid: 'a1',
++    mbid: 'al1',
++    coverId: 'al1',
+     title: 'Owned',
+     artist: 'X',
+     inLibrary: true,
+     libraryId: 'l1',
+   },
+-  { kind: 'track', mbid: 't1', title: 'Missing', artist: 'X' },
++  {
++    kind: 'track',
++    mbid: 't1',
++    title: 'Missing',
++    artist: 'X',
++    artistMbid: 'ar1',
++  },
+   { kind: 'track', mbid: 't2', title: 'Asked', artist: 'X' },
+ ]
+ 
+-describe('CatalogResults', () => {
+-  it('shows open for owned items, request for missing ones and the status of active requests', () => {
+-    const onRequest = vi.fn()
++const withSeer = (ui, requests = [], request = vi.fn()) => (
++  <SeerContext.Provider value={{ requests, request }}>
++    {ui}
++  </SeerContext.Provider>
++)
++
++describe('SearchView', () => {
++  beforeEach(() => vi.clearAllMocks())
++
++  it('picks the artist whose name was typed as the top result', () => {
++    expect(pickTop(results, 'charlie brown jr').mbid).toBe('ar1')
++    expect(pickTop(results, 'something else').mbid).toBe('al1')
++  })
++
++  it('shows sections, request buttons and the status of active requests', () => {
++    const request = vi.fn()
+     const requests = [
+       { id: 'r', kind: 'track', mbid: 't2', status: 'downloading' },
+     ]
+-    const { getByText, getAllByText } = render(
+-      <CatalogResults
+-        items={items}
+-        requests={requests}
+-        onRequest={onRequest}
+-      />,
++    const { getByText, getAllByLabelText, getAllByText } = render(
++      withSeer(
++        <SearchView query="charlie brown jr" results={results} />,
++        requests,
++        request,
++      ),
+     )
+-    expect(getByText('resources.seer.actions.open')).toBeTruthy()
++    expect(getByText('resources.seer.sections.topResult')).toBeTruthy()
++    expect(getByText('resources.seer.sections.artists')).toBeTruthy()
+     expect(getByText('resources.seer.status.downloading')).toBeTruthy()
+-    const requestButtons = getAllByText('resources.seer.actions.request')
+-    expect(requestButtons).toHaveLength(1)
+-    fireEvent.click(requestButtons[0])
+-    expect(onRequest).toHaveBeenCalledWith(items[1])
++    expect(getAllByText('Charlie Brown Jr.').length).toBeGreaterThan(0)
++    const buttons = getAllByLabelText('resources.seer.actions.request')
++    expect(buttons).toHaveLength(1)
++    fireEvent.click(buttons[0])
++    expect(request).toHaveBeenCalledWith(results[3])
++    expect(getAllByLabelText('resources.seer.actions.open')).toHaveLength(1)
++  })
++
++  it('opens the artist page from an artist card', () => {
++    const { getByText } = render(
++      withSeer(<SearchView query="x" results={results} />),
++    )
++    fireEvent.click(getByText('Charlie Brown'))
++    expect(push).toHaveBeenCalledWith('/seer?artist=ar2')
++  })
++
++  it('offers a retry when MusicBrainz fails', () => {
++    const onRetry = vi.fn()
++    const { getByText } = render(
++      withSeer(
++        <SearchView query="x" error={new Error('x')} onRetry={onRetry} />,
++      ),
++    )
++    fireEvent.click(getByText('resources.seer.actions.retry'))
++    expect(onRetry).toHaveBeenCalled()
+   })
+ })
+ 
+-describe('RequestsTable', () => {
++describe('RequestsList', () => {
+   const requests = [
+     {
+       id: '1',
+@@ -74,6 +130,7 @@ describe('RequestsTable', () => {
+     {
+       id: '2',
+       kind: 'album',
++      mbid: 'm2',
+       title: 'F',
+       artist: 'A',
+       status: 'failed',
+@@ -83,6 +140,7 @@ describe('RequestsTable', () => {
+     {
+       id: '3',
+       kind: 'album',
++      mbid: 'm3',
+       title: 'OK',
+       artist: 'A',
+       status: 'available',
+@@ -94,7 +152,7 @@ describe('RequestsTable', () => {
+ 
+   it('hides approval buttons from regular users', () => {
+     const { queryByText, getByText } = render(
+-      <RequestsTable requests={requests} onApprove={vi.fn()} />,
++      <RequestsList requests={requests} onApprove={vi.fn()} />,
+     )
+     expect(queryByText('resources.seer.actions.approve')).toBeNull()
+     expect(getByText('boom')).toBeTruthy()
+@@ -104,7 +162,7 @@ describe('RequestsTable', () => {
+     RA.usePermissions.mockReturnValue({ permissions: 'admin' })
+     const onApprove = vi.fn()
+     const { getByText } = render(
+-      <RequestsTable requests={requests} onApprove={onApprove} />,
++      <RequestsList requests={requests} onApprove={onApprove} />,
+     )
+     fireEvent.click(getByText('resources.seer.actions.approve'))
+     fireEvent.click(getByText('resources.seer.actions.retry'))
+@@ -113,7 +171,7 @@ describe('RequestsTable', () => {
+ 
+   it('shows an empty message', () => {
+     const { getByText } = render(
+-      <RequestsTable requests={[]} onApprove={vi.fn()} />,
++      <RequestsList requests={[]} onApprove={vi.fn()} />,
+     )
+     expect(getByText('resources.seer.message.noRequests')).toBeTruthy()
+   })
+diff --git a/ui/src/seer/SeerPage.jsx b/ui/src/seer/SeerPage.jsx
+index 8353026..6b56150 100644
+--- a/ui/src/seer/SeerPage.jsx
++++ b/ui/src/seer/SeerPage.jsx
+@@ -1,31 +1,117 @@
+-import { useCallback, useEffect, useState } from 'react'
+-import {
+-  Card,
+-  CardContent,
+-  CircularProgress,
+-  InputAdornment,
+-  TextField,
+-  Typography,
+-} from '@material-ui/core'
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
++import { IconButton, InputBase } from '@material-ui/core'
+ import { makeStyles } from '@material-ui/core/styles'
++import CloseIcon from '@material-ui/icons/Close'
+ import SearchIcon from '@material-ui/icons/Search'
+ import { Title, useNotify, useTranslate } from 'react-admin'
++import { useHistory, useLocation } from 'react-router-dom'
+ import { useRefreshOnEvents } from '../common'
+ import config from '../config'
++import { SeerContext } from './actions'
++import { AlbumView } from './AlbumView'
+ import {
+   approveRequest,
+   createRequest,
+   listRequests,
+   searchCatalog,
+ } from './api'
+-import { CatalogResults } from './CatalogResults'
+-import { RequestsTable } from './RequestsTable'
++import { ArtistView } from './ArtistView'
++import { Section } from './components'
++import { RequestsList } from './RequestsList'
++import { SearchView } from './SearchView'
++import { useCatalog } from './useCatalog'
+ 
+-const useStyles = makeStyles((theme) => ({
+-  root: { marginTop: theme.spacing(2) },
+-  section: { marginBottom: theme.spacing(2) },
+-  progress: { display: 'block', margin: theme.spacing(2, 'auto') },
+-}))
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  return {
++    root: {
++      padding: theme.spacing(2, 3, 12),
++      maxWidth: 1600,
++      [theme.breakpoints.down('xs')]: { padding: theme.spacing(1, 1, 12) },
++    },
++    bar: {
++      position: 'sticky',
++      top: 0,
++      zIndex: 5,
++      padding: theme.spacing(1.5, 0),
++      margin: theme.spacing(0, 0, 1),
++    },
++    search: {
++      display: 'flex',
++      alignItems: 'center',
++      gap: theme.spacing(1),
++      maxWidth: 560,
++      height: 52,
++      padding: theme.spacing(0, 1, 0, 2),
++      borderRadius: 999,
++      background: dark ? '#242424' : '#fff',
++      border: `2px solid ${dark ? 'transparent' : 'rgba(0,0,0,0.08)'}`,
++      boxShadow: dark
++        ? '0 8px 24px rgba(0,0,0,0.35)'
++        : '0 6px 20px rgba(0,0,0,0.08)',
++      transition: 'border-color 150ms ease, background 150ms ease',
++      '&:hover': {
++        background: dark ? '#2a2a2a' : '#fff',
++        borderColor: dark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.15)',
++      },
++      '&:focus-within': { borderColor: theme.palette.text.primary },
++      '& > svg': { color: theme.palette.text.secondary },
++    },
++    input: { flex: 1, fontSize: 16, fontWeight: 500 },
++    welcome: {
++      position: 'relative',
++      overflow: 'hidden',
++      borderRadius: 20,
++      padding: theme.spacing(6, 5),
++      marginTop: theme.spacing(2),
++      color: 'white',
++      background:
++        'radial-gradient(1200px 400px at 0% 0%, #1ed76055, transparent 60%), radial-gradient(900px 500px at 100% 100%, #7c4dff66, transparent 60%), linear-gradient(135deg, #10241a 0%, #1a1035 100%)',
++      [theme.breakpoints.down('xs')]: { padding: theme.spacing(4, 3) },
++    },
++    welcomeTitle: {
++      fontSize: 'clamp(2rem, 5vw, 3.6rem)',
++      fontWeight: 900,
++      letterSpacing: '-0.04em',
++      lineHeight: 1.05,
++      margin: 0,
++    },
++    welcomeText: {
++      fontSize: 16,
++      opacity: 0.85,
++      maxWidth: 560,
++      marginTop: theme.spacing(1.5),
++    },
++    vinyl: {
++      position: 'absolute',
++      right: -60,
++      top: -60,
++      width: 260,
++      height: 260,
++      borderRadius: '50%',
++      background:
++        'repeating-radial-gradient(circle, #111 0 2px, #1b1b1b 2px 4px), #111',
++      boxShadow: '0 20px 60px rgba(0,0,0,0.5)',
++      opacity: 0.55,
++      animation: '$spin 12s linear infinite',
++      '&::after': {
++        content: '""',
++        position: 'absolute',
++        inset: '38%',
++        borderRadius: '50%',
++        background: 'linear-gradient(135deg, #1ed760, #7c4dff)',
++      },
++      [theme.breakpoints.down('xs')]: { display: 'none' },
++    },
++    '@keyframes spin': { to: { transform: 'rotate(360deg)' } },
++    credit: {
++      marginTop: theme.spacing(6),
++      fontSize: 12,
++      color: theme.palette.text.secondary,
++      textAlign: 'center',
++    },
++  }
++})
+ 
+ const errorMessage = (err) => err?.body || err?.message || String(err)
+ 
+@@ -33,10 +119,25 @@ const SeerPage = () => {
+   const classes = useStyles()
+   const translate = useTranslate()
+   const notify = useNotify()
+-  const [query, setQuery] = useState('')
+-  const [results, setResults] = useState(null)
+-  const [searching, setSearching] = useState(false)
++  const history = useHistory()
++  const location = useLocation()
++  const params = useMemo(
++    () => new URLSearchParams(location.search),
++    [location.search],
++  )
++  const artist = params.get('artist')
++  const album = params.get('album')
++  const [query, setQuery] = useState(params.get('q') || '')
++  const [debounced, setDebounced] = useState(query.trim())
+   const [requests, setRequests] = useState([])
++  const inputRef = useRef()
++
++  // Artist and album pages open at the top, like a new page.
++  useEffect(() => {
++    if (artist || album) {
++      window.scrollTo(0, 0)
++    }
++  }, [artist, album])
+ 
+   const loadRequests = useCallback(
+     () =>
+@@ -45,97 +146,137 @@ const SeerPage = () => {
+         .catch((err) => notify(errorMessage(err), 'warning')),
+     [notify],
+   )
+-
+   useEffect(() => {
+     loadRequests()
+   }, [loadRequests])
+   useRefreshOnEvents({ events: ['seer'], onRefresh: loadRequests })
+ 
+-  // Debounced catalog search: MusicBrainz is slow (1 request/second), so wait for a pause.
++  // MusicBrainz is slow (1 request/second), so wait for a pause in typing.
+   useEffect(() => {
+-    const q = query.trim()
+-    if (q.length < 2) {
+-      setResults(null)
+-      return
+-    }
+-    let cancelled = false
+-    const timer = setTimeout(
+-      () => {
+-        setSearching(true)
+-        searchCatalog(q)
+-          .then((items) => !cancelled && setResults(items))
+-          .catch((err) => !cancelled && notify(errorMessage(err), 'warning'))
+-          .finally(() => !cancelled && setSearching(false))
+-      },
++    const t = setTimeout(
++      () => setDebounced(query.trim()),
+       Math.max(config.uiSearchDebounceMs, 600),
+     )
+-    return () => {
+-      cancelled = true
+-      clearTimeout(timer)
+-    }
+-  }, [query, notify])
++    return () => clearTimeout(t)
++  }, [query])
+ 
+-  const request = (item) =>
+-    createRequest(item)
+-      .then((req) => {
+-        notify('resources.seer.message.requested', 'info')
+-        setRequests((rs) => [req, ...rs.filter((r) => r.id !== req.id)])
+-      })
+-      .catch((err) => notify(errorMessage(err), 'warning'))
++  // Keep the query in the URL, so "back" from an artist returns to the results.
++  useEffect(() => {
++    if (artist || album) return
++    const search = debounced ? `?q=${encodeURIComponent(debounced)}` : ''
++    if (location.search !== search) history.replace(`/seer${search}`)
++  }, [debounced, artist, album, history, location.search])
++
++  const searchKey =
++    debounced.length >= 2 ? `search:${debounced.toLowerCase()}` : null
++  const search = useCatalog(searchKey, () => searchCatalog(debounced, 12))
+ 
++  const request = useCallback(
++    (item) =>
++      createRequest(item)
++        .then((req) => {
++          notify('resources.seer.message.requested', 'info')
++          setRequests((rs) => [req, ...rs.filter((r) => r.id !== req.id)])
++        })
++        .catch((err) => notify(errorMessage(err), 'warning')),
++    [notify],
++  )
+   const approve = (req) =>
+     approveRequest(req.id)
+       .then(loadRequests)
+       .catch((err) => notify(errorMessage(err), 'warning'))
+ 
+-  return (
+-    <div className={classes.root}>
+-      <Title
+-        title={
+-          'Navidrome - ' + translate('resources.seer.name', { smart_count: 2 })
+-        }
++  const onType = (e) => {
++    setQuery(e.target.value)
++    if (artist || album) history.push('/seer')
++  }
++  const clear = () => {
++    setQuery('')
++    setDebounced('')
++    inputRef.current?.focus()
++  }
++
++  const ctx = useMemo(() => ({ requests, request }), [requests, request])
++  const typing = query.trim() !== debounced
++  let body
++  if (artist) {
++    body = <ArtistView key={artist} mbid={artist} />
++  } else if (album) {
++    body = <AlbumView key={album} mbid={album} />
++  } else if (searchKey) {
++    body = (
++      <SearchView
++        query={debounced}
++        results={search.data}
++        loading={search.loading || typing}
++        error={search.error}
++        onRetry={search.retry}
+       />
+-      <Card className={classes.section}>
+-        <CardContent>
+-          <TextField
+-            fullWidth
+-            autoFocus
+-            variant="outlined"
+-            placeholder={translate('resources.seer.message.searchPlaceholder')}
+-            value={query}
+-            onChange={(e) => setQuery(e.target.value)}
+-            InputProps={{
+-              startAdornment: (
+-                <InputAdornment position="start">
+-                  <SearchIcon />
+-                </InputAdornment>
+-              ),
+-            }}
+-          />
+-          {searching && <CircularProgress className={classes.progress} />}
+-          {!searching && results && results.length === 0 && (
+-            <Typography variant="body2" color="textSecondary">
+-              {translate('resources.seer.message.noResults')}
+-            </Typography>
+-          )}
+-          {!searching && results && results.length > 0 && (
+-            <CatalogResults
+-              items={results}
+-              requests={requests}
+-              onRequest={request}
+-            />
+-          )}
+-        </CardContent>
+-      </Card>
+-      <Card>
+-        <CardContent>
+-          <Typography variant="h6" gutterBottom>
+-            {translate('resources.seer.requests')}
+-          </Typography>
+-          <RequestsTable requests={requests} onApprove={approve} />
+-        </CardContent>
+-      </Card>
+-    </div>
++    )
++  } else {
++    body = (
++      <>
++        <div className={classes.welcome}>
++          <div className={classes.vinyl} />
++          <h1 className={classes.welcomeTitle}>
++            {translate('resources.seer.message.welcomeTitle')}
++          </h1>
++          <div className={classes.welcomeText}>
++            {translate('resources.seer.message.welcomeText')}
++          </div>
++        </div>
++        <Section
++          title={translate('resources.seer.requests')}
++          hint={requests.length > 0 ? String(requests.length) : null}
++        >
++          <RequestsList requests={requests} onApprove={approve} />
++        </Section>
++      </>
++    )
++  }
++
++  return (
++    <SeerContext.Provider value={ctx}>
++      <div className={classes.root}>
++        <Title
++          title={
++            'Navidrome - ' +
++            translate('resources.seer.name', { smart_count: 2 })
++          }
++        />
++        {!artist && !album && (
++          <div className={classes.bar}>
++            <div className={classes.search}>
++              <SearchIcon />
++              <InputBase
++                inputRef={inputRef}
++                autoFocus
++                className={classes.input}
++                placeholder={translate(
++                  'resources.seer.message.searchPlaceholder',
++                )}
++                value={query}
++                onChange={onType}
++                inputProps={{
++                  'aria-label': translate(
++                    'resources.seer.message.searchPlaceholder',
++                  ),
++                }}
++              />
++              {query && (
++                <IconButton size="small" onClick={clear} aria-label="clear">
++                  <CloseIcon />
++                </IconButton>
++              )}
++            </div>
++          </div>
++        )}
++        {body}
++        <div className={classes.credit}>
++          {translate('resources.seer.message.credit')}
++        </div>
++      </div>
++    </SeerContext.Provider>
+   )
+ }
+ 
+diff --git a/ui/src/seer/StatusChip.jsx b/ui/src/seer/StatusChip.jsx
+index 4beaf69..253feac 100644
+--- a/ui/src/seer/StatusChip.jsx
++++ b/ui/src/seer/StatusChip.jsx
+@@ -1,20 +1,60 @@
+-import { Chip } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
+ import { useTranslate } from 'react-admin'
+ 
+-const colors = {
+-  available: 'primary',
+-  failed: 'secondary',
++const palette = {
++  pending: '#f5a524',
++  queued: '#7c8cff',
++  searching: '#4fb3ff',
++  downloading: '#4fb3ff',
++  importing: '#a77bff',
++  available: '#1ed760',
++  failed: '#ff5c7a',
+ }
+ 
++const busy = ['queued', 'searching', 'downloading', 'importing']
++
++const useStyles = makeStyles({
++  pill: {
++    display: 'inline-flex',
++    alignItems: 'center',
++    gap: 6,
++    padding: '3px 10px 3px 8px',
++    borderRadius: 999,
++    fontSize: 12,
++    fontWeight: 600,
++    lineHeight: '18px',
++    whiteSpace: 'nowrap',
++  },
++  dot: {
++    width: 7,
++    height: 7,
++    borderRadius: '50%',
++    flexShrink: 0,
++  },
++  pulse: {
++    animation: '$pulse 1.4s ease-in-out infinite',
++  },
++  '@keyframes pulse': {
++    '0%, 100%': { opacity: 1, transform: 'scale(1)' },
++    '50%': { opacity: 0.35, transform: 'scale(0.7)' },
++  },
++})
++
+ export const StatusChip = ({ status, error }) => {
++  const classes = useStyles()
+   const translate = useTranslate()
++  const color = palette[status] || '#999'
+   return (
+-    <Chip
+-      size="small"
+-      variant={status === 'available' ? 'default' : 'outlined'}
+-      color={colors[status] || 'default'}
+-      label={translate(`resources.seer.status.${status}`, { _: status })}
++    <span
++      className={classes.pill}
++      style={{ color, background: `${color}1f` }}
+       title={error || undefined}
+-    />
++    >
++      <span
++        className={`${classes.dot} ${busy.includes(status) ? classes.pulse : ''}`}
++        style={{ background: color }}
++      />
++      {translate(`resources.seer.status.${status}`, { _: status })}
++    </span>
+   )
+ }
+diff --git a/ui/src/seer/actions.jsx b/ui/src/seer/actions.jsx
+new file mode 100644
+index 0000000..9855422
+--- /dev/null
++++ b/ui/src/seer/actions.jsx
+@@ -0,0 +1,222 @@
++import { createContext, useContext, useState } from 'react'
++import {
++  ButtonBase,
++  CircularProgress,
++  IconButton,
++  Tooltip,
++} from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import AddIcon from '@material-ui/icons/Add'
++import CheckCircleIcon from '@material-ui/icons/CheckCircle'
++import PlayArrowIcon from '@material-ui/icons/PlayArrow'
++import { useDataProvider, useNotify, useTranslate } from 'react-admin'
++import { useDispatch } from 'react-redux'
++import { useHistory } from 'react-router-dom'
++import { playTracks } from '../actions'
++import { StatusChip } from './StatusChip'
++
++// SeerContext shares the user's requests and the request action with every view.
++export const SeerContext = createContext({ requests: [], request: () => {} })
++export const useSeer = () => useContext(SeerContext)
++
++export const findRequest = (requests, item) =>
++  requests.find(
++    (r) =>
++      r.kind === item.kind && r.mbid === item.mbid && r.status !== 'failed',
++  )
++
++export const GREEN = '#1ed760'
++
++const useStyles = makeStyles((theme) => ({
++  fab: {
++    width: 48,
++    height: 48,
++    borderRadius: '50%',
++    background: GREEN,
++    color: '#000',
++    boxShadow: '0 8px 18px rgba(0,0,0,0.35)',
++    transition: 'transform 150ms ease, background 150ms ease',
++    '&:hover': { transform: 'scale(1.06)', background: '#3be477' },
++    '& svg': { fontSize: 28 },
++  },
++  fabLarge: {
++    width: 56,
++    height: 56,
++    '& svg': { fontSize: 32 },
++  },
++  pill: {
++    borderRadius: 999,
++    padding: '6px 16px',
++    fontSize: 13,
++    fontWeight: 700,
++    letterSpacing: '0.02em',
++    border: `1px solid ${theme.palette.type === 'dark' ? 'rgba(255,255,255,0.35)' : 'rgba(0,0,0,0.3)'}`,
++    color: theme.palette.text.primary,
++    transition: 'all 150ms ease',
++    whiteSpace: 'nowrap',
++    '&:hover': {
++      borderColor: theme.palette.text.primary,
++      transform: 'scale(1.04)',
++    },
++    '& svg': { fontSize: 18, marginRight: 4, marginLeft: -4 },
++  },
++  pillLarge: {
++    padding: '12px 28px',
++    fontSize: 15,
++    background: GREEN,
++    color: '#000',
++    border: 'none',
++    boxShadow: '0 8px 24px rgba(30,215,96,0.25)',
++    '&:hover': { background: '#3be477', transform: 'scale(1.04)' },
++  },
++  owned: {
++    color: GREEN,
++    display: 'inline-flex',
++    alignItems: 'center',
++    gap: 4,
++    fontSize: 12,
++    fontWeight: 600,
++    whiteSpace: 'nowrap',
++  },
++  icon: {
++    color: theme.palette.text.secondary,
++    '&:hover': { color: theme.palette.text.primary },
++  },
++}))
++
++const usePlayOwned = () => {
++  const dataProvider = useDataProvider()
++  const dispatch = useDispatch()
++  const history = useHistory()
++  const notify = useNotify()
++  return (item) => {
++    if (item.kind === 'album') {
++      history.push(`/album/${item.libraryId}/show`)
++    } else if (item.kind === 'artist') {
++      history.push(`/artist/${item.libraryId}/show`)
++    } else {
++      dataProvider
++        .getOne('song', { id: item.libraryId })
++        .then(({ data }) =>
++          dispatch(playTracks({ [data.id]: data }, [data.id])),
++        )
++        .catch(() => notify('ra.page.error', 'warning'))
++    }
++  }
++}
++
++// ItemAction is the call to action of a catalog item: play/open what is in the
++// library, show the status of what was asked for, or offer to request it.
++//   variant "fab":  round green button (cards)
++//   variant "pill": outlined text button (rows); "hero" is the big green one
++//   variant "icon": compact + icon (track rows)
++export const ItemAction = ({
++  item,
++  variant = 'pill',
++  stopPropagation = true,
++}) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const { requests, request } = useSeer()
++  const playOwned = usePlayOwned()
++  const [sending, setSending] = useState(false)
++  const req = findRequest(requests, item)
++
++  const wrap = (fn) => (e) => {
++    if (stopPropagation) e.stopPropagation()
++    fn()
++  }
++  const doRequest = wrap(() => {
++    setSending(true)
++    Promise.resolve(request(item)).finally(() => setSending(false))
++  })
++
++  if (item.inLibrary) {
++    const label = translate(
++      item.kind === 'track'
++        ? 'resources.seer.actions.play'
++        : 'resources.seer.actions.open',
++    )
++    if (variant === 'fab' || variant === 'hero') {
++      return (
++        <Tooltip title={label}>
++          <ButtonBase
++            className={`${classes.fab} ${variant === 'hero' ? classes.fabLarge : ''}`}
++            onClick={wrap(() => playOwned(item))}
++            aria-label={label}
++          >
++            <PlayArrowIcon />
++          </ButtonBase>
++        </Tooltip>
++      )
++    }
++    return (
++      <span className={classes.owned}>
++        <CheckCircleIcon style={{ fontSize: 16 }} />
++        {variant === 'pill' && translate('resources.seer.message.inLibrary')}
++        <IconButton
++          size="small"
++          className={classes.icon}
++          onClick={wrap(() => playOwned(item))}
++          aria-label={label}
++        >
++          <PlayArrowIcon fontSize="small" />
++        </IconButton>
++      </span>
++    )
++  }
++
++  if (req) {
++    return <StatusChip status={req.status} error={req.error} />
++  }
++
++  const label = translate(
++    item.kind === 'album' && variant === 'hero'
++      ? 'resources.seer.actions.requestAlbum'
++      : 'resources.seer.actions.request',
++  )
++  if (sending) {
++    return (
++      <CircularProgress
++        size={variant === 'fab' ? 40 : 22}
++        style={{ color: GREEN }}
++      />
++    )
++  }
++  if (variant === 'fab') {
++    return (
++      <Tooltip title={label}>
++        <ButtonBase
++          className={classes.fab}
++          onClick={doRequest}
++          aria-label={label}
++        >
++          <AddIcon />
++        </ButtonBase>
++      </Tooltip>
++    )
++  }
++  if (variant === 'icon') {
++    return (
++      <Tooltip title={label}>
++        <IconButton
++          size="small"
++          className={classes.icon}
++          onClick={doRequest}
++          aria-label={label}
++        >
++          <AddIcon />
++        </IconButton>
++      </Tooltip>
++    )
++  }
++  return (
++    <ButtonBase
++      className={`${classes.pill} ${variant === 'hero' ? classes.pillLarge : ''}`}
++      onClick={doRequest}
++    >
++      <AddIcon />
++      {label}
++    </ButtonBase>
++  )
++}
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index f0e4357..d43f795 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -21,3 +21,12 @@ export const approveRequest = (id) =>
+   httpClient(`${SEER_URL}/requests/${id}/approve`, { method: 'POST' }).then(
+     ({ json }) => json,
+   )
++
++export const getArtist = (mbid) =>
++  httpClient(`${SEER_URL}/catalog/artist/${mbid}`).then(({ json }) => json)
++
++export const getAlbum = (mbid) =>
++  httpClient(`${SEER_URL}/catalog/album/${mbid}`).then(({ json }) => json)
++
++export const coverUrl = (id, size = 250) =>
++  id ? `https://coverartarchive.org/release-group/${id}/front-${size}` : null
+diff --git a/ui/src/seer/artwork.jsx b/ui/src/seer/artwork.jsx
+new file mode 100644
+index 0000000..8076b0c
+--- /dev/null
++++ b/ui/src/seer/artwork.jsx
+@@ -0,0 +1,161 @@
++import { useEffect, useState } from 'react'
++import { makeStyles } from '@material-ui/core/styles'
++import MusicNoteIcon from '@material-ui/icons/MusicNote'
++import { coverUrl } from './api'
++
++// hueOf gives every artist/album a stable color, used while covers load and
++// for items that have no cover (MusicBrainz has no artist pictures).
++export const hueOf = (s = '') => {
++  let h = 0
++  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360
++  return h
++}
++
++export const gradientOf = (s) => {
++  const h = hueOf(s)
++  return `linear-gradient(135deg, hsl(${h}, 62%, 52%) 0%, hsl(${(h + 48) % 360}, 58%, 30%) 100%)`
++}
++
++export const initialsOf = (name = '') =>
++  name
++    .replace(/[^\p{L}\p{N}\s]/gu, '')
++    .split(/\s+/)
++    .filter(Boolean)
++    .slice(0, 2)
++    .map((w) => w[0].toUpperCase())
++    .join('') || '?'
++
++const useStyles = makeStyles({
++  cover: {
++    position: 'relative',
++    overflow: 'hidden',
++    flexShrink: 0,
++    display: 'flex',
++    alignItems: 'center',
++    justifyContent: 'center',
++    color: 'rgba(255,255,255,0.85)',
++    '& img': {
++      position: 'absolute',
++      inset: 0,
++      width: '100%',
++      height: '100%',
++      objectFit: 'cover',
++      transition: 'opacity 300ms ease',
++    },
++  },
++  avatar: {
++    borderRadius: '50%',
++    display: 'flex',
++    alignItems: 'center',
++    justifyContent: 'center',
++    color: 'white',
++    fontWeight: 800,
++    letterSpacing: '-0.02em',
++    flexShrink: 0,
++    textShadow: '0 2px 12px rgba(0,0,0,0.25)',
++    userSelect: 'none',
++  },
++})
++
++// Cover shows the Cover Art Archive front image of a release group, over a
++// colored placeholder that stays when there is no image.
++export const Cover = ({
++  id,
++  seed,
++  size = 250,
++  radius = 6,
++  className,
++  style,
++}) => {
++  const classes = useStyles()
++  const [state, setState] = useState('loading')
++  const src = coverUrl(id, size > 250 ? 500 : 250)
++  useEffect(() => setState(src ? 'loading' : 'error'), [src])
++  return (
++    <div
++      className={`${classes.cover} ${className || ''}`}
++      style={{
++        background: gradientOf(seed || id),
++        borderRadius: radius,
++        ...style,
++      }}
++    >
++      {state !== 'loaded' && (
++        <MusicNoteIcon style={{ fontSize: '2.4em', opacity: 0.6 }} />
++      )}
++      {src && state !== 'error' && (
++        <img
++          src={src}
++          alt=""
++          loading="lazy"
++          style={{ opacity: state === 'loaded' ? 1 : 0 }}
++          onLoad={() => setState('loaded')}
++          onError={() => setState('error')}
++        />
++      )}
++    </div>
++  )
++}
++
++export const ArtistAvatar = ({ name, seed, size = 160, className, style }) => {
++  const classes = useStyles()
++  return (
++    <div
++      className={`${classes.avatar} ${className || ''}`}
++      style={{
++        width: size,
++        height: size,
++        fontSize: size * 0.36,
++        background: gradientOf(seed || name),
++        ...style,
++      }}
++    >
++      {initialsOf(name)}
++    </div>
++  )
++}
++
++// useCoverColor samples the average color of a cover for the page header.
++// It falls back to the item's hash color when the image can't be read.
++export const useCoverColor = (id, seed) => {
++  const fallback = `hsl(${hueOf(seed || id || '')}, 50%, 40%)`
++  const [color, setColor] = useState(fallback)
++  useEffect(() => {
++    setColor(fallback)
++    if (!id) return
++    let cancelled = false
++    const img = new Image()
++    img.crossOrigin = 'anonymous'
++    img.onload = () => {
++      try {
++        const c = document.createElement('canvas')
++        c.width = c.height = 16
++        const ctx = c.getContext('2d')
++        ctx.drawImage(img, 0, 0, 16, 16)
++        const d = ctx.getImageData(0, 0, 16, 16).data
++        let r = 0,
++          g = 0,
++          b = 0
++        for (let i = 0; i < d.length; i += 4) {
++          r += d[i]
++          g += d[i + 1]
++          b += d[i + 2]
++        }
++        const n = d.length / 4
++        // darken a little so white text stays readable on light covers
++        const k = 0.8
++        if (!cancelled)
++          setColor(
++            `rgb(${((r / n) * k) | 0}, ${((g / n) * k) | 0}, ${((b / n) * k) | 0})`,
++          )
++      } catch {
++        // tainted canvas (no CORS): keep the fallback
++      }
++    }
++    img.src = coverUrl(id, 250)
++    return () => {
++      cancelled = true
++    }
++  }, [id, fallback])
++  return color
++}
+diff --git a/ui/src/seer/components.jsx b/ui/src/seer/components.jsx
+new file mode 100644
+index 0000000..53ba0b9
+--- /dev/null
++++ b/ui/src/seer/components.jsx
+@@ -0,0 +1,388 @@
++import { ButtonBase, Typography } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import { useTranslate } from 'react-admin'
++import { useHistory } from 'react-router-dom'
++import { ItemAction } from './actions'
++import { ArtistAvatar, Cover } from './artwork'
++
++export const formatDuration = (ms) => {
++  if (!ms) return ''
++  const s = Math.round(ms / 1000)
++  const h = Math.floor(s / 3600)
++  const m = Math.floor((s % 3600) / 60)
++  const ss = String(s % 60).padStart(2, '0')
++  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`
++}
++
++// useTypeLabel translates MusicBrainz types ("Album + Live", "Group"...).
++export const useTypeLabel = () => {
++  const translate = useTranslate()
++  return (type) =>
++    (type || '')
++      .split(' + ')
++      .filter(Boolean)
++      .map((t) =>
++        translate(`resources.seer.types.${t.replace(/[^A-Za-z]/g, '')}`, {
++          _: t,
++        }),
++      )
++      .join(' · ')
++}
++
++export const useNav = () => {
++  const history = useHistory()
++  return {
++    artist: (mbid) => mbid && history.push(`/seer?artist=${mbid}`),
++    album: (mbid) => mbid && history.push(`/seer?album=${mbid}`),
++    back: () => (history.length > 1 ? history.goBack() : history.push('/seer')),
++  }
++}
++
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  const surface = dark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)'
++  const surfaceHover = dark ? 'rgba(255,255,255,0.09)' : 'rgba(0,0,0,0.06)'
++  return {
++    sectionTitle: {
++      fontSize: 24,
++      fontWeight: 800,
++      letterSpacing: '-0.02em',
++      margin: theme.spacing(4, 0, 2),
++      display: 'flex',
++      alignItems: 'baseline',
++      gap: theme.spacing(1.5),
++    },
++    sectionHint: {
++      fontSize: 13,
++      fontWeight: 500,
++      color: theme.palette.text.secondary,
++      letterSpacing: 0,
++    },
++    grid: {
++      display: 'grid',
++      gridTemplateColumns: 'repeat(auto-fill, minmax(168px, 1fr))',
++      gap: theme.spacing(2.5),
++      [theme.breakpoints.down('xs')]: {
++        gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
++        gap: theme.spacing(1.5),
++      },
++    },
++    card: {
++      display: 'block',
++      textAlign: 'left',
++      width: '100%',
++      boxSizing: 'border-box',
++      padding: 12,
++      borderRadius: 12,
++      background: surface,
++      transition: 'background 200ms ease, transform 200ms ease',
++      '&:hover': { background: surfaceHover },
++      '&:hover $fabWrap, &:focus-within $fabWrap': {
++        opacity: 1,
++        transform: 'translateY(0)',
++      },
++      '&:hover $coverImg': { boxShadow: '0 12px 28px rgba(0,0,0,0.45)' },
++    },
++    coverBox: {
++      position: 'relative',
++      width: '100%',
++      aspectRatio: '1 / 1',
++      marginBottom: 12,
++    },
++    coverImg: {
++      width: '100%',
++      height: '100%',
++      boxShadow: '0 8px 20px rgba(0,0,0,0.3)',
++      transition: 'box-shadow 200ms ease',
++      fontSize: 22,
++    },
++    fabWrap: {
++      position: 'absolute',
++      right: 8,
++      bottom: 8,
++      opacity: 0,
++      transform: 'translateY(8px)',
++      transition: 'opacity 200ms ease, transform 200ms ease',
++      '@media (hover: none)': { opacity: 1, transform: 'none' },
++    },
++    statusWrap: {
++      position: 'absolute',
++      left: 8,
++      top: 8,
++      backdropFilter: 'blur(8px)',
++      borderRadius: 999,
++      background: 'rgba(0,0,0,0.55)',
++    },
++    cardTitle: {
++      fontWeight: 700,
++      fontSize: 15,
++      lineHeight: 1.3,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    cardSub: {
++      fontSize: 13,
++      color: theme.palette.text.secondary,
++      marginTop: 4,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    ownedDot: {
++      display: 'inline-block',
++      width: 8,
++      height: 8,
++      borderRadius: '50%',
++      background: '#1ed760',
++      marginRight: 6,
++      verticalAlign: 'middle',
++    },
++    avatarBox: {
++      position: 'relative',
++      width: '100%',
++      aspectRatio: '1 / 1',
++      marginBottom: 12,
++      '& > div': {
++        width: '100% !important',
++        height: '100% !important',
++        boxShadow: '0 8px 24px rgba(0,0,0,0.35)',
++      },
++    },
++    row: {
++      display: 'grid',
++      gridTemplateColumns: 'var(--cols)',
++      alignItems: 'center',
++      gap: theme.spacing(2),
++      padding: '8px 12px',
++      borderRadius: 8,
++      transition: 'background 150ms ease',
++      '&:hover': { background: surfaceHover },
++      [theme.breakpoints.down('xs')]: {
++        gridTemplateColumns: 'var(--cols-xs)',
++        gap: theme.spacing(1.5),
++        padding: '8px 4px',
++      },
++    },
++    num: {
++      color: theme.palette.text.secondary,
++      fontVariantNumeric: 'tabular-nums',
++      textAlign: 'right',
++      fontSize: 15,
++    },
++    rowTitle: {
++      fontSize: 15,
++      fontWeight: 500,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    rowSub: {
++      fontSize: 13,
++      color: theme.palette.text.secondary,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    link: {
++      cursor: 'pointer',
++      '&:hover': {
++        textDecoration: 'underline',
++        color: theme.palette.text.primary,
++      },
++    },
++    hideXs: {
++      [theme.breakpoints.down('xs')]: { display: 'none' },
++    },
++    duration: {
++      color: theme.palette.text.secondary,
++      fontVariantNumeric: 'tabular-nums',
++      fontSize: 14,
++      textAlign: 'right',
++    },
++    shimmer: {
++      borderRadius: 12,
++      background: `linear-gradient(90deg, ${surface} 0%, ${surfaceHover} 50%, ${surface} 100%)`,
++      backgroundSize: '200% 100%',
++      animation: '$shimmer 1.3s linear infinite',
++    },
++    '@keyframes shimmer': {
++      '0%': { backgroundPosition: '200% 0' },
++      '100%': { backgroundPosition: '-200% 0' },
++    },
++  }
++})
++
++export const Section = ({ title, hint, children, action }) => {
++  const classes = useStyles()
++  return (
++    <section>
++      <Typography component="h2" className={classes.sectionTitle}>
++        {title}
++        {hint && <span className={classes.sectionHint}>{hint}</span>}
++        {action && <span style={{ marginLeft: 'auto' }}>{action}</span>}
++      </Typography>
++      {children}
++    </section>
++  )
++}
++
++export const Grid = ({ children }) => {
++  const classes = useStyles()
++  return <div className={classes.grid}>{children}</div>
++}
++
++export const AlbumCard = ({ item, showArtist = true }) => {
++  const classes = useStyles()
++  const nav = useNav()
++  const typeLabel = useTypeLabel()
++  const sub = [item.year, showArtist ? item.artist : typeLabel(item.type)]
++    .filter(Boolean)
++    .join(' · ')
++  return (
++    <ButtonBase
++      component="div"
++      className={classes.card}
++      onClick={() => nav.album(item.mbid)}
++      focusRipple
++    >
++      <div className={classes.coverBox}>
++        <Cover
++          id={item.coverId || item.mbid}
++          seed={item.title}
++          radius={8}
++          className={classes.coverImg}
++        />
++        <div className={classes.fabWrap}>
++          <ItemAction item={item} variant="fab" />
++        </div>
++      </div>
++      <div className={classes.cardTitle} title={item.title}>
++        {item.inLibrary && <span className={classes.ownedDot} />}
++        {item.title}
++      </div>
++      <div className={classes.cardSub}>{sub}</div>
++    </ButtonBase>
++  )
++}
++
++export const ArtistCard = ({ item }) => {
++  const classes = useStyles()
++  const nav = useNav()
++  const typeLabel = useTypeLabel()
++  const sub = [typeLabel(item.type) || null, item.country]
++    .filter(Boolean)
++    .join(' · ')
++  return (
++    <ButtonBase
++      component="div"
++      className={classes.card}
++      onClick={() => nav.artist(item.mbid)}
++      focusRipple
++    >
++      <div className={classes.avatarBox}>
++        <ArtistAvatar name={item.title} seed={item.mbid} />
++      </div>
++      <div className={classes.cardTitle} title={item.title}>
++        {item.inLibrary && <span className={classes.ownedDot} />}
++        {item.title}
++      </div>
++      <div className={classes.cardSub} title={item.disambiguation}>
++        {sub || item.disambiguation || ' '}
++      </div>
++    </ButtonBase>
++  )
++}
++
++// TrackRow: "#/cover | title + artist | album | duration | action".
++export const TrackRow = ({
++  item,
++  index,
++  showCover = true,
++  showAlbum = true,
++}) => {
++  const classes = useStyles()
++  const nav = useNav()
++  const lead = showCover ? '44px' : '28px'
++  const cols = `${lead} minmax(0, 1fr) ${showAlbum ? 'minmax(0, 0.8fr)' : ''} 52px 120px`
++  const colsXs = `${lead} minmax(0, 1fr) auto`
++  return (
++    <div
++      className={classes.row}
++      style={{ '--cols': cols, '--cols-xs': colsXs }}
++    >
++      {showCover ? (
++        <Cover
++          id={item.coverId}
++          seed={item.album || item.title}
++          size={44}
++          radius={4}
++          style={{ width: 44, height: 44, fontSize: 9 }}
++        />
++      ) : (
++        <span className={classes.num}>{index}</span>
++      )}
++      <div style={{ minWidth: 0 }}>
++        <div className={classes.rowTitle} title={item.title}>
++          {item.inLibrary && <span className={classes.ownedDot} />}
++          {item.title}
++        </div>
++        <div className={classes.rowSub}>
++          <span
++            className={item.artistMbid ? classes.link : undefined}
++            onClick={() => nav.artist(item.artistMbid)}
++          >
++            {item.artist}
++          </span>
++        </div>
++      </div>
++      {showAlbum && (
++        <div className={`${classes.rowSub} ${classes.hideXs}`}>
++          <span
++            className={item.coverId ? classes.link : undefined}
++            onClick={() => nav.album(item.coverId)}
++          >
++            {item.album}
++          </span>
++        </div>
++      )}
++      <span className={`${classes.duration} ${classes.hideXs}`}>
++        {formatDuration(item.durationMs)}
++      </span>
++      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
++        <ItemAction item={item} variant="icon" />
++      </div>
++    </div>
++  )
++}
++
++export const Shimmer = ({ width = '100%', height = 16, style, round }) => {
++  const classes = useStyles()
++  return (
++    <div
++      className={classes.shimmer}
++      style={{
++        width,
++        height,
++        borderRadius: round ? '50%' : undefined,
++        ...style,
++      }}
++    />
++  )
++}
++
++export const GridSkeleton = ({ count = 6, round }) => (
++  <Grid>
++    {Array.from({ length: count }).map((_, i) => (
++      <div key={i} style={{ padding: 12 }}>
++        <Shimmer
++          height="auto"
++          round={round}
++          style={{ aspectRatio: '1 / 1', marginBottom: 12 }}
++        />
++        <Shimmer width="80%" height={14} style={{ marginBottom: 8 }} />
++        <Shimmer width="50%" height={12} />
++      </div>
++    ))}
++  </Grid>
++)
+diff --git a/ui/src/seer/states.jsx b/ui/src/seer/states.jsx
+new file mode 100644
+index 0000000..83e8822
+--- /dev/null
++++ b/ui/src/seer/states.jsx
+@@ -0,0 +1,172 @@
++import { ButtonBase, IconButton, Typography } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import ArrowBackIosIcon from '@material-ui/icons/ArrowBackIos'
++import CloudOffIcon from '@material-ui/icons/CloudOff'
++import { useTranslate } from 'react-admin'
++import { useNav } from './components'
++
++const useStyles = makeStyles((theme) => ({
++  error: {
++    margin: theme.spacing(8, 'auto'),
++    maxWidth: 420,
++    textAlign: 'center',
++    color: theme.palette.text.secondary,
++    '& svg': { fontSize: 56, opacity: 0.6 },
++  },
++  retry: {
++    marginTop: theme.spacing(2),
++    borderRadius: 999,
++    padding: '10px 26px',
++    fontWeight: 700,
++    background: theme.palette.text.primary,
++    color: theme.palette.background.default,
++    transition: 'transform 150ms ease',
++    '&:hover': { transform: 'scale(1.04)' },
++  },
++  hero: {
++    position: 'relative',
++    overflow: 'hidden',
++    borderRadius: 20,
++    marginTop: theme.spacing(1),
++    padding: theme.spacing(8, 4, 4),
++    display: 'flex',
++    alignItems: 'flex-end',
++    gap: theme.spacing(4),
++    transition: 'background 600ms ease',
++    boxShadow: '0 20px 60px rgba(0,0,0,0.25)',
++    '&::after': {
++      content: '""',
++      position: 'absolute',
++      inset: 0,
++      background:
++        'radial-gradient(800px 300px at 85% 0%, rgba(255,255,255,0.14), transparent 60%), linear-gradient(180deg, transparent 40%, rgba(0,0,0,0.35) 100%)',
++      pointerEvents: 'none',
++    },
++    '& > *': { position: 'relative', zIndex: 1 },
++    [theme.breakpoints.down('xs')]: {
++      flexDirection: 'column',
++      alignItems: 'center',
++      textAlign: 'center',
++      gap: theme.spacing(2),
++      padding: theme.spacing(7, 2, 3),
++    },
++  },
++  back: {
++    position: 'absolute !important',
++    top: theme.spacing(2),
++    left: theme.spacing(2),
++    background: 'rgba(0,0,0,0.45)',
++    color: 'white',
++    backdropFilter: 'blur(8px)',
++    '&:hover': { background: 'rgba(0,0,0,0.7)' },
++    '& svg': { fontSize: 18, marginLeft: 6 },
++  },
++  heroText: {
++    minWidth: 0,
++    color: 'white',
++    textShadow: '0 2px 16px rgba(0,0,0,0.3)',
++  },
++  label: {
++    fontSize: 12,
++    fontWeight: 800,
++    textTransform: 'uppercase',
++    letterSpacing: '0.12em',
++    opacity: 0.9,
++  },
++  title: {
++    fontSize: 'clamp(2rem, 6.5vw, 5.5rem)',
++    fontWeight: 900,
++    letterSpacing: '-0.045em',
++    lineHeight: 1.02,
++    margin: theme.spacing(1, 0, 2),
++    wordBreak: 'break-word',
++    display: '-webkit-box',
++    WebkitLineClamp: 3,
++    WebkitBoxOrient: 'vertical',
++    overflow: 'hidden',
++  },
++  meta: {
++    fontSize: 14,
++    fontWeight: 500,
++    opacity: 0.92,
++    display: 'flex',
++    flexWrap: 'wrap',
++    gap: '4px 0',
++    alignItems: 'center',
++    [theme.breakpoints.down('xs')]: { justifyContent: 'center' },
++    '& > *:not(:last-child)::after': {
++      content: '"•"',
++      margin: '0 8px',
++      opacity: 0.7,
++    },
++  },
++  actions: {
++    display: 'flex',
++    alignItems: 'center',
++    gap: theme.spacing(3),
++    padding: theme.spacing(3, 0, 1),
++    [theme.breakpoints.down('xs')]: { justifyContent: 'center' },
++  },
++}))
++
++export const ErrorState = ({ onRetry }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  return (
++    <div className={classes.error}>
++      <CloudOffIcon />
++      <Typography
++        variant="h6"
++        color="textPrimary"
++        style={{ fontWeight: 800, marginTop: 8 }}
++      >
++        {translate('resources.seer.message.catalogErrorTitle')}
++      </Typography>
++      <Typography variant="body2">
++        {translate('resources.seer.message.catalogError')}
++      </Typography>
++      {onRetry && (
++        <ButtonBase className={classes.retry} onClick={onRetry}>
++          {translate('resources.seer.actions.retry')}
++        </ButtonBase>
++      )}
++    </div>
++  )
++}
++
++// Hero is the colored header of the artist and album pages.
++export const Hero = ({ color, art, label, title, meta = [], children }) => {
++  const classes = useStyles()
++  const nav = useNav()
++  const translate = useTranslate()
++  return (
++    <>
++      <div
++        className={classes.hero}
++        style={{
++          background: `linear-gradient(135deg, ${color} 0%, ${color} 45%, rgba(0,0,0,0.55) 140%)`,
++        }}
++      >
++        <IconButton
++          className={classes.back}
++          size="small"
++          onClick={nav.back}
++          aria-label={translate('resources.seer.actions.back')}
++        >
++          <ArrowBackIosIcon />
++        </IconButton>
++        {art}
++        <div className={classes.heroText}>
++          <div className={classes.label}>{label}</div>
++          <h1 className={classes.title}>{title}</h1>
++          <div className={classes.meta}>
++            {meta.filter(Boolean).map((m, i) => (
++              <span key={i}>{m}</span>
++            ))}
++          </div>
++        </div>
++      </div>
++      {children && <div className={classes.actions}>{children}</div>}
++    </>
++  )
++}
+diff --git a/ui/src/seer/useCatalog.js b/ui/src/seer/useCatalog.js
+new file mode 100644
+index 0000000..4930cb7
+--- /dev/null
++++ b/ui/src/seer/useCatalog.js
+@@ -0,0 +1,51 @@
++import { useCallback, useEffect, useState } from 'react'
++
++// Responses are kept for the session, so going back to a page is instant.
++const cache = new Map()
++
++// useCatalog loads key with fetcher, exposing {data, loading, error, retry}.
++// A null key loads nothing.
++export const useCatalog = (key, fetcher) => {
++  const [state, setState] = useState(() => ({
++    data: key ? cache.get(key) || null : null,
++    loading: !!key && !cache.has(key),
++    error: null,
++  }))
++  const [attempt, setAttempt] = useState(0)
++
++  useEffect(() => {
++    if (!key) {
++      setState({ data: null, loading: false, error: null })
++      return
++    }
++    if (cache.has(key)) {
++      setState({ data: cache.get(key), loading: false, error: null })
++      return
++    }
++    let cancelled = false
++    setState((s) => ({ data: s.data, loading: true, error: null }))
++    fetcher()
++      .then((data) => {
++        cache.set(key, data)
++        if (!cancelled) setState({ data, loading: false, error: null })
++      })
++      .catch((error) => {
++        if (!cancelled) setState({ data: null, loading: false, error })
++      })
++    return () => {
++      cancelled = true
++    }
++    // fetcher is derived from key
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [key, attempt])
++
++  const retry = useCallback(() => {
++    cache.delete(key)
++    setAttempt((a) => a + 1)
++  }, [key])
++
++  return { ...state, retry }
++}
++
++// forget drops cached responses (after a request, library flags may change).
++export const forget = () => cache.clear()
+-- 
+2.43.0
+

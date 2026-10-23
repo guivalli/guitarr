@@ -1,0 +1,636 @@
+From c688a7413c3ffaf0e43073f6ab40dcfae92a14c3 Mon Sep 17 00:00:00 2001
+From: Guitarr <noreply@example.com>
+Date: Fri, 23 Oct 2026 01:26:19 -0300
+Subject: [PATCH] Seer: lyrics from LRCLIB saved as .lrc/.txt sidecars,
+ editable, with a batch for missing ones
+
+---
+ core/seer/lyrics.go           | 322 ++++++++++++++++++++++++++++++++++
+ core/seer/lyrics_test.go      |  85 +++++++++
+ core/seer/seer.go             |   6 +-
+ server/seerapi/lyrics.go      |  68 +++++++
+ server/seerapi/lyrics_test.go |  58 ++++++
+ server/seerapi/seerapi.go     |   8 +
+ 6 files changed, 545 insertions(+), 2 deletions(-)
+ create mode 100644 core/seer/lyrics.go
+ create mode 100644 core/seer/lyrics_test.go
+ create mode 100644 server/seerapi/lyrics.go
+ create mode 100644 server/seerapi/lyrics_test.go
+
+diff --git a/core/seer/lyrics.go b/core/seer/lyrics.go
+new file mode 100644
+index 00000000..f82fe544
+--- /dev/null
++++ b/core/seer/lyrics.go
+@@ -0,0 +1,322 @@
++package seer
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"math"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/Masterminds/squirrel"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++)
++
++// Lyrics finds song lyrics on LRCLIB (lrclib.net, free and open) and saves them
++// next to the audio file as a sidecar (.lrc when time-synced, .txt otherwise).
++// Navidrome reads those sidecars on every request (LyricsPriority), so a saved
++// lyric is served by getLyricsBySongId at once, without a rescan.
++type Lyrics struct {
++	ds        model.DataStore
++	client    *http.Client
++	baseURL   string // https://lrclib.net, replaced in tests
++	userAgent string
++	pause     time.Duration // between songs in the batch
++
++	mu  sync.Mutex
++	job LyricsJob
++}
++
++// LyricsCandidate is one LRCLIB entry.
++type LyricsCandidate struct {
++	ID       int64   `json:"id"`
++	Title    string  `json:"title"`
++	Artist   string  `json:"artist"`
++	Album    string  `json:"album"`
++	Duration float64 `json:"duration"`
++	Synced   string  `json:"synced,omitempty"`
++	Plain    string  `json:"plain,omitempty"`
++	Instr    bool    `json:"instrumental,omitempty"`
++}
++
++// LyricsJob is the progress of the "fetch missing lyrics" batch.
++type LyricsJob struct {
++	Running  bool      `json:"running"`
++	Total    int       `json:"total"`
++	Done     int       `json:"done"`
++	Synced   int       `json:"synced"`
++	Plain    int       `json:"plain"`
++	NotFound int       `json:"notFound"`
++	Failed   int       `json:"failed"`
++	Started  time.Time `json:"started,omitzero"`
++	Finished time.Time `json:"finished,omitzero"`
++	Error    string    `json:"error,omitempty"`
++}
++
++var ErrNoLyrics = errors.New("no lyrics found")
++
++func NewLyrics(ds model.DataStore, userAgent string) *Lyrics {
++	if userAgent == "" {
++		userAgent = "Guitarr (https://github.com/guivalli/guitarr)"
++	}
++	return &Lyrics{ds: ds, client: &http.Client{Timeout: 15 * time.Second}, baseURL: "https://lrclib.net", userAgent: userAgent, pause: 300 * time.Millisecond}
++}
++
++type lrclibEntry struct {
++	ID           int64   `json:"id"`
++	TrackName    string  `json:"trackName"`
++	ArtistName   string  `json:"artistName"`
++	AlbumName    string  `json:"albumName"`
++	Duration     float64 `json:"duration"`
++	Instrumental bool    `json:"instrumental"`
++	PlainLyrics  string  `json:"plainLyrics"`
++	SyncedLyrics string  `json:"syncedLyrics"`
++}
++
++func (e lrclibEntry) candidate() LyricsCandidate {
++	return LyricsCandidate{ID: e.ID, Title: e.TrackName, Artist: e.ArtistName, Album: e.AlbumName, Duration: e.Duration,
++		Synced: e.SyncedLyrics, Plain: e.PlainLyrics, Instr: e.Instrumental}
++}
++
++func (l *Lyrics) get(ctx context.Context, path string, q url.Values, out any) (bool, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, l.baseURL+path+"?"+q.Encode(), nil)
++	if err != nil {
++		return false, err
++	}
++	req.Header.Set("User-Agent", l.userAgent)
++	req.Header.Set("Lrclib-Client", l.userAgent)
++	resp, err := l.client.Do(req)
++	if err != nil {
++		return false, err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode == http.StatusNotFound {
++		return false, nil
++	}
++	if resp.StatusCode != http.StatusOK {
++		return false, fmt.Errorf("lrclib: HTTP %d", resp.StatusCode)
++	}
++	return true, json.NewDecoder(resp.Body).Decode(out)
++}
++
++func firstArtist(mf *model.MediaFile) string {
++	a := mf.Artist
++	if a == "" {
++		a = mf.AlbumArtist
++	}
++	return a
++}
++
++// Candidates looks the song up on LRCLIB: the exact match first (artist, title,
++// album and duration), then a search, closest duration first.
++func (l *Lyrics) Candidates(ctx context.Context, mf *model.MediaFile) ([]LyricsCandidate, error) {
++	var out []LyricsCandidate
++	seen := map[int64]bool{}
++	var exact lrclibEntry
++	q := url.Values{"artist_name": {firstArtist(mf)}, "track_name": {mf.Title}, "album_name": {mf.Album},
++		"duration": {fmt.Sprint(int(math.Round(float64(mf.Duration))))}}
++	if ok, err := l.get(ctx, "/api/get", q, &exact); err != nil {
++		return nil, err
++	} else if ok && exact.ID != 0 {
++		out = append(out, exact.candidate())
++		seen[exact.ID] = true
++	}
++	var found []lrclibEntry
++	if _, err := l.get(ctx, "/api/search", url.Values{"track_name": {mf.Title}, "artist_name": {firstArtist(mf)}}, &found); err != nil && len(out) == 0 {
++		return nil, err
++	}
++	dur := float64(mf.Duration)
++	rest := make([]LyricsCandidate, 0, len(found))
++	for _, e := range found {
++		if !seen[e.ID] && (e.SyncedLyrics != "" || e.PlainLyrics != "") {
++			seen[e.ID] = true
++			rest = append(rest, e.candidate())
++		}
++	}
++	// closest duration first, synced before plain
++	sortCandidates(rest, dur)
++	out = append(out, rest...)
++	if len(out) > 10 {
++		out = out[:10]
++	}
++	return out, nil
++}
++
++func sortCandidates(c []LyricsCandidate, dur float64) {
++	score := func(x LyricsCandidate) float64 {
++		s := math.Abs(x.Duration - dur)
++		if x.Synced == "" {
++			s += 1000
++		}
++		return s
++	}
++	for i := 1; i < len(c); i++ {
++		for j := i; j > 0 && score(c[j]) < score(c[j-1]); j-- {
++			c[j], c[j-1] = c[j-1], c[j]
++		}
++	}
++}
++
++// best is the candidate saved automatically: synced and within 3 s of the song, or plain within 3 s.
++func best(c []LyricsCandidate, dur float64) *LyricsCandidate {
++	var plain *LyricsCandidate
++	for i := range c {
++		if math.Abs(c[i].Duration-dur) > 3 || c[i].Instr {
++			continue
++		}
++		if c[i].Synced != "" {
++			return &c[i]
++		}
++		if plain == nil && c[i].Plain != "" {
++			plain = &c[i]
++		}
++	}
++	return plain
++}
++
++func sidecar(mf *model.MediaFile, ext string) string {
++	p := mf.AbsolutePath()
++	return strings.TrimSuffix(p, filepath.Ext(p)) + ext
++}
++
++// HasLyrics reports lyrics embedded in the file or in a sidecar Navidrome reads.
++func HasLyrics(mf *model.MediaFile) bool {
++	if l, err := mf.StructuredLyrics(); err == nil && len(l) > 0 {
++		return true
++	}
++	for _, ext := range []string{".lrc", ".txt", ".elrc", ".ttml", ".srt", ".yaml", ".yml"} {
++		if _, err := os.Stat(sidecar(mf, ext)); err == nil {
++			return true
++		}
++	}
++	return false
++}
++
++// Save writes the lyrics next to the song: synced (LRC) to .lrc, plain text to
++// .txt. Both empty removes the sidecars written here.
++func (l *Lyrics) Save(ctx context.Context, songID, synced, plain string) error {
++	mf, err := l.ds.MediaFile().Get(ctx, songID)
++	if err != nil {
++		return err
++	}
++	return saveSidecar(mf, synced, plain)
++}
++
++func saveSidecar(mf *model.MediaFile, synced, plain string) error {
++	if mf.LibraryPath == "" {
++		return errors.New("song has no library path")
++	}
++	lrc, txt := sidecar(mf, ".lrc"), sidecar(mf, ".txt")
++	synced, plain = strings.TrimSpace(synced), strings.TrimSpace(plain)
++	write := func(path, body string) error { return os.WriteFile(path, []byte(body+"\n"), 0o644) }
++	remove := func(path string) error {
++		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
++			return err
++		}
++		return nil
++	}
++	switch {
++	case synced != "":
++		if err := write(lrc, synced); err != nil {
++			return err
++		}
++		return remove(txt)
++	case plain != "":
++		if err := write(txt, plain); err != nil {
++			return err
++		}
++		return remove(lrc)
++	default:
++		if err := remove(lrc); err != nil {
++			return err
++		}
++		return remove(txt)
++	}
++}
++
++// Find returns the LRCLIB candidates of a song (for the editor and the player fallback).
++func (l *Lyrics) Find(ctx context.Context, songID string) ([]LyricsCandidate, error) {
++	mf, err := l.ds.MediaFile().Get(ctx, songID)
++	if err != nil {
++		return nil, err
++	}
++	return l.Candidates(ctx, mf)
++}
++
++// Job returns the progress of the batch.
++func (l *Lyrics) Job() LyricsJob {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	return l.job
++}
++
++// FetchMissing starts (once) a background pass over the music without lyrics,
++// saving what LRCLIB has. Podcast episodes are skipped.
++func (l *Lyrics) FetchMissing(ctx context.Context) LyricsJob {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	if l.job.Running {
++		return l.job
++	}
++	l.job = LyricsJob{Running: true, Started: time.Now()}
++	go l.runBatch(context.WithoutCancel(ctx))
++	return l.job
++}
++
++func (l *Lyrics) update(f func(j *LyricsJob)) {
++	l.mu.Lock()
++	defer l.mu.Unlock()
++	f(&l.job)
++}
++
++func (l *Lyrics) runBatch(ctx context.Context) {
++	defer l.update(func(j *LyricsJob) { j.Running, j.Finished = false, time.Now() })
++	files, err := l.ds.MediaFile().GetAll(ctx, model.QueryOptions{Filters: squirrel.Eq{"missing": false}, Sort: "path"})
++	if err != nil {
++		l.update(func(j *LyricsJob) { j.Error = err.Error() })
++		return
++	}
++	var todo []*model.MediaFile
++	for i := range files {
++		mf := &files[i]
++		if isPodcastPath(mf.Path) || mf.Title == "" || HasLyrics(mf) {
++			continue
++		}
++		todo = append(todo, mf)
++	}
++	l.update(func(j *LyricsJob) { j.Total = len(todo) })
++	log.Info(ctx, "Seer: fetching missing lyrics from LRCLIB", "songs", len(todo))
++	for _, mf := range todo {
++		cands, err := l.Candidates(ctx, mf)
++		var pick *LyricsCandidate
++		if err == nil {
++			pick = best(cands, float64(mf.Duration))
++		}
++		switch {
++		case err != nil:
++			l.update(func(j *LyricsJob) { j.Failed++ })
++		case pick == nil:
++			l.update(func(j *LyricsJob) { j.NotFound++ })
++		default:
++			if err := saveSidecar(mf, pick.Synced, pick.Plain); err != nil {
++				log.Warn(ctx, "Seer: saving lyrics failed", "path", mf.Path, err)
++				l.update(func(j *LyricsJob) { j.Failed++ })
++			} else if pick.Synced != "" {
++				l.update(func(j *LyricsJob) { j.Synced++ })
++			} else {
++				l.update(func(j *LyricsJob) { j.Plain++ })
++			}
++		}
++		l.update(func(j *LyricsJob) { j.Done++ })
++		time.Sleep(l.pause) // be gentle with a free service
++	}
++	j := l.Job()
++	log.Info(ctx, "Seer: lyrics batch finished", "synced", j.Synced, "plain", j.Plain, "notFound", j.NotFound, "failed", j.Failed)
++}
+diff --git a/core/seer/lyrics_test.go b/core/seer/lyrics_test.go
+new file mode 100644
+index 00000000..0a8c757a
+--- /dev/null
++++ b/core/seer/lyrics_test.go
+@@ -0,0 +1,85 @@
++package seer
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/navidrome/navidrome/model"
++)
++
++func TestLyricsCandidatesAndSidecars(t *testing.T) {
++	var gotUA string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		gotUA = r.Header.Get("User-Agent")
++		switch r.URL.Path {
++		case "/api/get":
++			if r.URL.Query().Get("duration") != "200" || r.URL.Query().Get("album_name") != "Disco" {
++				t.Errorf("get query = %v", r.URL.Query())
++			}
++			http.NotFound(w, r)
++		case "/api/search":
++			_ = json.NewEncoder(w).Encode([]lrclibEntry{
++				{ID: 1, TrackName: "Faixa", ArtistName: "Banda", Duration: 260, SyncedLyrics: "[00:01.00] longe"},
++				{ID: 2, TrackName: "Faixa", ArtistName: "Banda", Duration: 201, PlainLyrics: "só texto"},
++				{ID: 3, TrackName: "Faixa", ArtistName: "Banda", Duration: 199, SyncedLyrics: "[00:01.00] perto\n[00:02.50] fim"},
++				{ID: 4, TrackName: "Faixa", ArtistName: "Banda", Duration: 200},
++			})
++		}
++	}))
++	defer srv.Close()
++	l := NewLyrics(nil, "test-agent")
++	l.baseURL = srv.URL
++
++	dir := t.TempDir()
++	if err := os.MkdirAll(filepath.Join(dir, "Banda", "Disco"), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	mf := &model.MediaFile{ID: "s1", Title: "Faixa", Artist: "Banda", Album: "Disco", Duration: 200.2,
++		LibraryPath: dir, Path: filepath.Join("Banda", "Disco", "01 Faixa.flac")}
++
++	c, err := l.Candidates(context.Background(), mf)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if gotUA != "test-agent" || len(c) != 3 || c[0].ID != 3 || c[1].ID != 1 || c[2].ID != 2 {
++		t.Fatalf("candidates = %+v (ua %q)", c, gotUA)
++	}
++	pick := best(c, 200)
++	if pick == nil || pick.ID != 3 {
++		t.Fatalf("best = %+v", pick)
++	}
++	if best([]LyricsCandidate{{Duration: 260, Synced: "x"}}, 200) != nil {
++		t.Error("a lyric 60 s off must not be saved automatically")
++	}
++
++	if HasLyrics(mf) {
++		t.Error("no lyrics yet")
++	}
++	if err := saveSidecar(mf, pick.Synced, ""); err != nil {
++		t.Fatal(err)
++	}
++	lrc := filepath.Join(dir, "Banda", "Disco", "01 Faixa.lrc")
++	if b, _ := os.ReadFile(lrc); !strings.HasPrefix(string(b), "[00:01.00] perto") || !HasLyrics(mf) {
++		t.Errorf("lrc = %q", b)
++	}
++	// manual plain text replaces the synced file
++	if err := saveSidecar(mf, "", "linha um\nlinha dois"); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := os.Stat(lrc); !os.IsNotExist(err) {
++		t.Error(".lrc should be gone")
++	}
++	if b, _ := os.ReadFile(filepath.Join(dir, "Banda", "Disco", "01 Faixa.txt")); string(b) != "linha um\nlinha dois\n" {
++		t.Errorf("txt = %q", b)
++	}
++	// both empty clears
++	if err := saveSidecar(mf, " ", ""); err != nil || HasLyrics(mf) {
++		t.Errorf("clear: %v, has %v", err, HasLyrics(mf))
++	}
++}
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index c3e369d4..08b2cb3f 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -31,7 +31,9 @@ type Seer struct {
+ 	Podcasts *PodcastService
+ 	// Settings holds the switches an admin changes in the UI.
+ 	Settings *Settings
+-	reader   *swapReader
++	// Lyrics finds lyrics on LRCLIB and saves them next to the songs.
++	Lyrics *Lyrics
++	reader *swapReader
+ }
+ 
+ // Enabled reports whether the feature is turned on in the configuration.
+@@ -87,7 +89,7 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 	editor.SetCovers(&acquire.CoverFinder{UserAgent: opts.UserAgent}, catalog)
+ 	pStore := NewPodcastStore(db)
+ 	podcasts := NewPodcastService(pStore, func() string { return dest }, lib, broker, conf.Server.FFmpegPath, opts.YouTube.Path)
+-	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor, Podcasts: podcasts, Settings: settings, reader: reader}
++	return &Seer{Service: svc, Importer: imp, Storage: storage, Duplicates: dups, Editor: editor, Podcasts: podcasts, Settings: settings, Lyrics: NewLyrics(ds, opts.UserAgent), reader: reader}
+ }
+ 
+ // refreshUI tells open pages to reload (useRefreshOnEvents(['seer'])).
+diff --git a/server/seerapi/lyrics.go b/server/seerapi/lyrics.go
+new file mode 100644
+index 00000000..ffd6eb1d
+--- /dev/null
++++ b/server/seerapi/lyrics.go
+@@ -0,0 +1,68 @@
++package seerapi
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/navidrome/navidrome/core/seer"
++	"github.com/navidrome/navidrome/log"
++	"github.com/navidrome/navidrome/model"
++)
++
++// LyricsService finds lyrics on LRCLIB and saves them next to the songs.
++type LyricsService interface {
++	Find(ctx context.Context, songID string) ([]seer.LyricsCandidate, error)
++	Save(ctx context.Context, songID, synced, plain string) error
++	FetchMissing(ctx context.Context) seer.LyricsJob
++	Job() seer.LyricsJob
++}
++
++// lrclibLyrics lists the LRCLIB candidates of a song (player fallback and editor).
++func (api *Router) lrclibLyrics(w http.ResponseWriter, r *http.Request) {
++	c, err := api.lyrics.Find(r.Context(), chi.URLParam(r, "id"))
++	switch {
++	case errors.Is(err, model.ErrNotFound):
++		http.Error(w, "song not found", http.StatusNotFound)
++	case err != nil:
++		log.Warn(r.Context(), "Seer: LRCLIB lookup failed", err)
++		http.Error(w, "LRCLIB is unavailable: "+err.Error(), http.StatusBadGateway)
++	default:
++		if c == nil {
++			c = []seer.LyricsCandidate{}
++		}
++		writeJSON(w, http.StatusOK, c)
++	}
++}
++
++// saveLyrics writes {"synced": "[00:01.00] ...", "plain": "..."}; both empty removes them.
++func (api *Router) saveLyrics(w http.ResponseWriter, r *http.Request) {
++	var body struct {
++		Synced string `json:"synced"`
++		Plain  string `json:"plain"`
++	}
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512<<10)).Decode(&body); err != nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	err := api.lyrics.Save(r.Context(), chi.URLParam(r, "id"), body.Synced, body.Plain)
++	switch {
++	case errors.Is(err, model.ErrNotFound):
++		http.Error(w, "song not found", http.StatusNotFound)
++	case err != nil:
++		log.Error(r.Context(), "Seer: saving lyrics failed", err)
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++	default:
++		w.WriteHeader(http.StatusNoContent)
++	}
++}
++
++func (api *Router) fetchMissingLyrics(w http.ResponseWriter, r *http.Request) {
++	writeJSON(w, http.StatusAccepted, api.lyrics.FetchMissing(r.Context()))
++}
++
++func (api *Router) lyricsJob(w http.ResponseWriter, _ *http.Request) {
++	writeJSON(w, http.StatusOK, api.lyrics.Job())
++}
+diff --git a/server/seerapi/lyrics_test.go b/server/seerapi/lyrics_test.go
+new file mode 100644
+index 00000000..83442c3d
+--- /dev/null
++++ b/server/seerapi/lyrics_test.go
+@@ -0,0 +1,58 @@
++package seerapi
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/navidrome/navidrome/core/seer"
++	"github.com/navidrome/navidrome/model"
++)
++
++type fakeLyrics struct {
++	saved  [3]string
++	starts int
++}
++
++func (f *fakeLyrics) Find(_ context.Context, id string) ([]seer.LyricsCandidate, error) {
++	if id == "none" {
++		return nil, model.ErrNotFound
++	}
++	return []seer.LyricsCandidate{{ID: 7, Title: "T", Synced: "[00:01.00] a"}}, nil
++}
++func (f *fakeLyrics) Save(_ context.Context, id, synced, plain string) error {
++	f.saved = [3]string{id, synced, plain}
++	return nil
++}
++func (f *fakeLyrics) FetchMissing(context.Context) seer.LyricsJob {
++	f.starts++
++	return seer.LyricsJob{Running: true}
++}
++func (f *fakeLyrics) Job() seer.LyricsJob { return seer.LyricsJob{Done: 3, Total: 5} }
++
++func TestSeerLyricsAPI(t *testing.T) {
++	lyr := &fakeLyrics{}
++	api := NewWithImports(nil, &fakeService{}, nil)
++	api.lyrics = lyr
++	api.Handler = api.routes()
++	user, admin := model.User{ID: "u1"}, model.User{ID: "a", IsAdmin: true}
++
++	if w := do(t, api, user, "GET", "/lyrics/s1/lrclib", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"synced":"[00:01.00] a"`) {
++		t.Errorf("lrclib: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, user, "GET", "/lyrics/none/lrclib", ""); w.Code != 404 {
++		t.Errorf("unknown song: %d", w.Code)
++	}
++	if w := do(t, api, user, "PUT", "/lyrics/s1", `{"plain":"x"}`); w.Code != 403 {
++		t.Errorf("only admins save lyrics: %d", w.Code)
++	}
++	if w := do(t, api, admin, "PUT", "/lyrics/s1", `{"synced":"[00:02.00] b","plain":""}`); w.Code != 204 || lyr.saved != [3]string{"s1", "[00:02.00] b", ""} {
++		t.Errorf("save: %d %v", w.Code, lyr.saved)
++	}
++	if w := do(t, api, admin, "POST", "/lyrics-batch", ""); w.Code != 202 || lyr.starts != 1 {
++		t.Errorf("batch: %d", w.Code)
++	}
++	if w := do(t, api, admin, "GET", "/lyrics-batch", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"total":5`) {
++		t.Errorf("batch status: %d %s", w.Code, w.Body)
++	}
++}
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index c35409b8..8396863d 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -75,6 +75,7 @@ type Router struct {
+ 	editor   Editor
+ 	podcasts Podcasts
+ 	settings Settings
++	lyrics   LyricsService
+ }
+ 
+ func New(ds model.DataStore, s *seer.Seer) *Router {
+@@ -87,6 +88,7 @@ func New(ds model.DataStore, s *seer.Seer) *Router {
+ 		editor:   s.Editor,
+ 		podcasts: s.Podcasts,
+ 		settings: s,
++		lyrics:   s.Lyrics,
+ 	}
+ 	r.Handler = r.routes()
+ 	return r
+@@ -143,6 +145,12 @@ func (api *Router) routes() http.Handler {
+ 			r.Get("/state", api.getState)
+ 			r.Put("/state", api.putState)
+ 		}
++		if api.lyrics != nil {
++			r.Get("/lyrics/{id}/lrclib", api.lrclibLyrics)
++			r.With(adminOnly).Put("/lyrics/{id}", api.saveLyrics)
++			r.With(adminOnly).Post("/lyrics-batch", api.fetchMissingLyrics)
++			r.With(adminOnly).Get("/lyrics-batch", api.lyricsJob)
++		}
+ 		r.Get("/catalog", api.searchCatalog)
+ 		r.Get("/catalog/artist/{mbid}", api.catalogArtist)
+ 		r.Get("/catalog/album/{mbid}", api.catalogAlbum)
+-- 
+2.47.3
+

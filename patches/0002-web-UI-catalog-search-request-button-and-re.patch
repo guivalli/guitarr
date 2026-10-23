@@ -1,0 +1,867 @@
+From 8500f0ba55bc3b72379be77e8801eb04d1a0677e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 16:06:56 +0000
+Subject: [PATCH 02/10] Add Seer web UI: catalog search, request button and
+ requests page
+
+A "Requests" sidebar entry (when Seer.Enabled) searches MusicBrainz, plays
+owned items, requests missing ones and lists requests with admin approval.
+The list refreshes via the event stream.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ SEER.md                        |  11 ++-
+ cmd/wire_gen.go                |   4 +-
+ core/acquire/service.go        |  13 ++-
+ core/seer/seer.go              |  13 ++-
+ resources/i18n/pt-br.json      |  37 +++++++++
+ server/serve_index.go          |   2 +
+ ui/src/App.jsx                 |   2 +
+ ui/src/config.js               |   1 +
+ ui/src/i18n/en.json            |  37 +++++++++
+ ui/src/seer/CatalogResults.jsx |  97 ++++++++++++++++++++++
+ ui/src/seer/RequestsTable.jsx  |  87 ++++++++++++++++++++
+ ui/src/seer/Seer.test.jsx      | 120 ++++++++++++++++++++++++++++
+ ui/src/seer/SeerPage.jsx       | 142 +++++++++++++++++++++++++++++++++
+ ui/src/seer/StatusChip.jsx     |  20 +++++
+ ui/src/seer/api.js             |  23 ++++++
+ ui/src/seer/index.jsx          |  16 ++++
+ 16 files changed, 618 insertions(+), 7 deletions(-)
+ create mode 100644 ui/src/seer/CatalogResults.jsx
+ create mode 100644 ui/src/seer/RequestsTable.jsx
+ create mode 100644 ui/src/seer/Seer.test.jsx
+ create mode 100644 ui/src/seer/SeerPage.jsx
+ create mode 100644 ui/src/seer/StatusChip.jsx
+ create mode 100644 ui/src/seer/api.js
+ create mode 100644 ui/src/seer/index.jsx
+
+diff --git a/SEER.md b/SEER.md
+index e9779e0..e32dfae 100644
+--- a/SEER.md
++++ b/SEER.md
+@@ -8,6 +8,15 @@ Code: `core/acquire` (engine, no Navidrome imports), `core/seer` (config,
+ library matching, scanner), `server/seerapi` (HTTP), migration
+ `db/migrations/20261010000000_create_acquire_request.sql`.
+ 
++## Web UI
++
++When `Seer.Enabled` is on, a **Requests** entry appears in the sidebar (`#/seer`):
++a search box over the MusicBrainz catalog (owned items get Play/Open, missing
++ones a Request button, requested ones their live status) and the requests list,
++where admins approve pending requests or retry failed ones. The list refreshes
++by itself through the server event stream (`refreshResource` for `seer`).
++Code: `ui/src/seer/`; strings under `resources.seer` (English and pt-BR).
++
+ ## Configuration
+ 
+ ```toml
+@@ -70,7 +79,7 @@ Statuses: `pending` → `queued` → `searching` → `downloading` → `importin
+ 
+ ## Not done yet
+ 
+-- Web UI (plan phase 2): search page with "Request" button, requests page, SSE updates.
+ - Lidarr and slskd API shapes are untested against live instances.
+ - Soulseek files keep the peer's tags (no MusicBrainz retagging yet).
+ - Per-user quotas, rate limits, reject/cancel requests.
++- Subsonic clients (Symfonium, Feishin...) don't see catalog results yet.
+diff --git a/cmd/wire_gen.go b/cmd/wire_gen.go
+index 62c52b7..2dff894 100644
+--- a/cmd/wire_gen.go
++++ b/cmd/wire_gen.go
+@@ -160,7 +160,7 @@ func CreateSeerRouter(ctx context.Context) *seerapi.Router {
+ 	playlistsPlaylists := playlists.NewPlaylists(dataStore, uploader)
+ 	metricsMetrics := metrics.GetPrometheusInstance(dataStore)
+ 	modelScanner := scanner.GetInstance(ctx, dataStore, broker, playlistsPlaylists, metricsMetrics)
+-	seerSeer := seer.GetInstance(dataStore, modelScanner, sqlDB)
++	seerSeer := seer.GetInstance(dataStore, modelScanner, sqlDB, broker)
+ 	router := seerapi.New(dataStore, seerSeer)
+ 	return router
+ }
+@@ -173,7 +173,7 @@ func CreateSeer(ctx context.Context) *seer.Seer {
+ 	playlistsPlaylists := playlists.NewPlaylists(dataStore, uploader)
+ 	metricsMetrics := metrics.GetPrometheusInstance(dataStore)
+ 	modelScanner := scanner.GetInstance(ctx, dataStore, broker, playlistsPlaylists, metricsMetrics)
+-	seerSeer := seer.GetInstance(dataStore, modelScanner, sqlDB)
++	seerSeer := seer.GetInstance(dataStore, modelScanner, sqlDB, broker)
+ 	return seerSeer
+ }
+ 
+diff --git a/core/acquire/service.go b/core/acquire/service.go
+index b174c39..ad21ab3 100644
+--- a/core/acquire/service.go
++++ b/core/acquire/service.go
+@@ -72,6 +72,8 @@ type Config struct {
+ 	PollInterval time.Duration
+ 	// RescanInterval is the minimum time between rescans triggered while waiting for imports.
+ 	RescanInterval time.Duration
++	// OnChange, when set, is called after a request is created or changes status.
++	OnChange func(Request)
+ }
+ 
+ type Service struct {
+@@ -187,6 +189,7 @@ func (s *Service) Submit(ctx context.Context, userID string, item CatalogItem) (
+ 	if err := s.store.Create(ctx, req); err != nil {
+ 		return nil, err
+ 	}
++	s.notify(req)
+ 	if req.Status == StatusQueued {
+ 		s.enqueue(ctx, req.ID)
+ 	}
+@@ -337,7 +340,15 @@ func (s *Service) rescan(ctx context.Context) {
+ 
+ func (s *Service) setStatus(ctx context.Context, req *Request, st Status, errMsg string) {
+ 	req.Status, req.Error, req.UpdatedAt = st, errMsg, time.Now()
+-	_ = s.store.Update(ctx, req)
++	if err := s.store.Update(ctx, req); err == nil {
++		s.notify(req)
++	}
++}
++
++func (s *Service) notify(req *Request) {
++	if s.cfg.OnChange != nil {
++		s.cfg.OnChange(*req)
++	}
+ }
+ 
+ // Get returns one request.
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index 7672317..64ac89e 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/navidrome/navidrome/core/acquire"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/server/events"
+ 	"github.com/navidrome/navidrome/utils/singleton"
+ )
+ 
+@@ -24,20 +25,26 @@ type Seer struct {
+ func Enabled() bool { return conf.Server.Seer.Enabled }
+ 
+ // GetInstance returns the process-wide Seer. Workers only run after Start.
+-func GetInstance(ds model.DataStore, scanner model.Scanner, db *sql.DB) *Seer {
++func GetInstance(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Broker) *Seer {
+ 	return singleton.GetInstance(func() *Seer {
+-		return New(ds, scanner, db)
++		return New(ds, scanner, db, broker)
+ 	})
+ }
+ 
+ // New builds a Seer from conf.Server.Seer.
+-func New(ds model.DataStore, scanner model.Scanner, db *sql.DB) *Seer {
++func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Broker) *Seer {
+ 	opts := conf.Server.Seer
+ 	cfg := acquire.Config{
+ 		DestDir:       destFolder(ds),
+ 		Workers:       opts.Workers,
+ 		AutoApprove:   opts.AutoApprove,
+ 		ImportTimeout: opts.ImportTimeout,
++		OnChange: func(acquire.Request) {
++			// Tells open UIs to reload the requests list (useRefreshOnEvents(['seer'])).
++			if broker != nil {
++				broker.SendBroadcastMessage(context.Background(), (&events.RefreshResource{}).With("seer"))
++			}
++		},
+ 	}
+ 	catalog := &acquire.MusicBrainz{UserAgent: opts.UserAgent, BaseURL: opts.MusicBrainzURL}
+ 	lib := &library{ds: ds, scanner: scanner}
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index 2389192..1346692 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -454,6 +454,43 @@
+         "configKey": "chave",
+         "configValue": "valor"
+       }
++    },
++    "seer": {
++      "name": "Pedido |||| Pedidos",
++      "requests": "Pedidos",
++      "fields": {
++        "title": "Título",
++        "artist": "Artista",
++        "status": "Status",
++        "source": "Fonte",
++        "createdAt": "Pedido em"
++      },
++      "kind": {
++        "track": "Música",
++        "album": "Álbum"
++      },
++      "status": {
++        "pending": "Aguardando aprovação",
++        "queued": "Na fila",
++        "searching": "Procurando",
++        "downloading": "Baixando",
++        "importing": "Importando",
++        "available": "Disponível",
++        "failed": "Falhou"
++      },
++      "actions": {
++        "request": "Pedir",
++        "play": "Tocar",
++        "open": "Abrir",
++        "approve": "Aprovar",
++        "retry": "Tentar de novo"
++      },
++      "message": {
++        "searchPlaceholder": "Busque qualquer artista, álbum ou música",
++        "noResults": "Nada encontrado",
++        "noRequests": "Nenhum pedido ainda",
++        "requested": "Pedido enviado"
++      }
+     }
+   },
+   "ra": {
+diff --git a/server/serve_index.go b/server/serve_index.go
+index 1671974..b3504d1 100644
+--- a/server/serve_index.go
++++ b/server/serve_index.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/navidrome/navidrome/conf/mime"
+ 	"github.com/navidrome/navidrome/consts"
+ 	"github.com/navidrome/navidrome/core/quickconnect"
++	"github.com/navidrome/navidrome/core/seer"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
+ 	"github.com/navidrome/navidrome/utils/slice"
+@@ -83,6 +84,7 @@ func serveIndex(ds model.DataStore, fs fs.FS, shareInfo *model.Share) http.Handl
+ 			"separator":                 string(os.PathSeparator),
+ 			"enableInspect":             conf.Server.Inspect.Enabled,
+ 			"pluginsEnabled":            conf.Server.Plugins.Enabled,
++			"seerEnabled":               seer.Enabled(),
+ 			"extAuthLogoutURL":          conf.Server.ExtAuth.LogoutURL,
+ 		}
+ 		if strings.HasPrefix(conf.Server.UILoginBackgroundURL, "/") {
+diff --git a/ui/src/App.jsx b/ui/src/App.jsx
+index 4de3693..92df18b 100644
+--- a/ui/src/App.jsx
++++ b/ui/src/App.jsx
+@@ -49,6 +49,7 @@ import SharePlayer from './share/SharePlayer'
+ import { HTML5Backend } from 'react-dnd-html5-backend'
+ import { DndProvider } from 'react-dnd'
+ import missing from './missing/index.js'
++import seer from './seer'
+ import { useEffect } from 'react'
+ 
+ const history = createHashHistory()
+@@ -132,6 +133,7 @@ const Admin = (props) => {
+           {...(permissions === 'admin' ? radio.admin : radio.all)}
+         />,
+         config.enableSharing && <Resource name="share" {...share} />,
++        config.seerEnabled && <Resource name="seer" {...seer} />,
+         <Resource
+           name="playlist"
+           {...playlist}
+diff --git a/ui/src/config.js b/ui/src/config.js
+index 62b3cb8..1dd9cb0 100644
+--- a/ui/src/config.js
++++ b/ui/src/config.js
+@@ -46,6 +46,7 @@ const defaultConfig = {
+   separator: '/',
+   enableInspect: true,
+   pluginsEnabled: true,
++  seerEnabled: true,
+ }
+ 
+ let config
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index f694ea7..446183c 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -457,6 +457,43 @@
+         "configKey": "key",
+         "configValue": "value"
+       }
++    },
++    "seer": {
++      "name": "Request |||| Requests",
++      "requests": "Requests",
++      "fields": {
++        "title": "Title",
++        "artist": "Artist",
++        "status": "Status",
++        "source": "Source",
++        "createdAt": "Requested at"
++      },
++      "kind": {
++        "track": "Track",
++        "album": "Album"
++      },
++      "status": {
++        "pending": "Waiting approval",
++        "queued": "Queued",
++        "searching": "Searching",
++        "downloading": "Downloading",
++        "importing": "Importing",
++        "available": "Available",
++        "failed": "Failed"
++      },
++      "actions": {
++        "request": "Request",
++        "play": "Play",
++        "open": "Open",
++        "approve": "Approve",
++        "retry": "Retry"
++      },
++      "message": {
++        "searchPlaceholder": "Search any artist, album or song",
++        "noResults": "Nothing found",
++        "noRequests": "No requests yet",
++        "requested": "Request sent"
++      }
+     }
+   },
+   "ra": {
+diff --git a/ui/src/seer/CatalogResults.jsx b/ui/src/seer/CatalogResults.jsx
+new file mode 100644
+index 0000000..86699e8
+--- /dev/null
++++ b/ui/src/seer/CatalogResults.jsx
+@@ -0,0 +1,97 @@
++import {
++  Button,
++  List,
++  ListItem,
++  ListItemIcon,
++  ListItemSecondaryAction,
++  ListItemText,
++} from '@material-ui/core'
++import AlbumIcon from '@material-ui/icons/Album'
++import MusicNoteIcon from '@material-ui/icons/MusicNote'
++import PlayArrowIcon from '@material-ui/icons/PlayArrow'
++import AddIcon from '@material-ui/icons/Add'
++import { useDataProvider, useNotify, useTranslate } from 'react-admin'
++import { useDispatch } from 'react-redux'
++import { useHistory } from 'react-router-dom'
++import { playTracks } from '../actions'
++import { StatusChip } from './StatusChip'
++
++const describe = (item) =>
++  [item.artist, item.kind === 'track' ? item.album : null, item.year]
++    .filter(Boolean)
++    .join(' · ')
++
++const OwnedAction = ({ item }) => {
++  const translate = useTranslate()
++  const dataProvider = useDataProvider()
++  const dispatch = useDispatch()
++  const history = useHistory()
++  const notify = useNotify()
++
++  const play = () => {
++    if (item.kind === 'album') {
++      history.push(`/album/${item.libraryId}/show`)
++      return
++    }
++    dataProvider
++      .getOne('song', { id: item.libraryId })
++      .then(({ data }) => dispatch(playTracks({ [data.id]: data }, [data.id])))
++      .catch(() => notify('ra.page.error', 'warning'))
++  }
++
++  return (
++    <Button size="small" color="primary" onClick={play}>
++      <PlayArrowIcon fontSize="small" />
++      {translate(
++        item.kind === 'album'
++          ? 'resources.seer.actions.open'
++          : 'resources.seer.actions.play',
++      )}
++    </Button>
++  )
++}
++
++export const CatalogResults = ({ items, requests, onRequest }) => {
++  const translate = useTranslate()
++  const findRequest = (item) =>
++    requests.find(
++      (r) =>
++        r.kind === item.kind && r.mbid === item.mbid && r.status !== 'failed',
++    )
++
++  return (
++    <List dense>
++      {items.map((item) => {
++        const req = findRequest(item)
++        return (
++          <ListItem key={`${item.kind}-${item.mbid}`}>
++            <ListItemIcon>
++              {item.kind === 'album' ? <AlbumIcon /> : <MusicNoteIcon />}
++            </ListItemIcon>
++            <ListItemText
++              primary={item.title}
++              secondary={`${translate(`resources.seer.kind.${item.kind}`)} · ${describe(item)}`}
++            />
++            <ListItemSecondaryAction>
++              {item.inLibrary ? (
++                <OwnedAction item={item} />
++              ) : req ? (
++                <StatusChip status={req.status} error={req.error} />
++              ) : (
++                <Button
++                  size="small"
++                  variant="outlined"
++                  color="primary"
++                  onClick={() => onRequest(item)}
++                >
++                  <AddIcon fontSize="small" />
++                  {translate('resources.seer.actions.request')}
++                </Button>
++              )}
++            </ListItemSecondaryAction>
++          </ListItem>
++        )
++      })}
++    </List>
++  )
++}
+diff --git a/ui/src/seer/RequestsTable.jsx b/ui/src/seer/RequestsTable.jsx
+new file mode 100644
+index 0000000..bc28a9a
+--- /dev/null
++++ b/ui/src/seer/RequestsTable.jsx
+@@ -0,0 +1,87 @@
++import {
++  Button,
++  Table,
++  TableBody,
++  TableCell,
++  TableHead,
++  TableRow,
++  Typography,
++} from '@material-ui/core'
++import { usePermissions, useTranslate } from 'react-admin'
++import { StatusChip } from './StatusChip'
++
++const formatDate = (d) => new Date(d).toLocaleString()
++
++export const RequestsTable = ({ requests, onApprove }) => {
++  const translate = useTranslate()
++  const { permissions } = usePermissions()
++  const isAdmin = permissions === 'admin'
++
++  if (requests.length === 0) {
++    return (
++      <Typography variant="body2" color="textSecondary">
++        {translate('resources.seer.message.noRequests')}
++      </Typography>
++    )
++  }
++
++  return (
++    <Table size="small">
++      <TableHead>
++        <TableRow>
++          <TableCell>{translate('resources.seer.fields.title')}</TableCell>
++          <TableCell>{translate('resources.seer.fields.artist')}</TableCell>
++          <TableCell>{translate('resources.seer.fields.status')}</TableCell>
++          <TableCell>{translate('resources.seer.fields.source')}</TableCell>
++          <TableCell>{translate('resources.seer.fields.createdAt')}</TableCell>
++          {isAdmin && <TableCell />}
++        </TableRow>
++      </TableHead>
++      <TableBody>
++        {requests.map((r) => (
++          <TableRow key={r.id}>
++            <TableCell>
++              {r.title}
++              <Typography
++                variant="caption"
++                display="block"
++                color="textSecondary"
++              >
++                {translate(`resources.seer.kind.${r.kind}`)}
++                {r.kind === 'track' && r.album ? ` · ${r.album}` : ''}
++              </Typography>
++            </TableCell>
++            <TableCell>{r.artist}</TableCell>
++            <TableCell>
++              <StatusChip status={r.status} error={r.error} />
++              {r.status === 'failed' && r.error && (
++                <Typography variant="caption" display="block" color="error">
++                  {r.error}
++                </Typography>
++              )}
++            </TableCell>
++            <TableCell>{r.source || '—'}</TableCell>
++            <TableCell>{formatDate(r.createdAt)}</TableCell>
++            {isAdmin && (
++              <TableCell align="right">
++                {(r.status === 'pending' || r.status === 'failed') && (
++                  <Button
++                    size="small"
++                    color="primary"
++                    onClick={() => onApprove(r)}
++                  >
++                    {translate(
++                      r.status === 'pending'
++                        ? 'resources.seer.actions.approve'
++                        : 'resources.seer.actions.retry',
++                    )}
++                  </Button>
++                )}
++              </TableCell>
++            )}
++          </TableRow>
++        ))}
++      </TableBody>
++    </Table>
++  )
++}
+diff --git a/ui/src/seer/Seer.test.jsx b/ui/src/seer/Seer.test.jsx
+new file mode 100644
+index 0000000..b263b34
+--- /dev/null
++++ b/ui/src/seer/Seer.test.jsx
+@@ -0,0 +1,120 @@
++import React from 'react'
++import { render, fireEvent } from '@testing-library/react'
++import { describe, it, expect, vi, beforeEach } from 'vitest'
++import * as RA from 'react-admin'
++import { CatalogResults } from './CatalogResults'
++import { RequestsTable } from './RequestsTable'
++
++vi.mock('react-admin', async () => {
++  const actual = await vi.importActual('react-admin')
++  return {
++    ...actual,
++    useTranslate: () => (key) => key,
++    useNotify: vi.fn(),
++    useDataProvider: vi.fn(),
++    usePermissions: vi.fn(() => ({ permissions: 'user' })),
++  }
++})
++
++vi.mock('react-redux', async () => {
++  const actual = await vi.importActual('react-redux')
++  return { ...actual, useDispatch: () => vi.fn() }
++})
++
++vi.mock('react-router-dom', async () => {
++  const actual = await vi.importActual('react-router-dom')
++  return { ...actual, useHistory: () => ({ push: vi.fn() }) }
++})
++
++const items = [
++  {
++    kind: 'album',
++    mbid: 'a1',
++    title: 'Owned',
++    artist: 'X',
++    inLibrary: true,
++    libraryId: 'l1',
++  },
++  { kind: 'track', mbid: 't1', title: 'Missing', artist: 'X' },
++  { kind: 'track', mbid: 't2', title: 'Asked', artist: 'X' },
++]
++
++describe('CatalogResults', () => {
++  it('shows open for owned items, request for missing ones and the status of active requests', () => {
++    const onRequest = vi.fn()
++    const requests = [
++      { id: 'r', kind: 'track', mbid: 't2', status: 'downloading' },
++    ]
++    const { getByText, getAllByText } = render(
++      <CatalogResults
++        items={items}
++        requests={requests}
++        onRequest={onRequest}
++      />,
++    )
++    expect(getByText('resources.seer.actions.open')).toBeTruthy()
++    expect(getByText('resources.seer.status.downloading')).toBeTruthy()
++    const requestButtons = getAllByText('resources.seer.actions.request')
++    expect(requestButtons).toHaveLength(1)
++    fireEvent.click(requestButtons[0])
++    expect(onRequest).toHaveBeenCalledWith(items[1])
++  })
++})
++
++describe('RequestsTable', () => {
++  const requests = [
++    {
++      id: '1',
++      kind: 'track',
++      title: 'P',
++      artist: 'A',
++      status: 'pending',
++      createdAt: '2026-10-10T00:00:00Z',
++    },
++    {
++      id: '2',
++      kind: 'album',
++      title: 'F',
++      artist: 'A',
++      status: 'failed',
++      error: 'boom',
++      createdAt: '2026-10-10T00:00:00Z',
++    },
++    {
++      id: '3',
++      kind: 'album',
++      title: 'OK',
++      artist: 'A',
++      status: 'available',
++      createdAt: '2026-10-10T00:00:00Z',
++    },
++  ]
++
++  beforeEach(() => vi.clearAllMocks())
++
++  it('hides approval buttons from regular users', () => {
++    const { queryByText, getByText } = render(
++      <RequestsTable requests={requests} onApprove={vi.fn()} />,
++    )
++    expect(queryByText('resources.seer.actions.approve')).toBeNull()
++    expect(getByText('boom')).toBeTruthy()
++  })
++
++  it('lets admins approve pending and retry failed requests', () => {
++    RA.usePermissions.mockReturnValue({ permissions: 'admin' })
++    const onApprove = vi.fn()
++    const { getByText } = render(
++      <RequestsTable requests={requests} onApprove={onApprove} />,
++    )
++    fireEvent.click(getByText('resources.seer.actions.approve'))
++    fireEvent.click(getByText('resources.seer.actions.retry'))
++    expect(onApprove.mock.calls.map((c) => c[0].id)).toEqual(['1', '2'])
++  })
++
++  it('shows an empty message', () => {
++    const { getByText } = render(
++      <RequestsTable requests={[]} onApprove={vi.fn()} />,
++    )
++    expect(getByText('resources.seer.message.noRequests')).toBeTruthy()
++  })
++})
+diff --git a/ui/src/seer/SeerPage.jsx b/ui/src/seer/SeerPage.jsx
+new file mode 100644
+index 0000000..8353026
+--- /dev/null
++++ b/ui/src/seer/SeerPage.jsx
+@@ -0,0 +1,142 @@
++import { useCallback, useEffect, useState } from 'react'
++import {
++  Card,
++  CardContent,
++  CircularProgress,
++  InputAdornment,
++  TextField,
++  Typography,
++} from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import SearchIcon from '@material-ui/icons/Search'
++import { Title, useNotify, useTranslate } from 'react-admin'
++import { useRefreshOnEvents } from '../common'
++import config from '../config'
++import {
++  approveRequest,
++  createRequest,
++  listRequests,
++  searchCatalog,
++} from './api'
++import { CatalogResults } from './CatalogResults'
++import { RequestsTable } from './RequestsTable'
++
++const useStyles = makeStyles((theme) => ({
++  root: { marginTop: theme.spacing(2) },
++  section: { marginBottom: theme.spacing(2) },
++  progress: { display: 'block', margin: theme.spacing(2, 'auto') },
++}))
++
++const errorMessage = (err) => err?.body || err?.message || String(err)
++
++const SeerPage = () => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const notify = useNotify()
++  const [query, setQuery] = useState('')
++  const [results, setResults] = useState(null)
++  const [searching, setSearching] = useState(false)
++  const [requests, setRequests] = useState([])
++
++  const loadRequests = useCallback(
++    () =>
++      listRequests()
++        .then(setRequests)
++        .catch((err) => notify(errorMessage(err), 'warning')),
++    [notify],
++  )
++
++  useEffect(() => {
++    loadRequests()
++  }, [loadRequests])
++  useRefreshOnEvents({ events: ['seer'], onRefresh: loadRequests })
++
++  // Debounced catalog search: MusicBrainz is slow (1 request/second), so wait for a pause.
++  useEffect(() => {
++    const q = query.trim()
++    if (q.length < 2) {
++      setResults(null)
++      return
++    }
++    let cancelled = false
++    const timer = setTimeout(
++      () => {
++        setSearching(true)
++        searchCatalog(q)
++          .then((items) => !cancelled && setResults(items))
++          .catch((err) => !cancelled && notify(errorMessage(err), 'warning'))
++          .finally(() => !cancelled && setSearching(false))
++      },
++      Math.max(config.uiSearchDebounceMs, 600),
++    )
++    return () => {
++      cancelled = true
++      clearTimeout(timer)
++    }
++  }, [query, notify])
++
++  const request = (item) =>
++    createRequest(item)
++      .then((req) => {
++        notify('resources.seer.message.requested', 'info')
++        setRequests((rs) => [req, ...rs.filter((r) => r.id !== req.id)])
++      })
++      .catch((err) => notify(errorMessage(err), 'warning'))
++
++  const approve = (req) =>
++    approveRequest(req.id)
++      .then(loadRequests)
++      .catch((err) => notify(errorMessage(err), 'warning'))
++
++  return (
++    <div className={classes.root}>
++      <Title
++        title={
++          'Navidrome - ' + translate('resources.seer.name', { smart_count: 2 })
++        }
++      />
++      <Card className={classes.section}>
++        <CardContent>
++          <TextField
++            fullWidth
++            autoFocus
++            variant="outlined"
++            placeholder={translate('resources.seer.message.searchPlaceholder')}
++            value={query}
++            onChange={(e) => setQuery(e.target.value)}
++            InputProps={{
++              startAdornment: (
++                <InputAdornment position="start">
++                  <SearchIcon />
++                </InputAdornment>
++              ),
++            }}
++          />
++          {searching && <CircularProgress className={classes.progress} />}
++          {!searching && results && results.length === 0 && (
++            <Typography variant="body2" color="textSecondary">
++              {translate('resources.seer.message.noResults')}
++            </Typography>
++          )}
++          {!searching && results && results.length > 0 && (
++            <CatalogResults
++              items={results}
++              requests={requests}
++              onRequest={request}
++            />
++          )}
++        </CardContent>
++      </Card>
++      <Card>
++        <CardContent>
++          <Typography variant="h6" gutterBottom>
++            {translate('resources.seer.requests')}
++          </Typography>
++          <RequestsTable requests={requests} onApprove={approve} />
++        </CardContent>
++      </Card>
++    </div>
++  )
++}
++
++export default SeerPage
+diff --git a/ui/src/seer/StatusChip.jsx b/ui/src/seer/StatusChip.jsx
+new file mode 100644
+index 0000000..4beaf69
+--- /dev/null
++++ b/ui/src/seer/StatusChip.jsx
+@@ -0,0 +1,20 @@
++import { Chip } from '@material-ui/core'
++import { useTranslate } from 'react-admin'
++
++const colors = {
++  available: 'primary',
++  failed: 'secondary',
++}
++
++export const StatusChip = ({ status, error }) => {
++  const translate = useTranslate()
++  return (
++    <Chip
++      size="small"
++      variant={status === 'available' ? 'default' : 'outlined'}
++      color={colors[status] || 'default'}
++      label={translate(`resources.seer.status.${status}`, { _: status })}
++      title={error || undefined}
++    />
++  )
++}
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+new file mode 100644
+index 0000000..f0e4357
+--- /dev/null
++++ b/ui/src/seer/api.js
+@@ -0,0 +1,23 @@
++import httpClient from '../dataProvider/httpClient'
++import { REST_URL } from '../consts'
++
++const SEER_URL = `${REST_URL}/seer`
++
++export const searchCatalog = (q, limit = 20) =>
++  httpClient(
++    `${SEER_URL}/catalog?q=${encodeURIComponent(q)}&limit=${limit}`,
++  ).then(({ json }) => json)
++
++export const listRequests = () =>
++  httpClient(`${SEER_URL}/requests`).then(({ json }) => json)
++
++export const createRequest = (item) =>
++  httpClient(`${SEER_URL}/requests`, {
++    method: 'POST',
++    body: JSON.stringify(item),
++  }).then(({ json }) => json)
++
++export const approveRequest = (id) =>
++  httpClient(`${SEER_URL}/requests/${id}/approve`, { method: 'POST' }).then(
++    ({ json }) => json,
++  )
+diff --git a/ui/src/seer/index.jsx b/ui/src/seer/index.jsx
+new file mode 100644
+index 0000000..f13065f
+--- /dev/null
++++ b/ui/src/seer/index.jsx
+@@ -0,0 +1,16 @@
++import React from 'react'
++import LibraryAddIcon from '@material-ui/icons/LibraryAdd'
++import LibraryAddOutlinedIcon from '@material-ui/icons/LibraryAddOutlined'
++import DynamicMenuIcon from '../layout/DynamicMenuIcon'
++import SeerPage from './SeerPage'
++
++export default {
++  list: SeerPage,
++  icon: (
++    <DynamicMenuIcon
++      path={'seer'}
++      icon={LibraryAddOutlinedIcon}
++      activeIcon={LibraryAddIcon}
++    />
++  ),
++}
+-- 
+2.43.0
+

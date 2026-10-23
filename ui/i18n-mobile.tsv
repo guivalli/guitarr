@@ -1,0 +1,104 @@
+# Textos que só existem no app mobile (PWA/APK). Junta-se ao i18n-en.tsv no build do mobile.
+Sem perda (FLAC etc.). Ocupa 20 a 40 MB por música. ||| Lossless (FLAC etc.). Takes 20 to 40 MB per song.
+Cerca de 2,4 MB por minuto. Convertida pelo servidor. ||| About 2.4 MB per minute. Converted by the server.
+Média · 192 kbps (MP3) ||| Medium · 192 kbps (MP3)
+Cerca de 1,4 MB por minuto. ||| About 1.4 MB per minute.
+Econômica · 128 kbps (MP3) ||| Economy · 128 kbps (MP3)
+Cerca de 1 MB por minuto. Bom para guardar muita coisa. ||| About 1 MB per minute. Good for storing a lot.
+Este navegador não guarda arquivos offline ||| This browser does not store files offline
+Baixando para ouvir offline ||| Downloading to listen offline
+Limite de ||| Limit of
+Pouco espaço livre no aparelho ( ||| Little free space on the device (
+Sem conexão. Continua quando voltar. ||| No connection. Resumes when it is back.
+Aguardando Wi‑Fi (você escolheu baixar só no Wi‑Fi). ||| Waiting for Wi‑Fi (you chose to download only on Wi‑Fi).
+Baixando para uso offline… ||| Downloading for offline use…
+Faz parte de " ||| It is part of "
+um álbum/playlist ||| an album/playlist
+", que está offline. Remova por lá. ||| ", which is offline. Remove it there.
+Não consegui abrir a lista: ||| Could not open the list:
+Nada para baixar aqui. ||| Nothing to download here.
+" precisa de cerca de ||| " needs about
+, mas só restam ||| , but only
+dentro do limite de ||| within the limit of
+. Baixar até onde couber? (Você pode aumentar o limite depois.) ||| . Download as much as fits? (You can raise the limit later.)
+Remover do offline ||| Remove from offline
+acima do limite ||| over the limit
+Só no Wi‑Fi: ||| Wi‑Fi only:
+não ||| no
+sim ||| yes
+Músicas avulsas ||| Single songs
+Nada offline ainda. ||| Nothing offline yet.
+Abra um álbum ou uma playlist e toque em "Baixar offline", ou use ⋮ em uma música. ||| Open an album or a playlist and tap "Download offline", or use ⋮ on a song.
+Apagar tudo do offline ||| Delete everything offline
+" do offline? As músicas saem do aparelho (continuam no servidor). ||| " from offline? The songs leave the device (they stay on the server).
+Removido do offline ||| Removed from offline
+Apagar TUDO que está salvo offline neste aparelho? ||| Delete EVERYTHING saved offline on this device?
+Cancelar os downloads que faltam? ||| Cancel the downloads that are left?
+Limite de espaço offline ||| Offline space limit
+Quanto do aparelho o Guitarr pode usar para músicas offline. Usado agora: ||| How much of the device Guitarr may use for offline songs. Used now:
+Digite um valor em GB, por exemplo 3.5 ||| Enter a value in GB, for example 3.5
+Qualidade dos downloads ||| Download quality
+Vale para os próximos downloads. O que já está salvo não muda. ||| Applies to the next downloads. What is already saved does not change.
+Você já usa ||| You already use
+— apague itens para ficar abaixo do limite. ||| — delete items to stay under the limit.
+Adicionada à fila ||| Added to the queue
+Adicionada às Curtidas ||| Added to Liked Songs
+Removida das Curtidas ||| Removed from Liked Songs
+Opções ||| Options
+Nada por aqui com esse filtro. ||| Nothing here with this filter.
+Sem conexão · mostrando só o que está salvo offline ||| No connection · showing only what is saved offline
+Pedir música ||| Request a song
+Buscar na biblioteca ||| Search the library
+Músicas na Biblioteca ||| Songs in the Library
+Toque para ouvir · ⋮ para opções ||| Tap to listen · ⋮ for options
+Nenhum álbum ainda. ||| No albums yet.
+álbuns · ||| albums ·
+Nenhum artista ainda. ||| No artists yet.
+Sua coleção ||| Your collection
+Aleatório ||| Shuffle
+Busque um artista, álbum ou música. Cole também um link de playlist do Spotify ou YouTube Music abaixo. ||| Search for an artist, album or song. You can also paste a Spotify or YouTube Music playlist link below.
+Música ||| Song
+Catálogo MusicBrainz + Soulseek/YouTube ||| MusicBrainz catalog + Soulseek/YouTube
+Buscar & Pedir ||| Search & Request
+Cole o link (Spotify / YouTube Music) ou envie o CSV do Exportify. As faixas que faltam viram pedidos. ||| Paste the link (Spotify / YouTube Music) or upload the Exportify CSV. Missing tracks become requests.
+Os dois ||| Both
+Manter o último ||| Keep the latest
+Buscar podcasts ||| Search podcasts
+Nenhum canal ainda. Busque um podcast acima ou toque em + para colar um feed RSS ou canal do YouTube. ||| No channels yet. Search for a podcast above or tap + to paste an RSS feed or YouTube channel.
+Você escolhe os episódios um a um. ||| You pick the episodes one by one.
+Mantém no máximo os 3 mais recentes. ||| Keeps at most the 3 most recent.
+Baixa todos os episódios e guarda o histórico. ||| Downloads every episode and keeps the history.
+Armazenamento do servidor ||| Server storage
+livres de ||| free of
+músicas repetidas · ||| repeated songs ·
+Toque em Verificar ||| Tap Check
+Tela desconhecida ||| Unknown screen
+Erro ao desenhar a tela: ||| Error drawing the screen:
+Tocando da sua biblioteca ||| Playing from your library
+Letra em tela cheia ||| Full-screen lyrics
+Sem letra para podcast. ||| No lyrics for podcasts.
+Remover das Curtidas ||| Remove from Liked Songs
+Adicionar à fila ||| Add to queue
+Ir ao álbum ||| Go to album
+As tags do arquivo são reescritas no servidor. ||| The file's tags are rewritten on the server.
+Disponível: ||| Available:
+O MusicBrainz não respondeu. Tente de novo. ||| MusicBrainz did not answer. Try again.
+Tags salvas ||| Tags saved
+Apagar todas as músicas salvas offline neste aparelho? ||| Delete all songs saved offline on this device?
+A faixa ainda não apareceu na biblioteca ||| The track has not shown up in the library yet
+Tentando de novo ||| Trying again
+Cole o link da playlist ||| Paste the playlist link
+episódio(s) baixado(s)? Não dá para desfazer. ||| downloaded episode(s)? This cannot be undone.
+importação iniciada ||| import started
+Vale para a sua conta, aqui e no site. ||| Applies to your account, here and on the website.
+Nome ||| Name
+Tocadas há pouco ||| Recently played
+Instrumental, lo-fi, rock e eletrônica ||| Instrumental, lo-fi, rock and electronic
+Suas curtidas para o horário ||| Your likes for the time of day
+Feito com o que você curte e toca ||| Made from what you like and play
+artista não encontrado no MusicBrainz ||| artist not found on MusicBrainz
+Início ||| Home
+Idioma ||| Language
+Idioma da interface. Vale para a sua conta, aqui e no site. ||| Interface language. Applies to your account, here and on the website.
+Artista, álbum ou música ||| Artist, album or song
+Direção segura ||| Safe driving

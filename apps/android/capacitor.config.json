@@ -1,0 +1,19 @@
+{
+  "appId": "app.guitarr",
+  "appName": "Guitarr",
+  "webDir": "www",
+  "backgroundColor": "#050507",
+  "android": {
+    "allowMixedContent": true,
+    "backgroundColor": "#050507"
+  },
+  "plugins": {
+    "SystemBars": {
+      "insetsHandling": "css",
+      "style": "DARK"
+    }
+  },
+  "server": {
+    "androidScheme": "http"
+  }
+}

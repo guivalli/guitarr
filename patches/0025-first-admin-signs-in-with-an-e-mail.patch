@@ -1,0 +1,106 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] Seer: the first admin signs up with an e-mail
+
+The first-run form asks for an e-mail instead of a username. The e-mail is also the
+login name and the account e-mail; the display name is the part before the @.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index 345ed98..a74d4b8 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -721,7 +721,8 @@
+       "sign_in": "Entrar",
+       "sign_in_error": "Erro na autenticação, tente novamente.",
+       "logout": "Sair",
+-      "insightsCollectionNote": "Navidrome coleta dados de uso anônimos para\najudar a melhorar o projeto. Clique [aqui] para\nsaber mais e para desativar se desejar"
++      "insightsCollectionNote": "Navidrome coleta dados de uso anônimos para\najudar a melhorar o projeto. Clique [aqui] para\nsaber mais e para desativar se desejar",
++      "email": "E-mail"
+     },
+     "validation": {
+       "invalidChars": "Somente use letras e numeros",
+@@ -736,7 +737,8 @@
+       "oneOf": "Deve ser uma das seguintes opções: %{options}",
+       "regex": "Deve ter o formato específico (regexp): %{pattern}",
+       "unique": "Deve ser único",
+-      "url": "URL inválida"
++      "url": "URL inválida",
++      "invalidEmail": "Digite um e-mail válido"
+     },
+     "action": {
+       "add_filter": "Adicionar Filtro",
+diff --git a/server/auth.go b/server/auth.go
+index 3e58359..00aeb81 100644
+--- a/server/auth.go
++++ b/server/auth.go
+@@ -148,11 +148,17 @@ func createAdmin(ds model.DataStore) func(w http.ResponseWriter, r *http.Request
+ func createAdminUser(ctx context.Context, ds model.DataStore, username, password string) error {
+ 	log.Warn(ctx, "Creating initial user", "user", username)
+ 	caser := cases.Title(language.Und)
++	// The first admin signs in with an e-mail: the name is the part before the @.
++	name, _, hasAt := strings.Cut(username, "@")
++	email := ""
++	if hasAt {
++		email = username
++	}
+ 	initialUser := model.User{
+ 		ID:          id.NewRandom(),
+ 		UserName:    username,
+-		Name:        caser.String(username),
+-		Email:       "",
++		Name:        caser.String(name),
++		Email:       email,
+ 		NewPassword: password,
+ 		IsAdmin:     true,
+ 		LastLoginAt: new(time.Now()),
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index fc6a0b9..b5a33a9 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -724,7 +724,8 @@
+       "sign_in": "Sign in",
+       "sign_in_error": "Authentication failed, please retry",
+       "logout": "Logout",
+-      "insightsCollectionNote": "Navidrome collects anonymous usage data to\nhelp improve the project. Click [here] to learn\nmore and to opt-out if you want"
++      "insightsCollectionNote": "Navidrome collects anonymous usage data to\nhelp improve the project. Click [here] to learn\nmore and to opt-out if you want",
++      "email": "E-mail"
+     },
+     "validation": {
+       "invalidChars": "Please only use letters and numbers",
+@@ -739,7 +740,8 @@
+       "oneOf": "Must be one of: %{options}",
+       "regex": "Must match a specific format (regexp): %{pattern}",
+       "unique": "Must be unique",
+-      "url": "Must be a valid URL"
++      "url": "Must be a valid URL",
++      "invalidEmail": "Enter a valid e-mail address"
+     },
+     "action": {
+       "add_filter": "Add filter",
+diff --git a/ui/src/layout/Login.jsx b/ui/src/layout/Login.jsx
+index a7763cf..b8be2b8 100644
+--- a/ui/src/layout/Login.jsx
++++ b/ui/src/layout/Login.jsx
+@@ -269,7 +269,8 @@ const FormSignUp = ({ loading, handleSubmit, validate }) => {
+                     autoFocus
+                     name="username"
+                     component={renderInput}
+-                    label={translate('ra.auth.username')}
++                    label={translate('ra.auth.email')}
++                    type="email"
+                     disabled={loading}
+                     spellCheck={false}
+                   />
+@@ -361,9 +362,9 @@ const Login = ({ location }) => {
+   const validateSignup = useCallback(
+     (values) => {
+       const errors = validateLogin(values)
+-      const regex = /^\w+$/g
++      const regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+       if (values.username && !values.username.match(regex)) {
+-        errors.username = translate('ra.validation.invalidChars')
++        errors.username = translate('ra.validation.invalidEmail')
+       }
+       if (!values.confirmPassword) {
+         errors.confirmPassword = translate('ra.validation.required')

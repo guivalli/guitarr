@@ -1,0 +1,2989 @@
+From 022efe64ab35ed3cf19b1508ac456c7af6c99535 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 21:15:36 +0000
+Subject: [PATCH 05/10] Seer: import Spotify and YouTube Music playlists
+
+Paste a Spotify or YouTube Music playlist/album link, or upload an export
+(Exportify CSV, Spotify data JSON, Takeout CSV, "Artist - Title" text).
+Songs are matched to MusicBrainz (ISRC, then artist/title/length), missing
+ones are requested, and a Navidrome playlist with the same name follows
+the downloads. Unmatched songs can be picked by hand, and linked playlists
+can be re-read daily. Spotify works without credentials through the embed
+page; Seer.Spotify.ClientID/ClientSecret and Seer.YouTube.Cookies unlock
+long playlists and private lists.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+
+---
+ SEER.md                                       |  26 +
+ conf/configuration.go                         |  10 +
+ core/acquire/catalog_musicbrainz.go           |  76 +++
+ core/acquire/import_read.go                   | 519 +++++++++++++++
+ core/acquire/importer.go                      | 593 ++++++++++++++++++
+ core/acquire/importer_test.go                 | 212 +++++++
+ core/seer/playlists.go                        |  45 ++
+ core/seer/seer.go                             |  25 +-
+ .../20261011000000_create_import_tables.sql   |  36 ++
+ resources/i18n/pt-br.json                     |  36 ++
+ server/nativeapi/config.go                    |   1 +
+ server/seerapi/seerapi.go                     | 173 ++++-
+ server/seerapi/seerapi_test.go                |  55 ++
+ ui/src/i18n/en.json                           |  36 ++
+ ui/src/seer/ImportView.jsx                    | 420 +++++++++++++
+ ui/src/seer/ImportsPanel.jsx                  | 299 +++++++++
+ ui/src/seer/SeerPage.jsx                      |  41 +-
+ ui/src/seer/api.js                            |  35 ++
+ ui/src/seer/states.jsx                        |   2 +-
+ 19 files changed, 2622 insertions(+), 18 deletions(-)
+ create mode 100644 core/acquire/import_read.go
+ create mode 100644 core/acquire/importer.go
+ create mode 100644 core/acquire/importer_test.go
+ create mode 100644 core/seer/playlists.go
+ create mode 100644 db/migrations/20261011000000_create_import_tables.sql
+ create mode 100644 ui/src/seer/ImportView.jsx
+ create mode 100644 ui/src/seer/ImportsPanel.jsx
+
+diff --git a/SEER.md b/SEER.md
+index 457221a..f748f6b 100644
+--- a/SEER.md
++++ b/SEER.md
+@@ -20,6 +20,24 @@ pending requests or retry failed ones. The list refreshes
+ by itself through the server event stream (`refreshResource` for `seer`).
+ Code: `ui/src/seer/`; strings under `resources.seer` (English and pt-BR).
+ 
++## Importing playlists
++
++On the Requests page, paste a Spotify or YouTube Music playlist/album link or
++upload an export (Exportify CSV, Spotify data-export JSON, Google Takeout CSV,
++or "Artist - Title" lines). Every song is matched to MusicBrainz (by ISRC when
++Spotify gives one, else artist + title + length), songs already in the library
++are kept, missing ones are requested, and a Navidrome playlist with the same
++name is kept in order as songs arrive. Songs with no match can be picked by
++hand. Linked playlists can be re-read every day ("Sync every day").
++
++- Spotify public playlists work without setup (read from the embed page). For
++  long playlists and ISRC matching, create an app at developer.spotify.com and
++  set `Seer.Spotify.ClientID` / `ClientSecret`. Liked Songs are private:
++  export them with Exportify and upload the CSV.
++- YouTube Music public playlists are read with yt-dlp. For "Liked music"
++  (`https://music.youtube.com/playlist?list=LM`) set `Seer.YouTube.Cookies` to
++  a cookies.txt exported from a browser where you are logged in.
++
+ ## Configuration
+ 
+ ```toml
+@@ -37,6 +55,11 @@ MusicBrainzURL = "https://musicbrainz.org/ws/2"
+ Enabled = true
+ Path = "yt-dlp"
+ Format = "opus"
++Cookies = ""                     # cookies.txt for private YouTube Music lists
++
++[Seer.Spotify]                   # optional, for playlist imports
++ClientID = ""
++ClientSecret = ""
+ 
+ [Seer.Soulseek]                  # tracks and albums
+ Enabled = false
+@@ -68,6 +91,9 @@ Environment variables work as usual, e.g. `ND_SEER_ENABLED=true`,
+ | POST | `/requests` | any user | body: a catalog item. 409 if already in the library; returns the existing request if someone already asked for it |
+ | GET | `/requests/{id}` | owner or admin | one request |
+ | POST | `/requests/{id}/approve` | admin | queue a pending request, or retry a failed one |
++| GET/POST | `/imports` | any user | list imports; start one (`{"url","sync"}` or multipart `file`) |
++| GET/PUT/DELETE | `/imports/{id}` | owner or admin | import with its songs; `{"sync"}`; forget it |
++| POST | `/imports/{id}/items/{pos}/resolve` | owner or admin | body: the catalog track picked for an unmatched song |
+ 
+ Statuses: `pending` → `queued` → `searching` → `downloading` → `importing` →
+ `available`, or `failed` with `error`.
+diff --git a/conf/configuration.go b/conf/configuration.go
+index ea59974..da87b42 100644
+--- a/conf/configuration.go
++++ b/conf/configuration.go
+@@ -244,12 +244,19 @@ type seerOptions struct {
+ 	YouTube        seerYouTubeOptions  `json:",omitzero"`
+ 	Soulseek       seerSoulseekOptions `json:",omitzero"`
+ 	Lidarr         seerLidarrOptions   `json:",omitzero"`
++	Spotify        seerSpotifyOptions  `json:",omitzero"`
+ }
+ 
+ type seerYouTubeOptions struct {
+ 	Enabled bool
+ 	Path    string // yt-dlp binary
+ 	Format  string
++	Cookies string // optional cookies.txt, lets playlist imports read private lists (Liked music)
++}
++
++type seerSpotifyOptions struct {
++	ClientID     string // optional app credentials from developer.spotify.com, for playlist imports
++	ClientSecret string
+ }
+ 
+ type seerSoulseekOptions struct {
+@@ -1143,6 +1150,9 @@ func setViperDefaults() {
+ 	viper.SetDefault("seer.youtube.enabled", false)
+ 	viper.SetDefault("seer.youtube.path", "yt-dlp")
+ 	viper.SetDefault("seer.youtube.format", "opus")
++	viper.SetDefault("seer.youtube.cookies", "")
++	viper.SetDefault("seer.spotify.clientid", "")
++	viper.SetDefault("seer.spotify.clientsecret", "")
+ 	viper.SetDefault("seer.soulseek.enabled", false)
+ 	viper.SetDefault("seer.soulseek.url", "")
+ 	viper.SetDefault("seer.soulseek.apikey", "")
+diff --git a/core/acquire/catalog_musicbrainz.go b/core/acquire/catalog_musicbrainz.go
+index 880b96e..294baa0 100644
+--- a/core/acquire/catalog_musicbrainz.go
++++ b/core/acquire/catalog_musicbrainz.go
+@@ -562,3 +562,79 @@ func (m *MusicBrainz) Album(ctx context.Context, mbid string) (*AlbumDetail, err
+ 	}
+ 	return detail, nil
+ }
++
++// luceneEscaper escapes MusicBrainz's Lucene syntax inside quoted fields.
++var luceneEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
++
++// noise strips what streaming services append to titles but MusicBrainz keeps apart.
++var noise = regexp.MustCompile(`(?i)\s*[-–(\[]\s*(\d{4}\s+)?(remaster(ed)?|feat\.?|ft\.?|with |radio edit|single version|album version|mono|stereo|explicit)[^)\]]*[)\]]?\s*$`)
++
++// cleanTitle turns "Song - 2011 Remaster" or "Song (feat. X)" into "Song".
++func cleanTitle(s string) string {
++	for {
++		c := strings.TrimSpace(noise.ReplaceAllString(s, ""))
++		if c == s || c == "" {
++			return s
++		}
++		s = c
++	}
++}
++
++// firstArtist keeps the main artist of "A, B" or "A feat. B".
++func firstArtist(s string) string {
++	for _, sep := range []string{", ", " feat. ", " ft. ", " & ", " x ", "; "} {
++		if a, _, ok := strings.Cut(s, sep); ok {
++			s = a
++		}
++	}
++	return strings.TrimSpace(s)
++}
++
++// MatchTrack finds the MusicBrainz recording for a track from a playlist:
++// by ISRC when there is one, then by artist and title, preferring the
++// recording whose length is closest to the playlist's.
++func (m *MusicBrainz) MatchTrack(ctx context.Context, t ImportTrack) (*CatalogItem, error) {
++	var lastErr error
++	if t.ISRC != "" {
++		items, err := m.searchRecordings(ctx, url.Values{"query": {"isrc:" + t.ISRC}}, 5)
++		if err == nil && len(items) > 0 {
++			return &items[0], nil
++		}
++		lastErr = err
++	}
++	title, artist := cleanTitle(t.Title), firstArtist(t.Artist)
++	if title == "" || artist == "" {
++		return nil, lastErr
++	}
++	var recs struct {
++		Recordings []mbRecording `json:"recordings"`
++	}
++	q := fmt.Sprintf(`recording:"%s" AND artist:"%s"`, luceneEscaper.Replace(title), luceneEscaper.Replace(artist))
++	if err := m.get(ctx, "/recording", url.Values{"query": {q}, "limit": {"25"}}, &recs); err != nil {
++		return nil, err
++	}
++	var best *CatalogItem
++	bestRank := 1 << 30
++	for i, r := range recs.Recordings {
++		it, ok := r.item()
++		if !ok || r.Score < 70 || fold(cleanTitle(it.Title)) != fold(title) {
++			continue
++		}
++		rank := i * 1000 // MusicBrainz relevance first...
++		if t.DurationMs > 0 && it.DurationMs > 0 {
++			diff := t.DurationMs - it.DurationMs
++			if diff < 0 {
++				diff = -diff
++			}
++			if diff > 15000 {
++				continue // another version (live, extended...)
++			}
++			rank = diff // ...unless we know the length: closest wins
++		}
++		if rank < bestRank {
++			c := it
++			best, bestRank = &c, rank
++		}
++	}
++	return best, nil
++}
+diff --git a/core/acquire/import_read.go b/core/acquire/import_read.go
+new file mode 100644
+index 0000000..c0804a1
+--- /dev/null
++++ b/core/acquire/import_read.go
+@@ -0,0 +1,519 @@
++package acquire
++
++import (
++	"bytes"
++	"context"
++	"encoding/base64"
++	"encoding/csv"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os/exec"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// ImportTrack is one entry of an external playlist, before it is matched to MusicBrainz.
++type ImportTrack struct {
++	Artist     string `json:"artist"`
++	Title      string `json:"title"`
++	Album      string `json:"album,omitempty"`
++	ISRC       string `json:"isrc,omitempty"`
++	DurationMs int    `json:"durationMs,omitempty"`
++}
++
++// ImportList is a playlist read from Spotify, YouTube Music or a file.
++type ImportList struct {
++	Name   string
++	Source string // "spotify", "ytmusic" or "file"
++	Tracks []ImportTrack
++}
++
++// ErrUnsupportedLink is returned for links that are not a Spotify or YouTube playlist/album.
++var ErrUnsupportedLink = errors.New("unsupported link: paste a Spotify or YouTube Music playlist or album")
++
++// PlaylistReader reads playlists from streaming services.
++type PlaylistReader struct {
++	Client *http.Client
++	// Spotify Web API credentials (developer.spotify.com). Without them public
++	// playlists are read from Spotify's embed page, which may list fewer tracks.
++	SpotifyClientID     string
++	SpotifyClientSecret string
++	SpotifyAPI          string // tests only
++	SpotifyWeb          string // tests only
++	// YtDlp is the yt-dlp binary; Cookies an optional cookies.txt that gives
++	// access to private lists such as "Liked music".
++	YtDlp   string
++	Cookies string
++}
++
++var spotifyLink = regexp.MustCompile(`open\.spotify\.com/(?:intl-[a-z-]+/)?(?:embed/)?(playlist|album|track)/([A-Za-z0-9]+)`)
++
++// Read loads the playlist behind a link.
++func (p *PlaylistReader) Read(ctx context.Context, link string) (*ImportList, error) {
++	link = strings.TrimSpace(link)
++	if m := spotifyLink.FindStringSubmatch(link); m != nil {
++		if p.SpotifyClientID != "" && p.SpotifyClientSecret != "" {
++			return p.spotifyAPI(ctx, m[1], m[2])
++		}
++		return p.spotifyEmbed(ctx, m[1], m[2])
++	}
++	u, err := url.Parse(link)
++	if err == nil && (strings.HasSuffix(u.Hostname(), "youtube.com") || u.Hostname() == "youtu.be") {
++		return p.youtube(ctx, link)
++	}
++	return nil, ErrUnsupportedLink
++}
++
++func (p *PlaylistReader) client() *http.Client {
++	if p.Client != nil {
++		return p.Client
++	}
++	return &http.Client{Timeout: 30 * time.Second}
++}
++
++func (p *PlaylistReader) getJSON(ctx context.Context, u, token string, out any) error {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
++	if err != nil {
++		return err
++	}
++	if token != "" {
++		req.Header.Set("Authorization", "Bearer "+token)
++	}
++	resp, err := p.client().Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return fmt.Errorf("spotify: HTTP %d", resp.StatusCode)
++	}
++	return json.NewDecoder(resp.Body).Decode(out)
++}
++
++func (p *PlaylistReader) spotifyToken(ctx context.Context) (string, error) {
++	tokenURL := "https://accounts.spotify.com/api/token"
++	if p.SpotifyAPI != "" {
++		tokenURL = p.SpotifyAPI + "/api/token"
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader("grant_type=client_credentials"))
++	if err != nil {
++		return "", err
++	}
++	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
++	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(p.SpotifyClientID+":"+p.SpotifyClientSecret)))
++	resp, err := p.client().Do(req)
++	if err != nil {
++		return "", err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("spotify login failed (HTTP %d): check Seer.Spotify.ClientID/ClientSecret", resp.StatusCode)
++	}
++	var t struct {
++		AccessToken string `json:"access_token"`
++	}
++	if err := json.NewDecoder(resp.Body).Decode(&t); err != nil {
++		return "", err
++	}
++	return t.AccessToken, nil
++}
++
++type spotifyTrack struct {
++	Name       string `json:"name"`
++	DurationMs int    `json:"duration_ms"`
++	Artists    []struct {
++		Name string `json:"name"`
++	} `json:"artists"`
++	Album struct {
++		Name string `json:"name"`
++	} `json:"album"`
++	ExternalIDs struct {
++		ISRC string `json:"isrc"`
++	} `json:"external_ids"`
++}
++
++func (t spotifyTrack) importTrack(album string) ImportTrack {
++	var names []string
++	for _, a := range t.Artists {
++		names = append(names, a.Name)
++	}
++	if album == "" {
++		album = t.Album.Name
++	}
++	return ImportTrack{Artist: strings.Join(names, ", "), Title: t.Name, Album: album, ISRC: t.ExternalIDs.ISRC, DurationMs: t.DurationMs}
++}
++
++func (p *PlaylistReader) spotifyAPI(ctx context.Context, kind, id string) (*ImportList, error) {
++	token, err := p.spotifyToken(ctx)
++	if err != nil {
++		return nil, err
++	}
++	api := "https://api.spotify.com/v1"
++	if p.SpotifyAPI != "" {
++		api = p.SpotifyAPI + "/v1"
++	}
++	list := &ImportList{Source: "spotify"}
++	switch kind {
++	case "track":
++		var t spotifyTrack
++		if err := p.getJSON(ctx, api+"/tracks/"+id, token, &t); err != nil {
++			return nil, err
++		}
++		list.Name, list.Tracks = t.Name, []ImportTrack{t.importTrack("")}
++	case "album":
++		var a struct {
++			Name   string `json:"name"`
++			Tracks struct {
++				Items []spotifyTrack `json:"items"`
++				Next  string         `json:"next"`
++			} `json:"tracks"`
++		}
++		if err := p.getJSON(ctx, api+"/albums/"+id, token, &a); err != nil {
++			return nil, err
++		}
++		list.Name = a.Name
++		for _, t := range a.Tracks.Items {
++			list.Tracks = append(list.Tracks, t.importTrack(a.Name))
++		}
++	default:
++		var meta struct {
++			Name string `json:"name"`
++		}
++		if err := p.getJSON(ctx, api+"/playlists/"+id+"?fields=name", token, &meta); err != nil {
++			return nil, err
++		}
++		list.Name = meta.Name
++		next := api + "/playlists/" + id + "/tracks?limit=100&fields=next,items(track(name,duration_ms,external_ids,artists(name),album(name)))"
++		for next != "" && len(list.Tracks) < 5000 {
++			var page struct {
++				Next  string `json:"next"`
++				Items []struct {
++					Track *spotifyTrack `json:"track"`
++				} `json:"items"`
++			}
++			if err := p.getJSON(ctx, next, token, &page); err != nil {
++				return nil, err
++			}
++			for _, it := range page.Items {
++				if it.Track != nil && it.Track.Name != "" {
++					list.Tracks = append(list.Tracks, it.Track.importTrack(""))
++				}
++			}
++			next = page.Next
++		}
++	}
++	return list, nil
++}
++
++var nextData = regexp.MustCompile(`(?s)<script id="__NEXT_DATA__" type="application/json">(.*?)</script>`)
++
++// spotifyEmbed reads the public embed page, which needs no credentials.
++func (p *PlaylistReader) spotifyEmbed(ctx context.Context, kind, id string) (*ImportList, error) {
++	base := "https://open.spotify.com"
++	if p.SpotifyWeb != "" {
++		base = p.SpotifyWeb
++	}
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/embed/"+kind+"/"+id, nil)
++	if err != nil {
++		return nil, err
++	}
++	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36")
++	resp, err := p.client().Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("spotify: HTTP %d", resp.StatusCode)
++	}
++	m := nextData.FindSubmatch(body)
++	if m == nil {
++		return nil, errors.New("spotify page changed; set Seer.Spotify.ClientID/ClientSecret to use the API")
++	}
++	var data any
++	if err := json.Unmarshal(m[1], &data); err != nil {
++		return nil, err
++	}
++	entity := findKey(data, "entity")
++	e, _ := entity.(map[string]any)
++	if e == nil {
++		return nil, errors.New("spotify: playlist not found or private")
++	}
++	list := &ImportList{Source: "spotify", Name: str(e["name"])}
++	if list.Name == "" {
++		list.Name = str(e["title"])
++	}
++	tl, _ := e["trackList"].([]any)
++	for _, raw := range tl {
++		t, _ := raw.(map[string]any)
++		if t == nil {
++			continue
++		}
++		artist := strings.ReplaceAll(str(t["subtitle"]), " ", " ")
++		dur, _ := t["duration"].(float64)
++		if title := str(t["title"]); title != "" {
++			list.Tracks = append(list.Tracks, ImportTrack{Artist: artist, Title: title, DurationMs: int(dur)})
++		}
++	}
++	if kind == "track" && len(list.Tracks) == 0 && list.Name != "" {
++		var names []string
++		if as, ok := e["artists"].([]any); ok {
++			for _, a := range as {
++				if am, ok := a.(map[string]any); ok {
++					names = append(names, str(am["name"]))
++				}
++			}
++		}
++		dur, _ := e["duration"].(float64)
++		list.Tracks = []ImportTrack{{Artist: strings.Join(names, ", "), Title: list.Name, DurationMs: int(dur)}}
++	}
++	if len(list.Tracks) == 0 {
++		return nil, errors.New("spotify: no tracks found (private playlist?)")
++	}
++	return list, nil
++}
++
++func findKey(v any, key string) any {
++	switch t := v.(type) {
++	case map[string]any:
++		if found, ok := t[key]; ok {
++			return found
++		}
++		for _, c := range t {
++			if f := findKey(c, key); f != nil {
++				return f
++			}
++		}
++	case []any:
++		for _, c := range t {
++			if f := findKey(c, key); f != nil {
++				return f
++			}
++		}
++	}
++	return nil
++}
++
++func str(v any) string {
++	s, _ := v.(string)
++	return strings.TrimSpace(s)
++}
++
++// youtube lists a YouTube / YouTube Music playlist with yt-dlp (no download).
++func (p *PlaylistReader) youtube(ctx context.Context, link string) (*ImportList, error) {
++	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
++	defer cancel()
++	args := []string{"--flat-playlist", "-J", "--no-warnings"}
++	if p.Cookies != "" {
++		args = append(args, "--cookies", p.Cookies)
++	}
++	cmd := exec.CommandContext(ctx, cmp(p.YtDlp, "yt-dlp"), append(args, "--", link)...)
++	var out, stderr bytes.Buffer
++	cmd.Stdout, cmd.Stderr = &out, &stderr
++	if err := cmd.Run(); err != nil {
++		msg := strings.TrimSpace(stderr.String())
++		if p.Cookies == "" && (strings.Contains(msg, "Sign in") || strings.Contains(msg, "private")) {
++			msg += " (private list: set Seer.YouTube.Cookies to a cookies.txt from your browser)"
++		}
++		return nil, fmt.Errorf("yt-dlp: %w: %s", err, msg)
++	}
++	var pl struct {
++		Title   string `json:"title"`
++		Entries []struct {
++			Title    string   `json:"title"`
++			Track    string   `json:"track"`
++			Artist   string   `json:"artist"`
++			Artists  []string `json:"artists"`
++			Channel  string   `json:"channel"`
++			Uploader string   `json:"uploader"`
++			Album    string   `json:"album"`
++			Duration float64  `json:"duration"`
++		} `json:"entries"`
++	}
++	if err := json.Unmarshal(out.Bytes(), &pl); err != nil {
++		return nil, fmt.Errorf("yt-dlp: %w", err)
++	}
++	list := &ImportList{Name: pl.Title, Source: "ytmusic"}
++	for _, e := range pl.Entries {
++		t := ImportTrack{Title: cmp(e.Track, e.Title), Album: e.Album, DurationMs: int(e.Duration * 1000)}
++		switch {
++		case len(e.Artists) > 0:
++			t.Artist = strings.Join(e.Artists, ", ")
++		case e.Artist != "":
++			t.Artist = e.Artist
++		default:
++			ch := cmp(e.Channel, e.Uploader)
++			if strings.HasSuffix(ch, " - Topic") {
++				t.Artist = strings.TrimSuffix(ch, " - Topic")
++			} else if a, title, ok := strings.Cut(t.Title, " - "); ok {
++				t.Artist, t.Title = strings.TrimSpace(a), strings.TrimSpace(title)
++			} else {
++				t.Artist = ch
++			}
++		}
++		if t.Title != "" && t.Title != "[Private video]" && t.Title != "[Deleted video]" {
++			list.Tracks = append(list.Tracks, t)
++		}
++	}
++	if list.Name == "Liked music" || list.Name == "" {
++		list.Name = cmp(list.Name, "YouTube Music")
++	}
++	return list, nil
++}
++
++// ParseImportFile reads an exported playlist: an Exportify / Google Takeout CSV,
++// Spotify's data export (YourLibrary.json, Playlist1.json) or plain
++// "Artist - Title" lines.
++func ParseImportFile(name string, data []byte) (*ImportList, error) {
++	base := name
++	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
++		base = base[i+1:]
++	}
++	list := &ImportList{Source: "file", Name: strings.TrimSuffix(base, fileExt(base))}
++	trimmed := bytes.TrimSpace(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")))
++	switch {
++	case len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '['):
++		parseJSONExport(trimmed, list)
++	case bytes.Contains(firstLine(trimmed), []byte(",")) || bytes.Contains(firstLine(trimmed), []byte(";")):
++		if err := parseCSVExport(trimmed, list); err != nil {
++			return nil, err
++		}
++	default:
++		for _, line := range strings.Split(string(trimmed), "\n") {
++			line = strings.TrimSpace(line)
++			if a, t, ok := strings.Cut(line, " - "); ok {
++				list.Tracks = append(list.Tracks, ImportTrack{Artist: strings.TrimSpace(a), Title: strings.TrimSpace(t)})
++			}
++		}
++	}
++	if len(list.Tracks) == 0 {
++		return nil, errors.New("no tracks found in the file")
++	}
++	return list, nil
++}
++
++func fileExt(s string) string {
++	if i := strings.LastIndex(s, "."); i > 0 {
++		return s[i:]
++	}
++	return ""
++}
++
++func firstLine(b []byte) []byte {
++	if i := bytes.IndexByte(b, '\n'); i >= 0 {
++		return b[:i]
++	}
++	return b
++}
++
++func parseCSVExport(data []byte, list *ImportList) error {
++	r := csv.NewReader(bytes.NewReader(data))
++	if bytes.Count(firstLine(data), []byte(";")) > bytes.Count(firstLine(data), []byte(",")) {
++		r.Comma = ';'
++	}
++	r.FieldsPerRecord = -1
++	r.LazyQuotes = true
++	rows, err := r.ReadAll()
++	if err != nil {
++		return fmt.Errorf("reading CSV: %w", err)
++	}
++	if len(rows) < 2 {
++		return nil
++	}
++	col := func(names ...string) int {
++		for _, n := range names {
++			for i, h := range rows[0] {
++				if strings.EqualFold(strings.TrimSpace(h), n) {
++					return i
++				}
++			}
++		}
++		return -1
++	}
++	title := col("Track Name", "Song Title", "Title", "Track", "Song", "Name", "Música", "Titulo", "Título")
++	artist := col("Artist Name(s)", "Artist Name 1", "Artist Names", "Artist", "Artists", "Artista")
++	album := col("Album Name", "Album Title", "Album", "Álbum")
++	isrc := col("ISRC")
++	dur := col("Duration (ms)", "Track Duration (ms)", "Duration")
++	if title < 0 || artist < 0 {
++		return errors.New("CSV needs a title and an artist column")
++	}
++	get := func(row []string, i int) string {
++		if i < 0 || i >= len(row) {
++			return ""
++		}
++		return strings.TrimSpace(row[i])
++	}
++	for _, row := range rows[1:] {
++		t := ImportTrack{Title: get(row, title), Artist: get(row, artist), Album: get(row, album), ISRC: get(row, isrc)}
++		t.Artist = strings.ReplaceAll(t.Artist, ";", ", ") // Exportify separates artists with ";"... or ","
++		if d, err := strconv.Atoi(get(row, dur)); err == nil {
++			t.DurationMs = d
++		}
++		if t.Title != "" && t.Artist != "" {
++			list.Tracks = append(list.Tracks, t)
++		}
++	}
++	return nil
++}
++
++func parseJSONExport(data []byte, list *ImportList) {
++	var v any
++	if json.Unmarshal(data, &v) != nil {
++		return
++	}
++	if m, ok := v.(map[string]any); ok {
++		if n := str(m["name"]); n != "" {
++			list.Name = n
++		}
++	}
++	var walk func(any)
++	walk = func(v any) {
++		switch t := v.(type) {
++		case []any:
++			for _, c := range t {
++				walk(c)
++			}
++		case map[string]any:
++			title := firstStr(t, "track", "trackName", "master_metadata_track_name", "title")
++			artist := firstStr(t, "artist", "artistName", "master_metadata_album_artist_name")
++			if title != "" && artist != "" {
++				list.Tracks = append(list.Tracks, ImportTrack{Title: title, Artist: artist,
++					Album: firstStr(t, "album", "albumName", "master_metadata_album_album_name")})
++				return
++			}
++			for _, c := range t {
++				walk(c)
++			}
++		}
++	}
++	walk(v)
++	// Spotify playlists export wraps tracks as {"track": {"trackName", ...}}; the
++	// streaming history repeats songs: keep the first of each.
++	seen := map[string]bool{}
++	uniq := list.Tracks[:0]
++	for _, t := range list.Tracks {
++		k := fold(t.Artist) + "|" + fold(t.Title)
++		if !seen[k] {
++			seen[k] = true
++			uniq = append(uniq, t)
++		}
++	}
++	list.Tracks = uniq
++}
++
++func firstStr(m map[string]any, keys ...string) string {
++	for _, k := range keys {
++		if s := str(m[k]); s != "" {
++			return s
++		}
++	}
++	return ""
++}
+diff --git a/core/acquire/importer.go b/core/acquire/importer.go
+new file mode 100644
+index 0000000..ebff3d2
+--- /dev/null
++++ b/core/acquire/importer.go
+@@ -0,0 +1,593 @@
++package acquire
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
++	"strings"
++	"sync"
++	"time"
++)
++
++// ImportJob is a playlist being brought into the library.
++type ImportJob struct {
++	ID         string    `json:"id"`
++	UserID     string    `json:"userId"`
++	Name       string    `json:"name"`
++	Source     string    `json:"source"`
++	URL        string    `json:"url,omitempty"`
++	Status     string    `json:"status"` // reading, matching, downloading, done, failed
++	Error      string    `json:"error,omitempty"`
++	Sync       bool      `json:"sync"` // re-read the link every day and add new songs
++	PlaylistID string    `json:"playlistId,omitempty"`
++	CreatedAt  time.Time `json:"createdAt"`
++	UpdatedAt  time.Time `json:"updatedAt"`
++	// Counts by item state, filled when listing.
++	Counts map[string]int `json:"counts,omitempty"`
++	Total  int            `json:"total"`
++	Items  []ImportItem   `json:"items,omitempty"`
++}
++
++// Item states.
++const (
++	ItemPending   = "pending"
++	ItemNotFound  = "notfound"  // no MusicBrainz match: the user can pick one
++	ItemOwned     = "owned"     // already in the library
++	ItemRequested = "requested" // a request is on its way
++	ItemAvailable = "available" // downloaded and scanned
++	ItemFailed    = "failed"    // the request failed
++)
++
++type ImportItem struct {
++	Position int    `json:"position"`
++	ImportTrack
++	State     string `json:"state"`
++	MBID      string `json:"mbid,omitempty"`
++	CoverID   string `json:"coverId,omitempty"`
++	RequestID string `json:"requestId,omitempty"`
++	LibraryID string `json:"libraryId,omitempty"`
++	Note      string `json:"note,omitempty"`
++}
++
++// Matcher finds the catalog recording for a playlist entry (nil when none).
++type Matcher interface {
++	MatchTrack(ctx context.Context, t ImportTrack) (*CatalogItem, error)
++}
++
++// PlaylistWriter keeps a Navidrome playlist with the given songs, in order.
++// It returns the playlist ID (creating the playlist when id is empty).
++type PlaylistWriter interface {
++	WritePlaylist(ctx context.Context, userID, id, name string, mediaFileIDs []string) (string, error)
++}
++
++// ListReader reads a playlist from a link.
++type ListReader interface {
++	Read(ctx context.Context, link string) (*ImportList, error)
++}
++
++// Importer brings external playlists into the library: it reads them, matches
++// every song to MusicBrainz, requests what is missing through the Service and
++// mirrors the playlist in Navidrome as songs arrive.
++type Importer struct {
++	svc       *Service
++	db        *sql.DB
++	matcher   Matcher
++	reader    ListReader
++	playlists PlaylistWriter
++	// OnChange is called when a job makes progress (for live UI refresh).
++	OnChange func()
++	// RefreshInterval: how often requested songs are checked (default 30s).
++	RefreshInterval time.Duration
++	// SyncInterval: how often synced playlists are read again (default 24h).
++	SyncInterval time.Duration
++	// RetryDelay between MusicBrainz attempts (default 5s).
++	RetryDelay time.Duration
++
++	queue chan string
++	mu    sync.Mutex
++	busy  map[string]bool
++	wg    sync.WaitGroup
++}
++
++func NewImporter(svc *Service, db *sql.DB, m Matcher, r ListReader, p PlaylistWriter) *Importer {
++	return &Importer{svc: svc, db: db, matcher: m, reader: r, playlists: p,
++		queue: make(chan string, 64), busy: map[string]bool{}}
++}
++
++// Start runs one job at a time (MusicBrainz allows 1 request/second) and the
++// periodic refresh/sync loop. Unfinished jobs resume.
++func (im *Importer) Start(ctx context.Context) {
++	refresh, syncEvery := im.RefreshInterval, im.SyncInterval
++	if refresh <= 0 {
++		refresh = 30 * time.Second
++	}
++	if syncEvery <= 0 {
++		syncEvery = 24 * time.Hour
++	}
++	im.wg.Go(func() {
++		for {
++			select {
++			case <-ctx.Done():
++				return
++			case id := <-im.queue:
++				im.run(ctx, id)
++			}
++		}
++	})
++	im.wg.Go(func() {
++		t := time.NewTicker(refresh)
++		defer t.Stop()
++		for {
++			select {
++			case <-ctx.Done():
++				return
++			case <-t.C:
++			}
++			im.refreshAll(ctx, syncEvery)
++		}
++	})
++	rows, err := im.db.QueryContext(ctx, `SELECT id FROM import_job WHERE status IN ('reading','matching') ORDER BY created_at`)
++	if err != nil {
++		return
++	}
++	var ids []string
++	for rows.Next() {
++		var id string
++		if rows.Scan(&id) == nil {
++			ids = append(ids, id)
++		}
++	}
++	rows.Close()
++	for _, id := range ids {
++		im.enqueue(id)
++	}
++}
++
++func (im *Importer) Wait() { im.wg.Wait() }
++
++func (im *Importer) enqueue(id string) {
++	im.mu.Lock()
++	if im.busy[id] {
++		im.mu.Unlock()
++		return
++	}
++	im.busy[id] = true
++	im.mu.Unlock()
++	select {
++	case im.queue <- id:
++	default:
++		go func() { im.queue <- id }()
++	}
++}
++
++func (im *Importer) notify() {
++	if im.OnChange != nil {
++		im.OnChange()
++	}
++}
++
++// CreateFromLink starts importing a Spotify / YouTube Music link.
++func (im *Importer) CreateFromLink(ctx context.Context, userID, link string, syncDaily bool) (*ImportJob, error) {
++	link = strings.TrimSpace(link)
++	if !spotifyLink.MatchString(link) && !strings.Contains(link, "youtube.com") && !strings.Contains(link, "youtu.be") {
++		return nil, ErrUnsupportedLink
++	}
++	source := "ytmusic"
++	if spotifyLink.MatchString(link) {
++		source = "spotify"
++	}
++	job := &ImportJob{ID: newID(), UserID: userID, Source: source, URL: link, Status: "reading", Sync: syncDaily, Name: link}
++	if err := im.insertJob(ctx, job); err != nil {
++		return nil, err
++	}
++	im.notify()
++	im.enqueue(job.ID)
++	return job, nil
++}
++
++// CreateFromList starts importing tracks already parsed (an uploaded file).
++func (im *Importer) CreateFromList(ctx context.Context, userID string, list *ImportList) (*ImportJob, error) {
++	job := &ImportJob{ID: newID(), UserID: userID, Source: list.Source, Status: "matching", Name: list.Name}
++	if err := im.insertJob(ctx, job); err != nil {
++		return nil, err
++	}
++	if err := im.addTracks(ctx, job.ID, list.Tracks); err != nil {
++		return nil, err
++	}
++	im.notify()
++	im.enqueue(job.ID)
++	return job, nil
++}
++
++func (im *Importer) insertJob(ctx context.Context, j *ImportJob) error {
++	now := time.Now()
++	j.CreatedAt, j.UpdatedAt = now, now
++	_, err := im.db.ExecContext(ctx, `INSERT INTO import_job (id, user_id, name, source, url, status, sync, created_at, updated_at)
++		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, j.ID, j.UserID, j.Name, j.Source, j.URL, j.Status, j.Sync, now, now)
++	return err
++}
++
++// addTracks appends the tracks that are not in the job yet (by artist and title).
++func (im *Importer) addTracks(ctx context.Context, jobID string, tracks []ImportTrack) error {
++	items, err := im.items(ctx, jobID)
++	if err != nil {
++		return err
++	}
++	seen := map[string]bool{}
++	for _, it := range items {
++		seen[fold(it.Artist)+"|"+fold(it.Title)] = true
++	}
++	pos := len(items)
++	tx, err := im.db.BeginTx(ctx, nil)
++	if err != nil {
++		return err
++	}
++	defer func() { _ = tx.Rollback() }()
++	for _, t := range tracks {
++		k := fold(t.Artist) + "|" + fold(t.Title)
++		if seen[k] || t.Title == "" {
++			continue
++		}
++		seen[k] = true
++		pos++
++		if _, err := tx.ExecContext(ctx, `INSERT INTO import_item (job_id, position, artist, title, album, isrc, duration_ms)
++			VALUES (?, ?, ?, ?, ?, ?, ?)`, jobID, pos, t.Artist, t.Title, t.Album, t.ISRC, t.DurationMs); err != nil {
++			return err
++		}
++	}
++	return tx.Commit()
++}
++
++func (im *Importer) setJob(ctx context.Context, id, status, errMsg string) {
++	_, _ = im.db.ExecContext(ctx, `UPDATE import_job SET status = ?, error = ?, updated_at = ? WHERE id = ?`,
++		status, errMsg, time.Now(), id)
++	im.notify()
++}
++
++func (im *Importer) setItem(ctx context.Context, jobID string, it *ImportItem) {
++	_, _ = im.db.ExecContext(ctx, `UPDATE import_item SET state = ?, mbid = ?, cover_id = ?, request_id = ?, library_id = ?, note = ?
++		WHERE job_id = ? AND position = ?`, it.State, it.MBID, it.CoverID, it.RequestID, it.LibraryID, it.Note, jobID, it.Position)
++}
++
++// run reads (when needed) and matches one job.
++func (im *Importer) run(ctx context.Context, id string) {
++	defer func() {
++		im.mu.Lock()
++		delete(im.busy, id)
++		im.mu.Unlock()
++	}()
++	job, err := im.job(ctx, id)
++	if err != nil {
++		return
++	}
++	if job.Status == "reading" {
++		list, err := im.reader.Read(ctx, job.URL)
++		if err != nil {
++			im.setJob(ctx, id, "failed", err.Error())
++			return
++		}
++		if list.Name != "" {
++			_, _ = im.db.ExecContext(ctx, `UPDATE import_job SET name = ?, source = ? WHERE id = ?`, list.Name, list.Source, id)
++		}
++		if err := im.addTracks(ctx, id, list.Tracks); err != nil {
++			im.setJob(ctx, id, "failed", err.Error())
++			return
++		}
++		im.setJob(ctx, id, "matching", "")
++	}
++	items, err := im.items(ctx, id)
++	if err != nil {
++		im.setJob(ctx, id, "failed", err.Error())
++		return
++	}
++	for i := range items {
++		if ctx.Err() != nil {
++			return // resumes on the next start
++		}
++		if items[i].State == ItemPending {
++			if err := im.resolve(ctx, job, &items[i], nil); err != nil {
++				// MusicBrainz unreachable: keep the rest pending; refreshAll retries the job
++				im.setJob(ctx, id, "matching", err.Error())
++				return
++			}
++		}
++	}
++	im.setJob(ctx, id, "downloading", "")
++	im.refresh(ctx, id)
++}
++
++// resolve matches an item (or uses the catalog item the user picked) and
++// requests it when it is not in the library yet.
++// It returns an error only when the catalog could not be reached.
++func (im *Importer) resolve(ctx context.Context, job *ImportJob, it *ImportItem, picked *CatalogItem) error {
++	cat := picked
++	if cat == nil {
++		var err error
++		for attempt := range 3 {
++			if cat, err = im.matcher.MatchTrack(ctx, it.ImportTrack); err == nil || ctx.Err() != nil {
++				break
++			}
++			select {
++			case <-time.After(time.Duration(attempt+1) * im.retryDelay()):
++			case <-ctx.Done():
++			}
++		}
++		if err != nil {
++			return err
++		}
++	}
++	if cat == nil {
++		it.State, it.Note = ItemNotFound, ""
++		im.setItem(ctx, job.ID, it)
++		im.notify()
++		return nil
++	}
++	cat.Kind = KindTrack
++	it.MBID, it.CoverID, it.Note = cat.MBID, cat.CoverID, ""
++	if libID, ok := im.svc.lib.Match(ctx, *cat); ok {
++		it.State, it.LibraryID = ItemOwned, libID
++	} else {
++		req, err := im.svc.Submit(ctx, job.UserID, *cat)
++		switch {
++		case errors.Is(err, ErrInLibrary):
++			it.State = ItemOwned
++		case err != nil:
++			it.State, it.Note = ItemFailed, err.Error()
++		default:
++			it.State, it.RequestID = ItemRequested, req.ID
++		}
++	}
++	im.setItem(ctx, job.ID, it)
++	im.notify()
++	return nil
++}
++
++func (im *Importer) retryDelay() time.Duration {
++	if im.RetryDelay > 0 {
++		return im.RetryDelay
++	}
++	return 5 * time.Second
++}
++
++// Resolve applies the user's choice for a song that was not matched.
++func (im *Importer) Resolve(ctx context.Context, jobID string, position int, cat CatalogItem) (*ImportItem, error) {
++	job, err := im.job(ctx, jobID)
++	if err != nil {
++		return nil, err
++	}
++	items, err := im.items(ctx, jobID)
++	if err != nil {
++		return nil, err
++	}
++	for i := range items {
++		if items[i].Position == position {
++			if cat.MBID == "" || cat.Title == "" {
++				return nil, errors.New("mbid and title are required")
++			}
++			if err := im.resolve(ctx, job, &items[i], &cat); err != nil {
++				return nil, err
++			}
++			return &items[i], nil
++		}
++	}
++	return nil, ErrNotFound
++}
++
++func (im *Importer) refreshAll(ctx context.Context, syncEvery time.Duration) {
++	// jobs that stopped because MusicBrainz was unreachable
++	if rows, err := im.db.QueryContext(ctx, `SELECT id FROM import_job WHERE status = 'matching' AND error != ''`); err == nil {
++		var ids []string
++		for rows.Next() {
++			var id string
++			if rows.Scan(&id) == nil {
++				ids = append(ids, id)
++			}
++		}
++		rows.Close()
++		for _, id := range ids {
++			im.enqueue(id)
++		}
++	}
++	rows, err := im.db.QueryContext(ctx, `SELECT id, sync, url, synced_at, created_at FROM import_job WHERE status IN ('downloading','done')`)
++	if err != nil {
++		return
++	}
++	type row struct {
++		id, url string
++		sync    bool
++		synced  time.Time
++	}
++	var jobs []row
++	for rows.Next() {
++		var r row
++		var synced sql.NullTime
++		if rows.Scan(&r.id, &r.sync, &r.url, &synced, &r.synced) == nil {
++			if synced.Valid {
++				r.synced = synced.Time
++			}
++			jobs = append(jobs, r)
++		}
++	}
++	rows.Close()
++	for _, j := range jobs {
++		im.refresh(ctx, j.id)
++		if j.sync && j.url != "" && time.Since(j.synced) >= syncEvery {
++			_, _ = im.db.ExecContext(ctx, `UPDATE import_job SET status = 'reading', synced_at = ? WHERE id = ?`, time.Now(), j.id)
++			im.enqueue(j.id)
++		}
++	}
++}
++
++// refresh follows the requests of a job and rewrites its Navidrome playlist.
++func (im *Importer) refresh(ctx context.Context, id string) {
++	job, err := im.job(ctx, id)
++	if err != nil {
++		return
++	}
++	items, err := im.items(ctx, id)
++	if err != nil {
++		return
++	}
++	changed, open := false, false
++	var ids []string
++	for i := range items {
++		it := &items[i]
++		if it.State == ItemRequested {
++			req, err := im.svc.store.Get(ctx, it.RequestID)
++			switch {
++			case err != nil:
++			case req.Status == StatusAvailable:
++				if libID, ok := im.svc.lib.Match(ctx, CatalogItem{Kind: KindTrack, MBID: it.MBID, Artist: req.Artist, Title: req.Title}); ok {
++					it.State, it.LibraryID = ItemAvailable, libID
++					im.setItem(ctx, id, it)
++					changed = true
++				}
++			case req.Status == StatusFailed:
++				it.State, it.Note = ItemFailed, req.Error
++				im.setItem(ctx, id, it)
++				changed = true
++			default:
++				open = true
++			}
++		}
++		if it.State == ItemOwned && it.LibraryID == "" {
++			if libID, ok := im.svc.lib.Match(ctx, CatalogItem{Kind: KindTrack, MBID: it.MBID, Artist: it.Artist, Title: it.Title}); ok {
++				it.LibraryID = libID
++				im.setItem(ctx, id, it)
++			}
++		}
++		if it.LibraryID != "" {
++			ids = append(ids, it.LibraryID)
++		}
++	}
++	if im.playlists != nil && len(ids) > 0 && (changed || job.PlaylistID == "" || job.Status != "done") {
++		plsID, err := im.playlists.WritePlaylist(ctx, job.UserID, job.PlaylistID, job.Name, ids)
++		if err == nil && plsID != job.PlaylistID {
++			_, _ = im.db.ExecContext(ctx, `UPDATE import_job SET playlist_id = ? WHERE id = ?`, plsID, id)
++		}
++	}
++	if !open && job.Status == "downloading" {
++		im.setJob(ctx, id, "done", "")
++	} else if changed {
++		im.notify()
++	}
++}
++
++const jobColumns = `id, user_id, name, source, url, status, error, sync, playlist_id, created_at, updated_at`
++
++func scanJob(row interface{ Scan(...any) error }) (*ImportJob, error) {
++	var j ImportJob
++	err := row.Scan(&j.ID, &j.UserID, &j.Name, &j.Source, &j.URL, &j.Status, &j.Error, &j.Sync, &j.PlaylistID, &j.CreatedAt, &j.UpdatedAt)
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, ErrNotFound
++	}
++	return &j, err
++}
++
++func (im *Importer) job(ctx context.Context, id string) (*ImportJob, error) {
++	return scanJob(im.db.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM import_job WHERE id = ?`, id))
++}
++
++func (im *Importer) items(ctx context.Context, jobID string) ([]ImportItem, error) {
++	rows, err := im.db.QueryContext(ctx, `SELECT position, artist, title, album, isrc, duration_ms, state, mbid, cover_id, request_id, library_id, note
++		FROM import_item WHERE job_id = ? ORDER BY position`, jobID)
++	if err != nil {
++		return nil, err
++	}
++	defer rows.Close()
++	var out []ImportItem
++	for rows.Next() {
++		var it ImportItem
++		if err := rows.Scan(&it.Position, &it.Artist, &it.Title, &it.Album, &it.ISRC, &it.DurationMs, &it.State,
++			&it.MBID, &it.CoverID, &it.RequestID, &it.LibraryID, &it.Note); err != nil {
++			return nil, err
++		}
++		out = append(out, it)
++	}
++	return out, rows.Err()
++}
++
++func (im *Importer) counts(ctx context.Context, j *ImportJob) {
++	rows, err := im.db.QueryContext(ctx, `SELECT state, COUNT(*) FROM import_item WHERE job_id = ? GROUP BY state`, j.ID)
++	if err != nil {
++		return
++	}
++	defer rows.Close()
++	j.Counts = map[string]int{}
++	for rows.Next() {
++		var s string
++		var n int
++		if rows.Scan(&s, &n) == nil {
++			j.Counts[s] = n
++			j.Total += n
++		}
++	}
++}
++
++// Jobs lists the imports of a user (everybody's when userID is empty), newest first.
++func (im *Importer) Jobs(ctx context.Context, userID string) ([]ImportJob, error) {
++	q, args := `SELECT `+jobColumns+` FROM import_job ORDER BY created_at DESC`, []any{}
++	if userID != "" {
++		q, args = `SELECT `+jobColumns+` FROM import_job WHERE user_id = ? ORDER BY created_at DESC`, []any{userID}
++	}
++	rows, err := im.db.QueryContext(ctx, q, args...)
++	if err != nil {
++		return nil, err
++	}
++	var out []ImportJob
++	for rows.Next() {
++		j, err := scanJob(rows)
++		if err != nil {
++			rows.Close()
++			return nil, err
++		}
++		out = append(out, *j)
++	}
++	rows.Close()
++	for i := range out {
++		im.counts(ctx, &out[i])
++	}
++	return out, nil
++}
++
++// Job returns one import with its items.
++func (im *Importer) Job(ctx context.Context, id string) (*ImportJob, error) {
++	j, err := im.job(ctx, id)
++	if err != nil {
++		return nil, err
++	}
++	im.counts(ctx, j)
++	if j.Items, err = im.items(ctx, id); err != nil {
++		return nil, err
++	}
++	return j, nil
++}
++
++// SetSync turns the daily re-read of the link on or off.
++func (im *Importer) SetSync(ctx context.Context, id string, on bool) error {
++	res, err := im.db.ExecContext(ctx, `UPDATE import_job SET sync = ? WHERE id = ?`, on, id)
++	if err != nil {
++		return err
++	}
++	if n, _ := res.RowsAffected(); n == 0 {
++		return ErrNotFound
++	}
++	return nil
++}
++
++// Delete forgets an import (its requests and playlist stay).
++func (im *Importer) Delete(ctx context.Context, id string) error {
++	if _, err := im.db.ExecContext(ctx, `DELETE FROM import_item WHERE job_id = ?`, id); err != nil {
++		return err
++	}
++	res, err := im.db.ExecContext(ctx, `DELETE FROM import_job WHERE id = ?`, id)
++	if err != nil {
++		return err
++	}
++	if n, _ := res.RowsAffected(); n == 0 {
++		return fmt.Errorf("%w", ErrNotFound)
++	}
++	im.notify()
++	return nil
++}
+diff --git a/core/acquire/importer_test.go b/core/acquire/importer_test.go
+new file mode 100644
+index 0000000..258571f
+--- /dev/null
++++ b/core/acquire/importer_test.go
+@@ -0,0 +1,212 @@
++package acquire
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type fakeMatcher struct{ down *atomic.Int32 }
++
++func (m fakeMatcher) MatchTrack(_ context.Context, t ImportTrack) (*CatalogItem, error) {
++	if m.down != nil && m.down.Add(-1) >= 0 {
++		return nil, errors.New("connection refused")
++	}
++	if strings.Contains(t.Title, "Unknown") {
++		return nil, nil
++	}
++	return &CatalogItem{Kind: KindTrack, MBID: "mb-" + fold(t.Title), Artist: t.Artist, Title: t.Title, CoverID: ""}, nil
++}
++
++type fakeReader struct{ list *ImportList }
++
++func (r fakeReader) Read(context.Context, string) (*ImportList, error) { return r.list, nil }
++
++type fakePlaylists struct {
++	mu    sync.Mutex
++	calls [][]string
++}
++
++func (p *fakePlaylists) WritePlaylist(_ context.Context, _, _, _ string, ids []string) (string, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.calls = append(p.calls, ids)
++	return "pls-1", nil
++}
++
++func (p *fakePlaylists) last() []string {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if len(p.calls) == 0 {
++		return nil
++	}
++	return p.calls[len(p.calls)-1]
++}
++
++func importDB(t *testing.T) *sql.DB {
++	t.Helper()
++	st := newSQLStore(t)
++	mig, err := os.ReadFile("../../db/migrations/20261011000000_create_import_tables.sql")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := st.DB.Exec(strings.Split(string(mig), "-- +goose Down")[0] + `INSERT INTO user (id) VALUES ('u1');`); err != nil {
++		t.Fatal(err)
++	}
++	return st.DB
++}
++
++func TestImporterRequestsMissingSongsAndBuildsPlaylist(t *testing.T) {
++	db := importDB(t)
++	lib := &fakeLib{have: map[string]bool{"mb-owned": true}}
++	svc := NewService(fastConfig(true), fakeCatalog{}, []Source{&fakeSource{name: "yt", kind: KindTrack, lib: lib}}, NewSQLStore(db), lib)
++	list := &ImportList{Name: "Rock", Source: "spotify", Tracks: []ImportTrack{
++		{Artist: "A", Title: "Owned"}, {Artist: "A", Title: "New"}, {Artist: "A", Title: "Unknown song"}, {Artist: "a", Title: "new"},
++	}}
++	pls := &fakePlaylists{}
++	down := &atomic.Int32{}
++	down.Store(4) // MusicBrainz fails 4 times: the job pauses and resumes
++	im := NewImporter(svc, db, fakeMatcher{down: down}, fakeReader{list}, pls)
++	im.RefreshInterval = 20 * time.Millisecond
++	im.RetryDelay = time.Millisecond
++	ctx, cancel := context.WithCancel(context.Background())
++	defer func() { cancel(); svc.Wait(); im.Wait() }()
++	svc.Start(ctx)
++	im.Start(ctx)
++
++	job, err := im.CreateFromLink(ctx, "u1", "https://open.spotify.com/playlist/abc123", true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var got *ImportJob
++	for i := 0; i < 300; i++ {
++		got, _ = im.Job(ctx, job.ID)
++		if got != nil && got.Status == "done" {
++			break
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	if got.Status != "done" || got.Name != "Rock" || got.Total != 3 {
++		t.Fatalf("job = %+v", got)
++	}
++	if got.Counts[ItemOwned] != 1 || got.Counts[ItemAvailable] != 1 || got.Counts[ItemNotFound] != 1 {
++		t.Errorf("counts = %v", got.Counts)
++	}
++	if ids := pls.last(); strings.Join(ids, ",") != "lib-mb-owned,lib-mb-new" {
++		t.Errorf("playlist = %v", ids)
++	}
++	if got.PlaylistID != "pls-1" {
++		t.Errorf("playlist id = %q", got.PlaylistID)
++	}
++
++	// the user picks a match for the unknown song
++	it, err := im.Resolve(ctx, job.ID, 3, CatalogItem{Kind: KindTrack, MBID: "mb-owned2", Title: "Unknown song", Artist: "A"})
++	if err != nil || it.State != ItemRequested {
++		t.Fatalf("resolve: %+v %v", it, err)
++	}
++	jobs, _ := im.Jobs(ctx, "u1")
++	if len(jobs) != 1 || !jobs[0].Sync {
++		t.Errorf("jobs = %+v", jobs)
++	}
++	if err := im.Delete(ctx, job.ID); err != nil {
++		t.Error(err)
++	}
++}
++
++func TestParseImportFile(t *testing.T) {
++	csvData := "\xef\xbb\xbf\"Track URI\",\"Track Name\",\"Artist Name(s)\",\"Album Name\",\"Duration (ms)\",\"ISRC\"\n" +
++		"\"spotify:track:1\",\"Zóio de Lula\",\"Charlie Brown Jr.\",\"Preço Curto\",\"236000\",\"BRX\"\n"
++	l, err := ParseImportFile("Minha playlist.csv", []byte(csvData))
++	if err != nil || l.Name != "Minha playlist" || len(l.Tracks) != 1 || l.Tracks[0].ISRC != "BRX" || l.Tracks[0].DurationMs != 236000 {
++		t.Fatalf("csv: %+v %v", l, err)
++	}
++	js := `{"tracks":[{"artist":"A","album":"B","track":"C"},{"artist":"A","album":"B","track":"C"}]}`
++	l, err = ParseImportFile("YourLibrary.json", []byte(js))
++	if err != nil || len(l.Tracks) != 1 || l.Tracks[0].Title != "C" {
++		t.Fatalf("json: %+v %v", l, err)
++	}
++	l, err = ParseImportFile("list.txt", []byte("Legião Urbana - Tempo Perdido\nnothing here\n"))
++	if err != nil || len(l.Tracks) != 1 || l.Tracks[0].Artist != "Legião Urbana" {
++		t.Fatalf("txt: %+v %v", l, err)
++	}
++	if _, err := ParseImportFile("x.csv", []byte("a,b\n1,2\n")); err == nil {
++		t.Error("expected an error for a CSV without title/artist")
++	}
++}
++
++func TestPlaylistReaderSpotify(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/embed/playlist/abc":
++			_, _ = w.Write([]byte(`<html><script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"name":"Rock BR","trackList":[{"title":"Céu Azul","subtitle":"Charlie Brown Jr.","duration":214000}]}}}}}}</script></html>`))
++		case "/api/token":
++			_, _ = w.Write([]byte(`{"access_token":"tok"}`))
++		case "/v1/playlists/abc":
++			_, _ = w.Write([]byte(`{"name":"Rock API"}`))
++		case "/v1/playlists/abc/tracks":
++			if r.Header.Get("Authorization") != "Bearer tok" {
++				w.WriteHeader(401)
++				return
++			}
++			_, _ = w.Write([]byte(`{"items":[{"track":{"name":"Céu Azul","duration_ms":214000,"external_ids":{"isrc":"BR1"},"artists":[{"name":"Charlie Brown Jr."}],"album":{"name":"Imunidade"}}},{"track":null}]}`))
++		default:
++			w.WriteHeader(404)
++		}
++	}))
++	defer srv.Close()
++	p := &PlaylistReader{SpotifyWeb: srv.URL}
++	l, err := p.Read(context.Background(), "https://open.spotify.com/intl-pt/playlist/abc?si=x")
++	if err != nil || l.Name != "Rock BR" || len(l.Tracks) != 1 || l.Tracks[0].Artist != "Charlie Brown Jr." {
++		t.Fatalf("embed: %+v %v", l, err)
++	}
++	p = &PlaylistReader{SpotifyAPI: srv.URL, SpotifyClientID: "id", SpotifyClientSecret: "secret"}
++	l, err = p.Read(context.Background(), "https://open.spotify.com/playlist/abc")
++	if err != nil || l.Name != "Rock API" || len(l.Tracks) != 1 || l.Tracks[0].ISRC != "BR1" || l.Tracks[0].Album != "Imunidade" {
++		t.Fatalf("api: %+v %v", l, err)
++	}
++	if _, err := p.Read(context.Background(), "https://example.com/x"); err != ErrUnsupportedLink {
++		t.Errorf("unsupported link: %v", err)
++	}
++}
++
++func TestPlaylistReaderYouTube(t *testing.T) {
++	dir := t.TempDir()
++	bin := filepath.Join(dir, "yt-dlp")
++	script := "#!/bin/sh\ncat <<'JSON'\n" + `{"title":"Rap","entries":[{"title":"Negro Drama","channel":"Racionais MC's - Topic","duration":411},{"title":"Emicida - AmarElo","channel":"Emicida","duration":300},{"title":"[Deleted video]"}]}` + "\nJSON\n"
++	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
++		t.Fatal(err)
++	}
++	p := &PlaylistReader{YtDlp: bin}
++	l, err := p.Read(context.Background(), "https://music.youtube.com/playlist?list=PL1")
++	if err != nil || l.Name != "Rap" || len(l.Tracks) != 2 {
++		t.Fatalf("yt: %+v %v", l, err)
++	}
++	if l.Tracks[0].Artist != "Racionais MC's" || l.Tracks[1].Artist != "Emicida" || l.Tracks[1].Title != "AmarElo" || l.Tracks[0].DurationMs != 411000 {
++		t.Errorf("tracks = %+v", l.Tracks)
++	}
++}
++
++func TestCleanTitle(t *testing.T) {
++	for in, want := range map[string]string{
++		"Song - 2011 Remaster":      "Song",
++		"Song (feat. Someone)":      "Song",
++		"Song - Remastered Version": "Song",
++		"Song (Ao Vivo)":            "Song (Ao Vivo)",
++	} {
++		if got := cleanTitle(in); got != want {
++			t.Errorf("cleanTitle(%q) = %q, want %q", in, got, want)
++		}
++	}
++	if firstArtist("Emicida, Majur & Pabllo Vittar") != "Emicida" {
++		t.Error("firstArtist")
++	}
++}
+diff --git a/core/seer/playlists.go b/core/seer/playlists.go
+new file mode 100644
+index 0000000..6581590
+--- /dev/null
++++ b/core/seer/playlists.go
+@@ -0,0 +1,45 @@
++package seer
++
++import (
++	"context"
++	"slices"
++
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/model/request"
++)
++
++// playlistWriter mirrors imported playlists as regular Navidrome playlists.
++type playlistWriter struct {
++	ds model.DataStore
++}
++
++// WritePlaylist creates the playlist (when id is empty or it was deleted) and
++// sets its tracks, in order, when they changed.
++func (w *playlistWriter) WritePlaylist(ctx context.Context, userID, id, name string, ids []string) (string, error) {
++	user, err := w.ds.User().Get(ctx, userID)
++	if err != nil {
++		return "", err
++	}
++	ctx = request.WithUser(ctx, *user)
++	repo := w.ds.Playlist()
++	var pls *model.Playlist
++	if id != "" {
++		if pls, err = repo.Get(ctx, id); err != nil {
++			pls = nil // deleted by the user: make a new one
++		}
++	}
++	if pls == nil {
++		pls = &model.Playlist{Name: name, OwnerID: userID, Comment: "Seer"}
++	} else {
++		current, err := repo.Tracks(ctx, pls.ID, false).GetMediaFileIDs(ctx, model.QueryOptions{Sort: "id"})
++		if err == nil && slices.Equal(current, ids) {
++			return pls.ID, nil
++		}
++	}
++	pls.SetTracks(nil)
++	pls.AddMediaFilesByID(ids)
++	if err := repo.Put(ctx, pls); err != nil {
++		return "", err
++	}
++	return pls.ID, nil
++}
+diff --git a/core/seer/seer.go b/core/seer/seer.go
+index 64ac89e..47732b9 100644
+--- a/core/seer/seer.go
++++ b/core/seer/seer.go
+@@ -19,6 +19,7 @@ import (
+ // Seer is the acquisition service shared by the API and the background workers.
+ type Seer struct {
+ 	*acquire.Service
++	Importer *acquire.Importer
+ }
+ 
+ // Enabled reports whether the feature is turned on in the configuration.
+@@ -39,16 +40,25 @@ func New(ds model.DataStore, scanner model.Scanner, db *sql.DB, broker events.Br
+ 		Workers:       opts.Workers,
+ 		AutoApprove:   opts.AutoApprove,
+ 		ImportTimeout: opts.ImportTimeout,
+-		OnChange: func(acquire.Request) {
+-			// Tells open UIs to reload the requests list (useRefreshOnEvents(['seer'])).
+-			if broker != nil {
+-				broker.SendBroadcastMessage(context.Background(), (&events.RefreshResource{}).With("seer"))
+-			}
+-		},
++		OnChange: func(acquire.Request) { refreshUI(broker) },
+ 	}
+ 	catalog := &acquire.MusicBrainz{UserAgent: opts.UserAgent, BaseURL: opts.MusicBrainzURL}
+ 	lib := &library{ds: ds, scanner: scanner}
+-	return &Seer{Service: acquire.NewService(cfg, catalog, sources(), acquire.NewSQLStore(db), lib)}
++	svc := acquire.NewService(cfg, catalog, sources(), acquire.NewSQLStore(db), lib)
++	reader := &acquire.PlaylistReader{
++		SpotifyClientID: opts.Spotify.ClientID, SpotifyClientSecret: opts.Spotify.ClientSecret,
++		YtDlp: opts.YouTube.Path, Cookies: opts.YouTube.Cookies,
++	}
++	imp := acquire.NewImporter(svc, db, catalog, reader, &playlistWriter{ds: ds})
++	imp.OnChange = func() { refreshUI(broker) }
++	return &Seer{Service: svc, Importer: imp}
++}
++
++// refreshUI tells open pages to reload (useRefreshOnEvents(['seer'])).
++func refreshUI(broker events.Broker) {
++	if broker != nil {
++		broker.SendBroadcastMessage(context.Background(), (&events.RefreshResource{}).With("seer"))
++	}
+ }
+ 
+ // Start launches the workers when the feature is enabled.
+@@ -58,6 +68,7 @@ func (s *Seer) Start(ctx context.Context) {
+ 	}
+ 	log.Info(ctx, "Starting Seer acquisition workers", "sources", conf.Server.Seer.Sources)
+ 	s.Service.Start(ctx)
++	s.Importer.Start(ctx)
+ }
+ 
+ // sources builds the enabled sources in the configured priority order.
+diff --git a/db/migrations/20261011000000_create_import_tables.sql b/db/migrations/20261011000000_create_import_tables.sql
+new file mode 100644
+index 0000000..7ac31bc
+--- /dev/null
++++ b/db/migrations/20261011000000_create_import_tables.sql
+@@ -0,0 +1,36 @@
++-- +goose Up
++CREATE TABLE import_job (
++    id          VARCHAR(255) NOT NULL PRIMARY KEY,
++    user_id     VARCHAR(255) NOT NULL REFERENCES user(id) ON DELETE CASCADE,
++    name        VARCHAR(255) NOT NULL DEFAULT '',
++    source      VARCHAR(16)  NOT NULL DEFAULT '',
++    url         TEXT         NOT NULL DEFAULT '',
++    status      VARCHAR(16)  NOT NULL DEFAULT 'reading',
++    error       TEXT         NOT NULL DEFAULT '',
++    sync        BOOL         NOT NULL DEFAULT false,
++    playlist_id VARCHAR(255) NOT NULL DEFAULT '',
++    synced_at   DATETIME,
++    created_at  DATETIME     NOT NULL,
++    updated_at  DATETIME     NOT NULL
++);
++CREATE INDEX import_job_user ON import_job(user_id);
++CREATE TABLE import_item (
++    job_id      VARCHAR(255) NOT NULL REFERENCES import_job(id) ON DELETE CASCADE,
++    position    INTEGER      NOT NULL,
++    artist      VARCHAR(255) NOT NULL DEFAULT '',
++    title       VARCHAR(255) NOT NULL DEFAULT '',
++    album       VARCHAR(255) NOT NULL DEFAULT '',
++    isrc        VARCHAR(32)  NOT NULL DEFAULT '',
++    duration_ms INTEGER      NOT NULL DEFAULT 0,
++    state       VARCHAR(16)  NOT NULL DEFAULT 'pending',
++    mbid        VARCHAR(64)  NOT NULL DEFAULT '',
++    cover_id    VARCHAR(64)  NOT NULL DEFAULT '',
++    request_id  VARCHAR(255) NOT NULL DEFAULT '',
++    library_id  VARCHAR(255) NOT NULL DEFAULT '',
++    note        TEXT         NOT NULL DEFAULT '',
++    PRIMARY KEY (job_id, position)
++);
++
++-- +goose Down
++DROP TABLE import_item;
++DROP TABLE import_job;
+diff --git a/resources/i18n/pt-br.json b/resources/i18n/pt-br.json
+index 096cbbd..637be0b 100644
+--- a/resources/i18n/pt-br.json
++++ b/resources/i18n/pt-br.json
+@@ -537,6 +537,42 @@
+         "albums": "Álbuns",
+         "eps": "EPs",
+         "other": "Ao vivo e outros"
++      },
++      "imports": {
++        "title": "Traga suas playlists",
++        "hint": "Cole o link de uma playlist ou álbum do Spotify ou do YouTube Music, ou envie um arquivo exportado (CSV do Exportify, JSON dos dados do Spotify, texto \"Artista - Música\"). O que faltar é pedido e uma playlist com o mesmo nome é criada aqui.",
++        "placeholder": "https://open.spotify.com/playlist/… ou music.youtube.com/playlist?list=…",
++        "go": "Importar",
++        "syncDaily": "Sincronizar todo dia",
++        "upload": "Enviar arquivo",
++        "started": "Importação iniciada",
++        "progress": "%{have} de %{total} na biblioteca",
++        "downloading": "%{smart_count} baixando |||| %{smart_count} baixando",
++        "notFound": "%{smart_count} não encontrada |||| %{smart_count} não encontradas",
++        "openPlaylist": "Abrir playlist",
++        "delete": "Esquecer esta importação",
++        "pick": "Escolher",
++        "pickTitle": "Qual é a música?",
++        "status": {
++          "reading": "Lendo a playlist…",
++          "matching": "Procurando as músicas…",
++          "downloading": "Baixando",
++          "done": "Concluída",
++          "failed": "Falhou"
++        },
++        "state": {
++          "pending": "Na fila",
++          "notfound": "Não encontrada",
++          "owned": "Na biblioteca",
++          "requested": "Baixando",
++          "available": "Adicionada",
++          "failed": "Falhou"
++        },
++        "source": {
++          "spotify": "Playlist do Spotify",
++          "ytmusic": "Playlist do YouTube Music",
++          "file": "Arquivo importado"
++        }
+       }
+     }
+   },
+diff --git a/server/nativeapi/config.go b/server/nativeapi/config.go
+index ed66949..0f94a01 100644
+--- a/server/nativeapi/config.go
++++ b/server/nativeapi/config.go
+@@ -33,6 +33,7 @@ var sensitiveFieldsFullMask = []string{
+ 	"Prometheus.Password",
+ 	"Seer.Soulseek.ApiKey",
+ 	"Seer.Lidarr.ApiKey",
++	"Seer.Spotify.ClientSecret",
+ }
+ 
+ type configResponse struct {
+diff --git a/server/seerapi/seerapi.go b/server/seerapi/seerapi.go
+index 0024f88..4842d58 100644
+--- a/server/seerapi/seerapi.go
++++ b/server/seerapi/seerapi.go
+@@ -5,8 +5,10 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
++	"io"
+ 	"net/http"
+ 	"strconv"
++	"strings"
+ 
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/navidrome/navidrome/core/acquire"
+@@ -28,14 +30,35 @@ type Service interface {
+ 	List(ctx context.Context, userID string) ([]acquire.Request, error)
+ }
+ 
++// Imports is the playlist importer used by the API.
++type Imports interface {
++	CreateFromLink(ctx context.Context, userID, link string, sync bool) (*acquire.ImportJob, error)
++	CreateFromList(ctx context.Context, userID string, list *acquire.ImportList) (*acquire.ImportJob, error)
++	Jobs(ctx context.Context, userID string) ([]acquire.ImportJob, error)
++	Job(ctx context.Context, id string) (*acquire.ImportJob, error)
++	Resolve(ctx context.Context, jobID string, position int, cat acquire.CatalogItem) (*acquire.ImportItem, error)
++	SetSync(ctx context.Context, id string, on bool) error
++	Delete(ctx context.Context, id string) error
++}
++
+ type Router struct {
+ 	http.Handler
+ 	ds  model.DataStore
+ 	svc Service
++	imp Imports
+ }
+ 
+ func New(ds model.DataStore, s *seer.Seer) *Router {
+-	return NewWithService(ds, s)
++	r := &Router{ds: ds, svc: s, imp: s.Importer}
++	r.Handler = r.routes()
++	return r
++}
++
++// NewWithImports builds the router around any Service and Imports (used by tests).
++func NewWithImports(ds model.DataStore, svc Service, imp Imports) *Router {
++	r := &Router{ds: ds, svc: svc, imp: imp}
++	r.Handler = r.routes()
++	return r
+ }
+ 
+ // NewWithService builds the router around any Service (used by tests).
+@@ -61,6 +84,16 @@ func (api *Router) routes() http.Handler {
+ 			r.Get("/{id}", api.getRequest)
+ 			r.With(adminOnly).Post("/{id}/approve", api.approveRequest)
+ 		})
++		if api.imp != nil {
++			r.Route("/imports", func(r chi.Router) {
++				r.Get("/", api.listImports)
++				r.Post("/", api.createImport)
++				r.Get("/{id}", api.getImport)
++				r.Put("/{id}", api.updateImport)
++				r.Delete("/{id}", api.deleteImport)
++				r.Post("/{id}/items/{pos}/resolve", api.resolveImportItem)
++			})
++		}
+ 	})
+ 	return r
+ }
+@@ -190,3 +223,141 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
+ 	w.WriteHeader(status)
+ 	_ = json.NewEncoder(w).Encode(v)
+ }
++
++func (api *Router) listImports(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	userID := user.ID
++	if user.IsAdmin && r.URL.Query().Get("mine") != "true" {
++		userID = ""
++	}
++	jobs, err := api.imp.Jobs(r.Context(), userID)
++	if err != nil {
++		log.Error(r.Context(), "Seer: listing imports failed", err)
++		http.Error(w, "internal error", http.StatusInternalServerError)
++		return
++	}
++	if jobs == nil {
++		jobs = []acquire.ImportJob{}
++	}
++	writeJSON(w, http.StatusOK, jobs)
++}
++
++// createImport takes {"url": "...", "sync": true} or a multipart "file" upload.
++func (api *Router) createImport(w http.ResponseWriter, r *http.Request) {
++	user, _ := request.UserFrom(r.Context())
++	var job *acquire.ImportJob
++	var err error
++	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/") {
++		r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
++		file, hdr, ferr := r.FormFile("file")
++		if ferr != nil {
++			http.Error(w, "file is required", http.StatusBadRequest)
++			return
++		}
++		defer file.Close()
++		data, rerr := io.ReadAll(file)
++		if rerr != nil {
++			http.Error(w, "file too large", http.StatusBadRequest)
++			return
++		}
++		list, perr := acquire.ParseImportFile(hdr.Filename, data)
++		if perr != nil {
++			http.Error(w, perr.Error(), http.StatusBadRequest)
++			return
++		}
++		if name := strings.TrimSpace(r.FormValue("name")); name != "" {
++			list.Name = name
++		}
++		job, err = api.imp.CreateFromList(r.Context(), user.ID, list)
++	} else {
++		var body struct {
++			URL  string `json:"url"`
++			Sync bool   `json:"sync"`
++		}
++		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&body); err != nil {
++			http.Error(w, "invalid body", http.StatusBadRequest)
++			return
++		}
++		job, err = api.imp.CreateFromLink(r.Context(), user.ID, body.URL, body.Sync)
++	}
++	if err != nil {
++		http.Error(w, err.Error(), http.StatusBadRequest)
++		return
++	}
++	writeJSON(w, http.StatusCreated, job)
++}
++
++// ownImport loads a job the caller may see, writing 404 otherwise.
++func (api *Router) ownImport(w http.ResponseWriter, r *http.Request) *acquire.ImportJob {
++	user, _ := request.UserFrom(r.Context())
++	job, err := api.imp.Job(r.Context(), chi.URLParam(r, "id"))
++	if err != nil || (!user.IsAdmin && job.UserID != user.ID) {
++		http.Error(w, "not found", http.StatusNotFound)
++		return nil
++	}
++	return job
++}
++
++func (api *Router) getImport(w http.ResponseWriter, r *http.Request) {
++	if job := api.ownImport(w, r); job != nil {
++		writeJSON(w, http.StatusOK, job)
++	}
++}
++
++func (api *Router) updateImport(w http.ResponseWriter, r *http.Request) {
++	job := api.ownImport(w, r)
++	if job == nil {
++		return
++	}
++	var body struct {
++		Sync bool `json:"sync"`
++	}
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&body); err != nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	if err := api.imp.SetSync(r.Context(), job.ID, body.Sync); err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	job.Sync = body.Sync
++	writeJSON(w, http.StatusOK, job)
++}
++
++func (api *Router) deleteImport(w http.ResponseWriter, r *http.Request) {
++	job := api.ownImport(w, r)
++	if job == nil {
++		return
++	}
++	if err := api.imp.Delete(r.Context(), job.ID); err != nil {
++		http.Error(w, err.Error(), http.StatusInternalServerError)
++		return
++	}
++	w.WriteHeader(http.StatusNoContent)
++}
++
++func (api *Router) resolveImportItem(w http.ResponseWriter, r *http.Request) {
++	job := api.ownImport(w, r)
++	if job == nil {
++		return
++	}
++	pos, err := strconv.Atoi(chi.URLParam(r, "pos"))
++	if err != nil {
++		http.Error(w, "invalid position", http.StatusBadRequest)
++		return
++	}
++	var cat acquire.CatalogItem
++	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&cat); err != nil {
++		http.Error(w, "invalid body", http.StatusBadRequest)
++		return
++	}
++	it, err := api.imp.Resolve(r.Context(), job.ID, pos, cat)
++	switch {
++	case errors.Is(err, acquire.ErrNotFound):
++		http.Error(w, "not found", http.StatusNotFound)
++	case err != nil:
++		http.Error(w, err.Error(), http.StatusBadRequest)
++	default:
++		writeJSON(w, http.StatusOK, it)
++	}
++}
+diff --git a/server/seerapi/seerapi_test.go b/server/seerapi/seerapi_test.go
+index 8bf7cb2..b384203 100644
+--- a/server/seerapi/seerapi_test.go
++++ b/server/seerapi/seerapi_test.go
+@@ -117,3 +117,58 @@ func TestSeerAPI(t *testing.T) {
+ 		t.Errorf("admins list everything, listed %q body %q", *svc.listedBy, w.Body)
+ 	}
+ }
++
++type fakeImports struct{ jobs map[string]*acquire.ImportJob }
++
++func (f *fakeImports) CreateFromLink(_ context.Context, userID, link string, sync bool) (*acquire.ImportJob, error) {
++	if link == "bad" {
++		return nil, acquire.ErrUnsupportedLink
++	}
++	j := &acquire.ImportJob{ID: "j1", UserID: userID, URL: link, Sync: sync}
++	f.jobs[j.ID] = j
++	return j, nil
++}
++func (f *fakeImports) CreateFromList(_ context.Context, userID string, l *acquire.ImportList) (*acquire.ImportJob, error) {
++	j := &acquire.ImportJob{ID: "j2", UserID: userID, Name: l.Name, Total: len(l.Tracks)}
++	f.jobs[j.ID] = j
++	return j, nil
++}
++func (f *fakeImports) Jobs(context.Context, string) ([]acquire.ImportJob, error) { return nil, nil }
++func (f *fakeImports) Job(_ context.Context, id string) (*acquire.ImportJob, error) {
++	if j, ok := f.jobs[id]; ok {
++		return j, nil
++	}
++	return nil, acquire.ErrNotFound
++}
++func (f *fakeImports) Resolve(context.Context, string, int, acquire.CatalogItem) (*acquire.ImportItem, error) {
++	return &acquire.ImportItem{State: acquire.ItemRequested}, nil
++}
++func (f *fakeImports) SetSync(context.Context, string, bool) error { return nil }
++func (f *fakeImports) Delete(_ context.Context, id string) error {
++	delete(f.jobs, id)
++	return nil
++}
++
++func TestSeerImportsAPI(t *testing.T) {
++	imp := &fakeImports{jobs: map[string]*acquire.ImportJob{"other": {ID: "other", UserID: "u2"}}}
++	api := NewWithImports(nil, &fakeService{reqs: map[string]*acquire.Request{}}, imp)
++	user := model.User{ID: "u1"}
++	if w := do(t, api, user, "POST", "/imports", `{"url":"https://open.spotify.com/playlist/x","sync":true}`); w.Code != 201 || !imp.jobs["j1"].Sync {
++		t.Errorf("create: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, user, "POST", "/imports", `{"url":"bad"}`); w.Code != 400 {
++		t.Errorf("bad link: %d", w.Code)
++	}
++	if w := do(t, api, user, "GET", "/imports/other", ""); w.Code != 404 {
++		t.Errorf("someone else's import: %d", w.Code)
++	}
++	if w := do(t, api, user, "POST", "/imports/j1/items/3/resolve", `{"mbid":"m","title":"T"}`); w.Code != 200 {
++		t.Errorf("resolve: %d %s", w.Code, w.Body)
++	}
++	if w := do(t, api, user, "DELETE", "/imports/j1", ""); w.Code != 204 {
++		t.Errorf("delete: %d", w.Code)
++	}
++	if w := do(t, api, user, "GET", "/imports", ""); w.Code != 200 || strings.TrimSpace(w.Body.String()) != "[]" {
++		t.Errorf("list: %d %s", w.Code, w.Body)
++	}
++}
+diff --git a/ui/src/i18n/en.json b/ui/src/i18n/en.json
+index b1f1b54..9d0cb4e 100644
+--- a/ui/src/i18n/en.json
++++ b/ui/src/i18n/en.json
+@@ -540,6 +540,42 @@
+         "albums": "Albums",
+         "eps": "EPs",
+         "other": "Live & more"
++      },
++      "imports": {
++        "title": "Bring your playlists",
++        "hint": "Paste a Spotify or YouTube Music playlist or album link, or upload an export (Exportify CSV, Spotify data JSON, \"Artist - Title\" text). Missing songs are requested and a playlist with the same name is created here.",
++        "placeholder": "https://open.spotify.com/playlist/… or music.youtube.com/playlist?list=…",
++        "go": "Import",
++        "syncDaily": "Sync every day",
++        "upload": "Upload a file",
++        "started": "Import started",
++        "progress": "%{have} of %{total} in your library",
++        "downloading": "%{smart_count} downloading |||| %{smart_count} downloading",
++        "notFound": "%{smart_count} not found |||| %{smart_count} not found",
++        "openPlaylist": "Open playlist",
++        "delete": "Forget this import",
++        "pick": "Choose",
++        "pickTitle": "Which song is it?",
++        "status": {
++          "reading": "Reading the playlist…",
++          "matching": "Finding songs…",
++          "downloading": "Downloading",
++          "done": "Done",
++          "failed": "Failed"
++        },
++        "state": {
++          "pending": "Waiting",
++          "notfound": "Not found",
++          "owned": "In library",
++          "requested": "Downloading",
++          "available": "Added",
++          "failed": "Failed"
++        },
++        "source": {
++          "spotify": "Spotify playlist",
++          "ytmusic": "YouTube Music playlist",
++          "file": "Imported file"
++        }
+       }
+     }
+   },
+diff --git a/ui/src/seer/ImportView.jsx b/ui/src/seer/ImportView.jsx
+new file mode 100644
+index 0000000..bc4f626
+--- /dev/null
++++ b/ui/src/seer/ImportView.jsx
+@@ -0,0 +1,420 @@
++import { useCallback, useEffect, useState } from 'react'
++import {
++  ButtonBase,
++  Dialog,
++  DialogContent,
++  DialogTitle,
++  IconButton,
++  InputBase,
++  Tooltip,
++} from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import DeleteIcon from '@material-ui/icons/DeleteOutline'
++import PlaylistPlayIcon from '@material-ui/icons/PlaylistPlay'
++import SearchIcon from '@material-ui/icons/Search'
++import SyncIcon from '@material-ui/icons/Sync'
++import { useNotify, useTranslate } from 'react-admin'
++import { useHistory } from 'react-router-dom'
++import { useRefreshOnEvents } from '../common'
++import { GREEN } from './actions'
++import {
++  deleteImport,
++  getImport,
++  resolveImportItem,
++  searchCatalog,
++  setImportSync,
++} from './api'
++import { Cover } from './artwork'
++import { formatDuration, Shimmer } from './components'
++import { ImportArt, ProgressBar, SOURCE_COLORS } from './ImportsPanel'
++import { ErrorState, Hero } from './states'
++
++const STATE_COLORS = {
++  pending: '#999',
++  notfound: '#f5a524',
++  owned: GREEN,
++  available: GREEN,
++  requested: '#4fb3ff',
++  failed: '#ff5c7a',
++}
++
++const errorMessage = (err) => err?.body || err?.message || String(err)
++
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  return {
++    art: {
++      width: 'clamp(140px, 22vw, 220px)',
++      height: 'clamp(140px, 22vw, 220px)',
++      borderRadius: 12,
++      display: 'flex',
++      alignItems: 'center',
++      justifyContent: 'center',
++      color: 'white',
++      boxShadow: '0 16px 48px rgba(0,0,0,0.5)',
++      flexShrink: 0,
++      '& svg': { fontSize: 80 },
++    },
++    bar: {
++      display: 'flex',
++      height: 8,
++      borderRadius: 999,
++      overflow: 'hidden',
++      background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)',
++      margin: theme.spacing(1, 0, 2),
++    },
++    action: {
++      height: 40,
++      padding: '0 18px',
++      borderRadius: 999,
++      fontWeight: 700,
++      fontSize: 14,
++      gap: 8,
++      border: `1px solid ${theme.palette.divider}`,
++      color: theme.palette.text.primary,
++      '&:hover': { borderColor: theme.palette.text.primary },
++    },
++    on: {
++      background: `${GREEN}26`,
++      borderColor: GREEN,
++      color: dark ? GREEN : '#0a7a35',
++    },
++    row: {
++      display: 'grid',
++      gridTemplateColumns: '32px 44px minmax(0, 1fr) 52px auto',
++      alignItems: 'center',
++      gap: theme.spacing(2),
++      padding: '8px 12px',
++      borderRadius: 8,
++      '&:hover': {
++        background: dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.05)',
++      },
++      [theme.breakpoints.down('xs')]: {
++        gridTemplateColumns: '44px minmax(0, 1fr) auto',
++        gap: theme.spacing(1.5),
++        '& > :first-child, & > :nth-child(4)': { display: 'none' },
++      },
++    },
++    num: {
++      color: theme.palette.text.secondary,
++      textAlign: 'right',
++      fontVariantNumeric: 'tabular-nums',
++    },
++    title: {
++      fontSize: 15,
++      fontWeight: 500,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    sub: {
++      fontSize: 13,
++      color: theme.palette.text.secondary,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    dur: {
++      color: theme.palette.text.secondary,
++      fontSize: 14,
++      textAlign: 'right',
++      fontVariantNumeric: 'tabular-nums',
++    },
++    pill: {
++      display: 'inline-flex',
++      alignItems: 'center',
++      gap: 6,
++      padding: '3px 10px',
++      borderRadius: 999,
++      fontSize: 12,
++      fontWeight: 600,
++      whiteSpace: 'nowrap',
++    },
++    pick: {
++      marginLeft: 8,
++      padding: '4px 12px',
++      borderRadius: 999,
++      fontSize: 12,
++      fontWeight: 700,
++      border: `1px solid ${theme.palette.divider}`,
++      '&:hover': { borderColor: theme.palette.text.primary },
++    },
++    search: {
++      display: 'flex',
++      alignItems: 'center',
++      gap: 8,
++      height: 44,
++      padding: '0 14px',
++      borderRadius: 999,
++      background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)',
++      marginBottom: 12,
++    },
++    option: {
++      display: 'flex',
++      width: '100%',
++      gap: 12,
++      alignItems: 'center',
++      justifyContent: 'flex-start',
++      textAlign: 'left',
++      padding: 8,
++      borderRadius: 8,
++      '&:hover': {
++        background: dark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.05)',
++      },
++    },
++  }
++})
++
++const PickDialog = ({ item, onClose, onPick }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const [q, setQ] = useState(`${item.artist} ${item.title}`)
++  const [results, setResults] = useState(null)
++  useEffect(() => {
++    let cancelled = false
++    const t = setTimeout(() => {
++      if (q.trim().length < 2) return
++      setResults(null)
++      searchCatalog(q.trim(), 12)
++        .then(
++          (r) => !cancelled && setResults(r.filter((i) => i.kind === 'track')),
++        )
++        .catch(() => !cancelled && setResults([]))
++    }, 600)
++    return () => {
++      cancelled = true
++      clearTimeout(t)
++    }
++  }, [q])
++  return (
++    <Dialog open onClose={onClose} fullWidth maxWidth="sm">
++      <DialogTitle>{translate('resources.seer.imports.pickTitle')}</DialogTitle>
++      <DialogContent>
++        <div className={classes.search}>
++          <SearchIcon />
++          <InputBase
++            fullWidth
++            autoFocus
++            value={q}
++            onChange={(e) => setQ(e.target.value)}
++          />
++        </div>
++        {results === null
++          ? [0, 1, 2].map((i) => (
++              <Shimmer key={i} height={48} style={{ margin: '8px 0' }} />
++            ))
++          : results.map((r) => (
++              <ButtonBase
++                key={r.mbid}
++                className={classes.option}
++                onClick={() => onPick(r)}
++              >
++                <Cover
++                  id={r.coverId}
++                  seed={r.album || r.title}
++                  radius={4}
++                  style={{ width: 44, height: 44, fontSize: 9 }}
++                />
++                <div style={{ minWidth: 0 }}>
++                  <div className={classes.title}>{r.title}</div>
++                  <div className={classes.sub}>
++                    {[r.artist, r.album, r.year].filter(Boolean).join(' · ')}
++                  </div>
++                </div>
++              </ButtonBase>
++            ))}
++        {results?.length === 0 && (
++          <div className={classes.sub}>
++            {translate('resources.seer.message.noResults', { query: q })}
++          </div>
++        )}
++      </DialogContent>
++    </Dialog>
++  )
++}
++
++export const ImportView = ({ id }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const notify = useNotify()
++  const history = useHistory()
++  const [job, setJob] = useState(null)
++  const [error, setError] = useState(null)
++  const [picking, setPicking] = useState(null)
++
++  const load = useCallback(
++    () =>
++      getImport(id)
++        .then((j) => {
++          setJob(j)
++          setError(null)
++        })
++        .catch(setError),
++    [id],
++  )
++  useEffect(() => {
++    load()
++  }, [load])
++  useRefreshOnEvents({ events: ['seer'], onRefresh: load })
++
++  if (error) return <ErrorState onRetry={load} />
++  const color = SOURCE_COLORS[job?.source] || '#7c4dff'
++  const c = job?.counts || {}
++  const have = (c.owned || 0) + (c.available || 0)
++
++  const toggleSync = () =>
++    setImportSync(id, !job.sync)
++      .then(load)
++      .catch((e) => notify(errorMessage(e), 'warning'))
++  const remove = () =>
++    deleteImport(id)
++      .then(() => history.push('/seer'))
++      .catch((e) => notify(errorMessage(e), 'warning'))
++  const pick = (item, cat) =>
++    resolveImportItem(id, item.position, cat)
++      .then(() => {
++        setPicking(null)
++        load()
++      })
++      .catch((e) => notify(errorMessage(e), 'warning'))
++
++  return (
++    <>
++      <Hero
++        color={`${color}cc`}
++        art={
++          job ? (
++            <ImportArt job={job} className={classes.art} />
++          ) : (
++            <Shimmer width={200} height={200} />
++          )
++        }
++        label={translate(
++          `resources.seer.imports.source.${job?.source || 'file'}`,
++        )}
++        title={
++          job ? (
++            job.name
++          ) : (
++            <Shimmer width="60%" height={72} style={{ opacity: 0.5 }} />
++          )
++        }
++        meta={
++          job && [
++            translate('resources.seer.imports.progress', {
++              have,
++              total: job.total,
++            }),
++            c.requested > 0 &&
++              translate('resources.seer.imports.downloading', {
++                smart_count: c.requested,
++              }),
++            c.notfound > 0 &&
++              translate('resources.seer.imports.notFound', {
++                smart_count: c.notfound,
++              }),
++            translate(`resources.seer.imports.status.${job.status}`),
++          ]
++        }
++      >
++        {job?.playlistId && (
++          <ButtonBase
++            className={classes.action}
++            onClick={() => history.push(`/playlist/${job.playlistId}/show`)}
++          >
++            <PlaylistPlayIcon />
++            {translate('resources.seer.imports.openPlaylist')}
++          </ButtonBase>
++        )}
++        {job?.url && (
++          <ButtonBase
++            className={`${classes.action} ${job.sync ? classes.on : ''}`}
++            onClick={toggleSync}
++            aria-pressed={job.sync}
++          >
++            <SyncIcon />
++            {translate('resources.seer.imports.syncDaily')}
++          </ButtonBase>
++        )}
++        {job && (
++          <Tooltip title={translate('resources.seer.imports.delete')}>
++            <IconButton
++              onClick={remove}
++              aria-label={translate('resources.seer.imports.delete')}
++            >
++              <DeleteIcon />
++            </IconButton>
++          </Tooltip>
++        )}
++      </Hero>
++      {job?.error && (
++        <div
++          className={classes.sub}
++          style={{ color: '#ff5c7a', margin: '8px 0' }}
++        >
++          {job.error}
++        </div>
++      )}
++      {job && <ProgressBar job={job} className={classes.bar} />}
++      {!job
++        ? [0, 1, 2, 3, 4].map((i) => (
++            <Shimmer key={i} height={44} style={{ margin: '12px 0' }} />
++          ))
++        : (job.items || []).map((it) => {
++            const sc = STATE_COLORS[it.state] || '#999'
++            return (
++              <div key={it.position} className={classes.row}>
++                <span className={classes.num}>{it.position}</span>
++                <Cover
++                  id={it.coverId}
++                  seed={it.album || it.title}
++                  radius={4}
++                  style={{ width: 44, height: 44, fontSize: 9 }}
++                />
++                <div style={{ minWidth: 0 }}>
++                  <div className={classes.title} title={it.title}>
++                    {it.title}
++                  </div>
++                  <div className={classes.sub} title={it.note || undefined}>
++                    {[it.artist, it.album].filter(Boolean).join(' · ')}
++                  </div>
++                </div>
++                <span className={classes.dur}>
++                  {formatDuration(it.durationMs)}
++                </span>
++                <div
++                  style={{
++                    display: 'flex',
++                    alignItems: 'center',
++                    justifyContent: 'flex-end',
++                  }}
++                >
++                  <span
++                    className={classes.pill}
++                    style={{ color: sc, background: `${sc}1f` }}
++                    title={it.note || undefined}
++                  >
++                    {translate(`resources.seer.imports.state.${it.state}`)}
++                  </span>
++                  {(it.state === 'notfound' || it.state === 'failed') && (
++                    <ButtonBase
++                      className={classes.pick}
++                      onClick={() => setPicking(it)}
++                    >
++                      {translate('resources.seer.imports.pick')}
++                    </ButtonBase>
++                  )}
++                </div>
++              </div>
++            )
++          })}
++      {picking && (
++        <PickDialog
++          item={picking}
++          onClose={() => setPicking(null)}
++          onPick={(cat) => pick(picking, cat)}
++        />
++      )}
++    </>
++  )
++}
+diff --git a/ui/src/seer/ImportsPanel.jsx b/ui/src/seer/ImportsPanel.jsx
+new file mode 100644
+index 0000000..e9e0547
+--- /dev/null
++++ b/ui/src/seer/ImportsPanel.jsx
+@@ -0,0 +1,299 @@
++import { useRef, useState } from 'react'
++import { ButtonBase, CircularProgress, InputBase } from '@material-ui/core'
++import { makeStyles } from '@material-ui/core/styles'
++import LinkIcon from '@material-ui/icons/Link'
++import SyncIcon from '@material-ui/icons/Sync'
++import UploadIcon from '@material-ui/icons/CloudUpload'
++import QueueMusicIcon from '@material-ui/icons/QueueMusic'
++import { useNotify, useTranslate } from 'react-admin'
++import { useHistory } from 'react-router-dom'
++import { importFile, importLink } from './api'
++import { GREEN } from './actions'
++import { Grid } from './components'
++
++export const SOURCE_COLORS = {
++  spotify: '#1ed760',
++  ytmusic: '#ff3b30',
++  file: '#7c4dff',
++}
++
++const errorMessage = (err) => err?.body || err?.message || String(err)
++
++const useStyles = makeStyles((theme) => {
++  const dark = theme.palette.type === 'dark'
++  return {
++    box: {
++      marginTop: theme.spacing(4),
++      borderRadius: 20,
++      padding: theme.spacing(3),
++      background: dark
++        ? 'linear-gradient(135deg, rgba(30,215,96,0.12), rgba(255,59,48,0.10))'
++        : 'linear-gradient(135deg, rgba(30,215,96,0.12), rgba(255,59,48,0.08))',
++      border: `1px solid ${dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'}`,
++    },
++    title: {
++      fontSize: 22,
++      fontWeight: 800,
++      letterSpacing: '-0.02em',
++      margin: 0,
++    },
++    hint: {
++      color: theme.palette.text.secondary,
++      fontSize: 14,
++      margin: theme.spacing(0.5, 0, 2),
++    },
++    row: {
++      display: 'flex',
++      gap: theme.spacing(1.5),
++      alignItems: 'center',
++      flexWrap: 'wrap',
++    },
++    field: {
++      flex: '1 1 320px',
++      display: 'flex',
++      alignItems: 'center',
++      gap: theme.spacing(1),
++      height: 48,
++      padding: theme.spacing(0, 2),
++      borderRadius: 999,
++      background: dark ? 'rgba(0,0,0,0.35)' : '#fff',
++      border: `2px solid transparent`,
++      '&:focus-within': { borderColor: theme.palette.text.primary },
++      '& svg': { color: theme.palette.text.secondary },
++    },
++    go: {
++      height: 48,
++      padding: '0 26px',
++      borderRadius: 999,
++      fontWeight: 800,
++      fontSize: 15,
++      background: GREEN,
++      color: '#000',
++      transition: 'transform 150ms ease',
++      '&:hover': { transform: 'scale(1.04)' },
++      '&.Mui-disabled': { opacity: 0.5 },
++    },
++    chip: {
++      height: 36,
++      padding: '0 14px',
++      borderRadius: 999,
++      fontSize: 13,
++      fontWeight: 600,
++      gap: 6,
++      color: theme.palette.text.primary,
++      background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
++      '& svg': { fontSize: 18 },
++    },
++    chipOn: { background: `${GREEN}33`, color: dark ? GREEN : '#0a7a35' },
++    card: {
++      display: 'block',
++      width: '100%',
++      boxSizing: 'border-box',
++      textAlign: 'left',
++      padding: 14,
++      borderRadius: 14,
++      background: dark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)',
++      transition: 'background 200ms ease',
++      '&:hover': {
++        background: dark ? 'rgba(255,255,255,0.09)' : 'rgba(0,0,0,0.06)',
++      },
++    },
++    art: {
++      width: '100%',
++      aspectRatio: '1 / 1',
++      borderRadius: 10,
++      marginBottom: 12,
++      display: 'flex',
++      alignItems: 'center',
++      justifyContent: 'center',
++      color: 'rgba(255,255,255,0.9)',
++      boxShadow: '0 8px 20px rgba(0,0,0,0.3)',
++      '& svg': { fontSize: 56 },
++    },
++    name: {
++      fontWeight: 700,
++      fontSize: 15,
++      overflow: 'hidden',
++      textOverflow: 'ellipsis',
++      whiteSpace: 'nowrap',
++    },
++    sub: { fontSize: 13, color: theme.palette.text.secondary, marginTop: 4 },
++    bar: {
++      display: 'flex',
++      height: 6,
++      borderRadius: 999,
++      overflow: 'hidden',
++      marginTop: 10,
++      background: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)',
++    },
++  }
++})
++
++export const ImportArt = ({ job, className, style }) => {
++  const color = SOURCE_COLORS[job.source] || '#7c4dff'
++  return (
++    <div
++      className={className}
++      style={{
++        background: `linear-gradient(135deg, ${color} 0%, ${color}88 45%, #1a1035 100%)`,
++        ...style,
++      }}
++    >
++      <QueueMusicIcon />
++    </div>
++  )
++}
++
++export const ProgressBar = ({ job, className }) => {
++  const c = job.counts || {}
++  const total = job.total || 1
++  const parts = [
++    [(c.owned || 0) + (c.available || 0), GREEN],
++    [c.requested || 0, '#4fb3ff'],
++    [c.notfound || 0, '#f5a524'],
++    [c.failed || 0, '#ff5c7a'],
++  ]
++  return (
++    <div className={className}>
++      {parts.map(([n, color], i) =>
++        n > 0 ? (
++          <span
++            key={i}
++            style={{ width: `${(n / total) * 100}%`, background: color }}
++          />
++        ) : null,
++      )}
++    </div>
++  )
++}
++
++export const ImportsPanel = ({ imports, onCreated }) => {
++  const classes = useStyles()
++  const translate = useTranslate()
++  const notify = useNotify()
++  const history = useHistory()
++  const fileRef = useRef()
++  const [link, setLink] = useState('')
++  const [sync, setSync] = useState(true)
++  const [busy, setBusy] = useState(false)
++
++  const done = (job) => {
++    setLink('')
++    notify('resources.seer.imports.started', 'info')
++    onCreated(job)
++    history.push(`/seer?import=${job.id}`)
++  }
++  const fail = (err) => notify(errorMessage(err), 'warning')
++  const submit = (e) => {
++    e?.preventDefault()
++    if (!link.trim()) return
++    setBusy(true)
++    importLink(link.trim(), sync)
++      .then(done, fail)
++      .finally(() => setBusy(false))
++  }
++  const upload = (e) => {
++    const file = e.target.files?.[0]
++    e.target.value = ''
++    if (!file) return
++    setBusy(true)
++    importFile(file)
++      .then(done, fail)
++      .finally(() => setBusy(false))
++  }
++
++  return (
++    <>
++      <form className={classes.box} onSubmit={submit}>
++        <h2 className={classes.title}>
++          {translate('resources.seer.imports.title')}
++        </h2>
++        <p className={classes.hint}>
++          {translate('resources.seer.imports.hint')}
++        </p>
++        <div className={classes.row}>
++          <div className={classes.field}>
++            <LinkIcon />
++            <InputBase
++              fullWidth
++              value={link}
++              onChange={(e) => setLink(e.target.value)}
++              placeholder={translate('resources.seer.imports.placeholder')}
++              inputProps={{
++                'aria-label': translate('resources.seer.imports.placeholder'),
++              }}
++            />
++          </div>
++          <ButtonBase
++            type="submit"
++            className={classes.go}
++            disabled={busy || !link.trim()}
++          >
++            {busy ? (
++              <CircularProgress size={20} style={{ color: '#000' }} />
++            ) : (
++              translate('resources.seer.imports.go')
++            )}
++          </ButtonBase>
++        </div>
++        <div className={classes.row} style={{ marginTop: 12 }}>
++          <ButtonBase
++            className={`${classes.chip} ${sync ? classes.chipOn : ''}`}
++            onClick={() => setSync((s) => !s)}
++            aria-pressed={sync}
++          >
++            <SyncIcon />
++            {translate('resources.seer.imports.syncDaily')}
++          </ButtonBase>
++          <ButtonBase
++            className={classes.chip}
++            onClick={() => fileRef.current?.click()}
++          >
++            <UploadIcon />
++            {translate('resources.seer.imports.upload')}
++          </ButtonBase>
++          <input
++            ref={fileRef}
++            type="file"
++            accept=".csv,.json,.txt"
++            hidden
++            onChange={upload}
++          />
++        </div>
++      </form>
++      {imports.length > 0 && (
++        <div style={{ marginTop: 24 }}>
++          <Grid>
++            {imports.map((job) => {
++              const c = job.counts || {}
++              const have = (c.owned || 0) + (c.available || 0)
++              return (
++                <ButtonBase
++                  key={job.id}
++                  component="div"
++                  className={classes.card}
++                  onClick={() => history.push(`/seer?import=${job.id}`)}
++                  focusRipple
++                >
++                  <ImportArt job={job} className={classes.art} />
++                  <div className={classes.name} title={job.name}>
++                    {job.name}
++                  </div>
++                  <div className={classes.sub}>
++                    {job.status === 'reading' || job.status === 'failed'
++                      ? translate(`resources.seer.imports.status.${job.status}`)
++                      : translate('resources.seer.imports.progress', {
++                          have,
++                          total: job.total,
++                        })}
++                  </div>
++                  <ProgressBar job={job} className={classes.bar} />
++                </ButtonBase>
++              )
++            })}
++          </Grid>
++        </div>
++      )}
++    </>
++  )
++}
+diff --git a/ui/src/seer/SeerPage.jsx b/ui/src/seer/SeerPage.jsx
+index 6b56150..74672b0 100644
+--- a/ui/src/seer/SeerPage.jsx
++++ b/ui/src/seer/SeerPage.jsx
+@@ -12,10 +12,13 @@ import { AlbumView } from './AlbumView'
+ import {
+   approveRequest,
+   createRequest,
++  listImports,
+   listRequests,
+   searchCatalog,
+ } from './api'
+ import { ArtistView } from './ArtistView'
++import { ImportsPanel } from './ImportsPanel'
++import { ImportView } from './ImportView'
+ import { Section } from './components'
+ import { RequestsList } from './RequestsList'
+ import { SearchView } from './SearchView'
+@@ -127,6 +130,8 @@ const SeerPage = () => {
+   )
+   const artist = params.get('artist')
+   const album = params.get('album')
++  const importId = params.get('import')
++  const detail = artist || album || importId
+   const [query, setQuery] = useState(params.get('q') || '')
+   const [debounced, setDebounced] = useState(query.trim())
+   const [requests, setRequests] = useState([])
+@@ -134,10 +139,10 @@ const SeerPage = () => {
+ 
+   // Artist and album pages open at the top, like a new page.
+   useEffect(() => {
+-    if (artist || album) {
++    if (detail) {
+       window.scrollTo(0, 0)
+     }
+-  }, [artist, album])
++  }, [detail])
+ 
+   const loadRequests = useCallback(
+     () =>
+@@ -146,10 +151,22 @@ const SeerPage = () => {
+         .catch((err) => notify(errorMessage(err), 'warning')),
+     [notify],
+   )
++  const [imports, setImports] = useState([])
++  const loadImports = useCallback(
++    () =>
++      listImports()
++        .then(setImports)
++        .catch(() => {}),
++    [],
++  )
++  const refreshAll = useCallback(
++    () => Promise.all([loadRequests(), loadImports()]),
++    [loadRequests, loadImports],
++  )
+   useEffect(() => {
+-    loadRequests()
+-  }, [loadRequests])
+-  useRefreshOnEvents({ events: ['seer'], onRefresh: loadRequests })
++    refreshAll()
++  }, [refreshAll])
++  useRefreshOnEvents({ events: ['seer'], onRefresh: refreshAll })
+ 
+   // MusicBrainz is slow (1 request/second), so wait for a pause in typing.
+   useEffect(() => {
+@@ -162,10 +179,10 @@ const SeerPage = () => {
+ 
+   // Keep the query in the URL, so "back" from an artist returns to the results.
+   useEffect(() => {
+-    if (artist || album) return
++    if (detail) return
+     const search = debounced ? `?q=${encodeURIComponent(debounced)}` : ''
+     if (location.search !== search) history.replace(`/seer${search}`)
+-  }, [debounced, artist, album, history, location.search])
++  }, [debounced, detail, history, location.search])
+ 
+   const searchKey =
+     debounced.length >= 2 ? `search:${debounced.toLowerCase()}` : null
+@@ -188,7 +205,7 @@ const SeerPage = () => {
+ 
+   const onType = (e) => {
+     setQuery(e.target.value)
+-    if (artist || album) history.push('/seer')
++    if (detail) history.push('/seer')
+   }
+   const clear = () => {
+     setQuery('')
+@@ -203,6 +220,8 @@ const SeerPage = () => {
+     body = <ArtistView key={artist} mbid={artist} />
+   } else if (album) {
+     body = <AlbumView key={album} mbid={album} />
++  } else if (importId) {
++    body = <ImportView key={importId} id={importId} />
+   } else if (searchKey) {
+     body = (
+       <SearchView
+@@ -225,6 +244,10 @@ const SeerPage = () => {
+             {translate('resources.seer.message.welcomeText')}
+           </div>
+         </div>
++        <ImportsPanel
++          imports={imports}
++          onCreated={(job) => setImports((js) => [job, ...js])}
++        />
+         <Section
+           title={translate('resources.seer.requests')}
+           hint={requests.length > 0 ? String(requests.length) : null}
+@@ -244,7 +267,7 @@ const SeerPage = () => {
+             translate('resources.seer.name', { smart_count: 2 })
+           }
+         />
+-        {!artist && !album && (
++        {!detail && (
+           <div className={classes.bar}>
+             <div className={classes.search}>
+               <SearchIcon />
+diff --git a/ui/src/seer/api.js b/ui/src/seer/api.js
+index d43f795..ab68c37 100644
+--- a/ui/src/seer/api.js
++++ b/ui/src/seer/api.js
+@@ -30,3 +30,38 @@ export const getAlbum = (mbid) =>
+ 
+ export const coverUrl = (id, size = 250) =>
+   id ? `https://coverartarchive.org/release-group/${id}/front-${size}` : null
++
++export const listImports = () =>
++  httpClient(`${SEER_URL}/imports`).then(({ json }) => json)
++
++export const getImport = (id) =>
++  httpClient(`${SEER_URL}/imports/${id}`).then(({ json }) => json)
++
++export const importLink = (url, sync) =>
++  httpClient(`${SEER_URL}/imports`, {
++    method: 'POST',
++    body: JSON.stringify({ url, sync }),
++  }).then(({ json }) => json)
++
++export const importFile = (file) => {
++  const body = new FormData()
++  body.append('file', file)
++  return httpClient(`${SEER_URL}/imports`, { method: 'POST', body }).then(
++    ({ json }) => json,
++  )
++}
++
++export const setImportSync = (id, sync) =>
++  httpClient(`${SEER_URL}/imports/${id}`, {
++    method: 'PUT',
++    body: JSON.stringify({ sync }),
++  }).then(({ json }) => json)
++
++export const deleteImport = (id) =>
++  httpClient(`${SEER_URL}/imports/${id}`, { method: 'DELETE' })
++
++export const resolveImportItem = (id, position, item) =>
++  httpClient(`${SEER_URL}/imports/${id}/items/${position}/resolve`, {
++    method: 'POST',
++    body: JSON.stringify(item),
++  }).then(({ json }) => json)
+diff --git a/ui/src/seer/states.jsx b/ui/src/seer/states.jsx
+index 83e8822..e6911a3 100644
+--- a/ui/src/seer/states.jsx
++++ b/ui/src/seer/states.jsx
+@@ -160,7 +160,7 @@ export const Hero = ({ color, art, label, title, meta = [], children }) => {
+           <div className={classes.label}>{label}</div>
+           <h1 className={classes.title}>{title}</h1>
+           <div className={classes.meta}>
+-            {meta.filter(Boolean).map((m, i) => (
++            {(meta || []).filter(Boolean).map((m, i) => (
+               <span key={i}>{m}</span>
+             ))}
+           </div>
+-- 
+2.43.0
+
