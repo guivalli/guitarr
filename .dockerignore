@@ -2,3 +2,5 @@
 apps/android
 /*.png
 /logo.jpeg
+docs/*.mp4
+docs/*.png
