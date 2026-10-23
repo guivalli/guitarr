@@ -8,7 +8,7 @@ your library, ready to stream on the web, on the phone (PWA / Android app) or in
 > in the account menu, in Settings or on the first step of the tour. A Portuguese install guide is in
 > [`LEIA-ME.md`](LEIA-ME.md).
 
-[![Watch the 1-minute intro](docs/intro-thumb.png)](docs/guitarr-intro.mp4)
+[![Watch the 1-minute intro](docs/intro-thumb.png)](guitarr-intro.mp4)
 
 *Click the picture to watch the 1-minute intro (web UI and phone app, fictional demo data).*
 
