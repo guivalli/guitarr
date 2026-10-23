@@ -10,6 +10,15 @@ Documentação: `README.md` (público, em inglês: o que é, créditos a Navidro
 
 **Segredos fora do `.env`** (patch 0032): o `.env` não precisa ter nada secreto. Chaves de API (slskd, Lidarr, Spotify) ficam seladas no banco; no primeiro start, `AdoptEnvSecrets` copia as que vierem do ambiente. Usuário/senha do Soulseek e do painel do slskd (e a chave `web.authentication.api_keys.guitarr`) ficam em `/srv/guitarr/slskd/slskd.yml`, montado no Guitarr em `/slskd/slskd.yml` (`ND_SEER_SOULSEEK_CONFIGFILE`) e editado pela tela Configurações; o slskd recarrega o arquivo sozinho e o Guitarr pede reconexão via API. Variáveis `SLSKD_SLSK_*`/`SLSKD_PASSWORD`/`SLSKD_API_KEY` no ambiente do slskd **passam na frente** do yml: não as recoloque no compose.
 
+## Duas cópias: altere sempre nas duas ao mesmo tempo
+
+O projeto vive em duas pastas irmãs, e **toda alteração tem de ir para as duas na mesma hora**:
+
+- **`guitarr`**: o repositório limpo, o que vai para o GitHub (só arquivos versionados e o `.env.example`; sem `.env`, dados, músicas, chaves ou notas pessoais).
+- **`guitarr dev`**: a cópia de trabalho e de produção (tem o `.env` real, os dados, o keystore do Android e é onde o container roda). Serve para testar.
+
+Fluxo: edite e comite na `guitarr`; depois sincronize a `guitarr dev` (`cd "guitarr dev" && git fetch ../guitarr main && git reset --hard FETCH_HEAD`, que só mexe nos arquivos versionados), rebuild/deploy por ela e teste. Só então publique. Nunca rode `git clean` na `guitarr dev` (apagaria `.env`, dados e a chave do Android) e nunca coloque nada pessoal na `guitarr`. Se mexer primeiro na dev para testar, leve a mesma mudança para a limpa antes de terminar.
+
 ## Comandos
 
 ```bash
