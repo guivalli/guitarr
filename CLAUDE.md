@@ -119,6 +119,13 @@ Convenções do mock que `live.js` respeita (quebrar gera bugs sutis):
 - A fila é uma lista de índices de `TRACKS` (`queue`); a recarga da biblioteca (`loadLibrary`) remapeia por id. Rádio/podcast tocam em modo externo (`ext`), fora de `TRACKS`.
 - Fora de `TRACKS/ALBUMS/ARTISTS` por design: registros `missing` (o admin os recebe da API; editar dá "not found") e episódios em `…/Podcasts/…` (ficam só na aba Podcasts).
 
+### Idiomas (inglês padrão, português BR) e busca com catálogo
+- O código e o mock da UI são escritos em **português**; no inglês, `ui/i18n.js` traduz o DOM em tempo de execução com o dicionário `ui/i18n-en.tsv` (mais `ui/i18n-mobile.tsv` só no app mobile), embutido no `<head>` por `ui/i18n_build.py` (usado por `build.py` e `mobile/build_mobile.py`). Formato por linha: `português ||| inglês`; `re: regex ||| troca` para casos com número. **Texto novo na UI precisa de uma linha no `.tsv`**, senão aparece em português no modo inglês.
+- Como casa: chave = texto exato do nó (espaços colapsados). Chaves de várias palavras ou com pontuação nas pontas também valem como começo/fim de um texto montado com dados (`Tocando álbum "X"`); palavra solta só casa o nó inteiro, para não mexer em título de música. Dados do usuário nunca entram no dicionário. Não são traduzidos: `<textarea>`, `code`, `.lyr-line`, `[data-notr]`.
+- A escolha fica em `localStorage.nd_seer_lang` e em `/api/seer/state` (`prefs.lang`); trocar de idioma recarrega a página (`seerSetLang`/`seerPickLang`). O seletor está no menu da conta, em Configurações, no 1º passo do passeio e no login (site e mobile). Os smoke tests gravam `nd_seer_lang=pt` para continuar afirmando textos em português.
+- Achar o que falta traduzir: abra o HTML gerado no Playwright com a API fictícia (modelo em `ui/tools/themeshots.js`), `nd_seer_lang=en`, e liste os nós de texto com acento. `ui/tools/i18nsmoke.js` cobre idioma, primeiro acesso, usuários e a busca.
+- **Busca do topo**: em Músicas/Álbuns/Artistas, `drawCatalogBlock()` (live.js) acrescenta abaixo da lista local o catálogo do MusicBrainz (`/api/seer/catalog`, só o que não está na biblioteca, com "+ Pedir"); `seerRefresh()` redesenha só esse bloco para não perder a rolagem.
+
 ### Verificação da UI
 Testes do app mobile: `ui/mobile/smoke.js` e `smoke2.js`, rodados contra `apps/mobile/index.html` do mesmo jeito.
 
@@ -145,6 +152,7 @@ APK = o mesmo app mobile (`ui/mobile/`) dentro do Capacitor 8. `apps/android/bui
 - Esquema do app é `http` (`capacitor.config.json`): com `https`, o WebView bloqueia imagem/áudio de servidor `http://` mesmo com `allowMixedContent`. CORS do Navidrome é `*`, então `fetch` direto funciona.
 - Offline: `offline.js` (armazém nativo = `Filesystem.downloadFile`; navegador = Cache Storage). Faixa tem lista de coleções (`cols`) que a seguram; limite/qualidade/Wi-Fi em `S.off.settings`. O restante do app só usa `S.offlineHas/offlineSrc/offlineSave/offlineButton/offlineScreen`.
 - `android/` é gerado pelo `cap add` mas está versionado com edições nossas (manifesto, Java, tema, `build.gradle` com assinatura e versão): não rode `cap add` de novo.
+- Copiar `apps/android` entre pastas/máquinas com `cp -r` troca os symlinks de `node_modules/.bin` por arquivos e o `npx cap sync` quebra (`Cannot find module '../package.json'`): apague `node_modules` e `www` antes de rodar o `build-apk.sh`. O primeiro build depois de renomear os volumes de cache baixa o Gradle de novo (10 a 15 min).
 - Os arquivos do `android/` pertencem ao root se o Docker os criou: `docker run --rm -v $PWD:/w alpine chown -R 1000:1000 /w`.
 - Testar sem celular: `apps/android/tools/Dockerfile.emulator` + `apps/android/tools/emu.sh` + `apps/android/tools/cdp.js` (WebView via devtools); servidor descartável com `ND_SCANNER...` como em "Testar a UI sem mexer em produção". `.dockerignore` mantém `apps/android` fora do contexto do build da imagem do servidor.
 
